@@ -176,3 +176,120 @@ python -u scripts/sb3/train.py --task AS-Tello-Approach-v0 --headless --num_envs
 Output goes to `logs/sb3/AS-Tello-Approach-v0/<timestamp>/model.zip`. For runs longer than
 your tool timeout, launch detached (`setsid nohup ... > outputs/train.log 2>&1 &`) and
 poll the log. Score the result with the Step 4 command, pointing `--checkpoint` at it.
+
+## Room task: `AS-Tello-Room-v0` (real map, AprilTag-only sensing, real rc)
+
+Human guide for both room tasks (train, tune rewards, watch): `simulation_infra/SINGLE_DRONE_SIMULATION.md`.
+
+Four Tellos start hovering in a 2 m x 2 m box 6-7 m from tag 10 (>= 0.5 m apart), fly to four
+landing spots on the floor 1 m in front of the tag-10 wall, 0.5 m apart, and send `land` over
+them. Start positions and the drone-to-spot assignment are random every episode. Success: all
+four landed within 0.3 m of their spots.
+Trained **end to end** by **one central controller** (the laptop): a single PPO policy sees all
+four drones' positional feeds and outputs all four drones' commands (agent cfg `central: true`,
+`rl/sb3_shared.Sb3CentralVecEnv`), trained on the team reward. No scripted pilot, search or hold.
+Run from `simulation_infra/` with the Step 2 environment.
+
+- **Observation** (96 = 4 drones x 24, PPO stacks 8): per drone, its `core/positional.py` feed as
+  the laptop receives it: last tag fix, heading, fix age, `lost` (no fix for 0.4 s: its position
+  freezes until it turns back to a tag; no odometry), its waypoint and landing spot in its heading
+  frame, waypoint-reached flag, tag-10 bearing, Tello `h`, its previous command, landing flag.
+  Fixes carry camera-model noise, 3 cm per-fix noise and a 3 cm per-drone bias; frames are lost
+  on the link at a per-drone, per-episode rate.
+- **Waypoint**: 1.5 m above each landing spot, radius 0.3 m. Until a drone's published fix is
+  inside it, `closer_reward` pays +10 per metre gained toward the waypoint (3D); after that only
+  landing rewards (touchdown, formation) and the penalties apply.
+- **Per-drone dynamics**: TWR x0.95-1.05, rotor drag x0.5-2.0, body-rate PID kp/ki x0.85-1.15,
+  kd x0.7-1.3, plus outer-loop gains, motor lag, mass, latency, rc->speed gain. No wind.
+- **Actions**: the real Tello commands: the 4 rc channels, each an integer in -100..100 (the full
+  SDK range), plus `land` (5th output > 0.5 for 3 steps). The logs' sent range is still recorded
+  as `command_envelope` in the fit file (`rc.use_envelope=True` would restrict to it); speeds past
+  the logged sticks (~21-35) extrapolate the fitted gains.
+- **Rewards** (per drone-step, summed over the drones for the controller): +10 per metre closer
+  to the waypoint until reached, -5 per metre away (`closer_reward`, `rew_away_ratio` 0.5), -0.5
+  until landed on the spot (`landing_loss`; ending early pays the rest), -0.5 flying without a tag,
+  -100 contact / crash, +100 at touchdown (`land_reward`), +200 all landed on spot.
+- **Land gate**: `land` is sent only once the drone's published fix has been inside its waypoint
+  (the obs waypoint-reached flag); before that it is blocked and costs -100 (`early_land_loss`).
+  The laptop must apply the same gate at deploy. Each is logged as
+  `Rewards/avg_<term>_per_episode` (per drone).
+- **Overlapped envs**: `scene.env_spacing` defaults to 0, so every env shares one room (the GUI
+  shows the whole batch). PhysX filters contacts between envs and every reward/crash uses the
+  env's own positions; measured no slower than the 14 m grid (`env.scene.env_spacing=14.0`).
+- **Room**: read live from `drone_deployment_infra/config/map.yaml` + `tags.yaml` (no copy;
+  re-mapping the room updates the sim). Tag 10's wall is X = 0, Z up from the floor; the floor
+  isn't in the map, so `env.tag10_height` (default 1.2 m, **assumed, measure it**) places it.
+  Tags are textured tag36h11 quads, orientation verified against the real detector.
+- **Sensing**: a tag counts only if it is inside the Tello camera's view (FOV, range, view
+  angle, pixel size, dropout, 0.2 s video delay, link loss). Observations are the positional
+  feed only, never ground truth.
+- **Kalman filter** (`env.kalman`, on by default; `env.kalman.enabled=False` trains on the raw
+  fix): the observed position is the estimate of `drone_deployment_infra/core/positional_kalman_filter.py`,
+  the laptop's file, loaded by path (`tags/kalman.py`) and run on torch for every drone. Constant
+  velocity per axis, outlier gate, holds when lost, restarts on the first fix after. Deploy with
+  `FilteredPositioner` iff the policy was trained with it. Self-test: `python3
+  drone_deployment_infra/core/positional_kalman_filter.py` (pass: `SELFTEST PASSED`).
+- **Motion**: the integer sticks go through the deadband and gains in
+  `source/action_space_kit/action_space_kit/control/tello_motion_fit.yaml`. Deploy by sending
+  `env.last_rc` (the same rounding) as `rc a b c d`, and `land` when the 5th output says so.
+- **Command rate**: one policy step = one rc packet, 74 ms (`env.command_rate_hz` = 500/37 =
+  13.5 Hz) with 0-16 ms arrival jitter. Measured in flight: `recordings/027_TELLO-1.train.jsonl`
+  sent at 13.43 Hz (median 70 ms, 80 ms cruising, 55-110 ms), because each tick runs a full-frame
+  tag detection before its `stop.wait(0.05)`. (`drone_deployment_tests/rc_rate_bench.py` on the
+  desktop gave 19.94 Hz for the older engine; don't use that number.) Per episode each drone loses
+  0-15% of rc packets (holds the last rc) and video frames (no fix): the flight reports lost
+  3-19% of frames per flight.
+- **Motion fit**: `tello_motion_fit.yaml` holds PRIORS until real logs are fitted. Copy the
+  laptop's `drone_deployment_infra/recordings/*.train.jsonl` here (logs from before the
+  unified layout: `drone_deployment_infra/core/migrate_outputs.py` moves `outputs/` into `recordings/`), then:
+
+```bash
+python -u scripts/fit_tello_motion.py --selftest                                  # pass: SELFTEST PASSED
+python -u scripts/fit_tello_motion.py          # every recordings/*.train.jsonl; rewrites the yaml
+```
+  Read its two cross-checks: the rc-vs-vel correlation should be diagonal, and the tag-vs-state
+  speed scale should be ~1 (a ~10x or ~0.1x means the engine's vgx/vgy units/axes are wrong;
+  then fit with `--speed_source tag`).
+
+```bash
+python -u scripts/check_room_env.py --headless --test all > outputs/check_room.log 2>&1
+grep -E "^\s*\[(ok|FAIL)|^== |zero |scripted " outputs/check_room.log
+python -u scripts/check_room_render.py > outputs/check_room_render.log 2>&1        # real localizer on sim renders
+python -u scripts/render_room_overview.py --out outputs/room_overview.png > outputs/room_overview.log 2>&1
+```
+Pass: every line `[ok]` (49); `zero` 0% success, with landing / no-tag losses equal to -0.5 x
+the off-spot / tag-less drone-steps. Render check: every view `[ok]`; a
+`[WARN real localizer: ambiguous pose flip]` line is a finding about `positional.py`, not a sim failure.
+Train (detached; central, ~27 s per iteration at 512 envs on the RTX 5080, 1500 iterations ~11 h):
+`setsid nohup python -u scripts/sb3/train.py --task AS-Tello-Room-v0 --headless --num_envs 512 --max_iterations 1500 > outputs/train_room.log 2>&1 &`.
+Watch it from anywhere: `dashboard/serve.sh` prints a public TensorBoard URL (see `dashboard/README.md`).
+
+Video (the core recorder for this task; works mid-training: with no `--checkpoint` it takes the
+newest `model_N_steps.zip` of the newest run):
+```bash
+python -u scripts/record_room.py --episodes 2 --out outputs/videos/room_policy.mp4 > outputs/record_room.log 2>&1
+grep "\[rec\]" outputs/record_room.log
+```
+Pass: one `[rec] episode N: ...` line per attempt and `[rec] wrote outputs/videos/room_policy.mp4 (...)`.
+Real time (one frame per rc command). `--view overview|side|top`, `--pilot zero` (scene check without
+a policy), `--no_dr`, `--set key=value`. Per drone one color: beacon = true position, cube = published
+fix, translucent sphere = its waypoint, disc = its landing spot; the bottom panel shows each drone's
+phase, rc and fix age. Checkpoint export (VecNormalize + deterministic policy -> TorchScript) is
+shared with `record_approach.py` in `action_space_kit/rl/policy_export.py`.
+
+### Single-drone variant: `AS-Tello-Room-Single-v0` (reward tuning)
+
+The room task with **one** drone (`tello_room_single_env_cfg.py`, agent cfg `sb3_ppo_single_cfg.yaml`,
+same PPO settings): same room, sensing, rc actions, dynamics randomization and reward terms, but the
+drone **starts on the floor** (`start_on_floor`, motors off, same start box) and the episode opens with
+the SDK `takeoff` the engine sends before any rc: the firmware climbs at 0.5 m/s to 0.8-1.0 m
+(`takeoff_height`) ignoring sticks and land, then the policy flies. Takeoff steps pay no closer reward
+and no no-tag loss (the policy isn't flying); the landing loss runs. It gets one of the four spots at
+random (`spot_count`). Observation 25 = 24 + taking-off flag. Success: landed within 0.3 m of its spot.
+```bash
+python -u scripts/check_room_env.py --headless --task AS-Tello-Room-Single-v0 > outputs/check_room_single.log 2>&1
+grep -E "^\s*\[(ok|FAIL)|^== |zero " outputs/check_room_single.log    # pass: every line [ok] (21)
+setsid nohup python -u scripts/sb3/train.py --task AS-Tello-Room-Single-v0 --headless --num_envs 512 --max_iterations 1500 > outputs/train_room_single.log 2>&1 &
+python -u scripts/record_room.py --task AS-Tello-Room-Single-v0 --out outputs/videos/room_single.mp4 > outputs/record_room_single.log 2>&1
+```
+Reward knobs are the `rew_*` fields in `tello_room_env_cfg.py`; override per run with `env.<field>=<value>`.

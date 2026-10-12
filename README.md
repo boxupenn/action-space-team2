@@ -446,6 +446,19 @@ Everything worth changing is in
 - `rew_scale_*` -- reward weights: closing distance, interception, perimeter breach,
   control effort
 
+## Room task: `AS-Tello-Room-v0` (the real room, AprilTag-only sensing)
+
+**Step-by-step guide (train, tune rewards, watch, single-drone variant): [`simulation_infra/SINGLE_DRONE_SIMULATION.md`](simulation_infra/SINGLE_DRONE_SIMULATION.md).**
+
+The real lane-approach flight, in the room as mapped by `drone_deployment_infra`
+(`config/map.yaml`, read directly). The drones know where they are only from AprilTags
+the Tello camera can actually see, plus dead reckoning between sightings, and they act
+through the same integer `rc` sticks the flight engine sends. The sim's per-stick speed,
+deadband and lag come from `control/tello_motion_fit.yaml`, fitted from real flight logs
+by `scripts/fit_tello_motion.py` (priors until logs are fitted). Checks, the fit workflow
+and commands: see the "Room task" section of `CLAUDE.md`. Measure the height of tag 10's
+centre above the floor and set `env.tag10_height` (1.2 m is assumed).
+
 ## Flying on real drones
 
 ```bash

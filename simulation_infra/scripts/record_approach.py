@@ -14,10 +14,8 @@ beacon, its gate ring and its landing pad, so the assignment is visible.
 
 import argparse
 import os
-import re
 import subprocess
 import sys
-from pathlib import Path
 
 parser = argparse.ArgumentParser(description="Record an AS-Tello-Approach-v0 video.")
 parser.add_argument("--pilot", choices=["policy", "scripted"], default="policy")
@@ -48,6 +46,7 @@ import gymnasium as gym  # noqa: E402
 import torch  # noqa: E402
 
 import action_space_kit.tasks  # noqa: F401, E402
+from action_space_kit.rl.policy_export import export_policy  # noqa: E402
 from action_space_kit.tasks.direct.tello_approach.scripted_pilot import scripted_actions  # noqa: E402
 from action_space_kit.tasks.direct.tello_approach.tello_approach_env_cfg import TelloApproachEnvCfg  # noqa: E402
 from omni.kit.viewport.utility import capture_viewport_to_file, get_active_viewport  # noqa: E402
@@ -65,54 +64,6 @@ def aim_camera(u) -> None:
     side = [-math.sin(a), math.cos(a)]
     eye = [look[0] + back * side[0], look[1] + back * side[1], origin[2] + 0.65 * back]
     u.sim.set_camera_view(eye=eye, target=look)
-
-
-_EXPORT_POLICY = """
-import os, pickle, sys, numpy as np, torch
-from stable_baselines3 import PPO
-ckpt, norm_path, out, n_stack = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
-model = PPO.load(ckpt, device="cpu")
-dim = model.observation_space.shape[0] // n_stack
-mean, var, clip, eps = np.zeros(dim), np.ones(dim), np.inf, 0.0
-if os.path.exists(norm_path):
-    v = pickle.load(open(norm_path, "rb"))
-    if v.norm_obs:
-        mean, var, clip, eps = v.obs_rms.mean, v.obs_rms.var, v.clip_obs, v.epsilon
-else:
-    print(f"[rec] WARNING: no normalization stats at {norm_path}", flush=True)
-f32 = lambda a: torch.as_tensor(np.asarray(a, dtype=np.float32))
-
-
-class Exported(torch.nn.Module):
-    # VecNormalize (per frame, before VecFrameStack) -> deterministic policy -> action clip, as in PPO.predict.
-    def __init__(self):
-        super().__init__()
-        self.policy = model.policy.eval()
-        self.register_buffer("mean", f32(np.tile(mean, n_stack)))
-        self.register_buffer("std", f32(np.sqrt(np.tile(var, n_stack) + eps)))
-        self.register_buffer("low", f32(model.action_space.low))
-        self.register_buffer("high", f32(model.action_space.high))
-        self.clip = float(clip)
-
-    def forward(self, obs):
-        obs = torch.clamp((obs - self.mean) / self.std, -self.clip, self.clip)
-        return torch.maximum(torch.minimum(self.policy._predict(obs, deterministic=True), self.high), self.low)
-
-
-with torch.no_grad():
-    torch.jit.trace(Exported(), torch.zeros(2, model.observation_space.shape[0])).save(out)
-"""
-
-
-def export_policy(ckpt: str, norm_path: Path, n_stack: int) -> str:
-    """Export checkpoint + VecNormalize stats as TorchScript from a clean interpreter.
-
-    Livestream loads omni.kit.pip_archive, whose prebundled numpy 1.26 shadows the venv's numpy 2
-    (Kit extensions need it), so the numpy-2 pickles in model.zip / *.pkl can't be loaded here.
-    """
-    out = os.path.join(args.frame_dir, "policy.pt")
-    subprocess.run([sys.executable, "-I", "-c", _EXPORT_POLICY, ckpt, str(norm_path), out, str(n_stack)], check=True)
-    return out
 
 
 def main() -> int:
@@ -152,11 +103,9 @@ def main() -> int:
             os.path.abspath(os.path.join("logs", "sb3", TASK)), ".*", "model.zip", sort_alpha=False
         )
         ckpt = os.path.abspath(ckpt)
-        m = re.match(r"model_(\d+)_steps$", Path(ckpt).stem)
-        norm_path = Path(ckpt).with_name(f"model_vecnormalize_{m.group(1)}_steps.pkl" if m else "model_vecnormalize.pkl")
         agent_cfg = load_cfg_from_registry(TASK, "sb3_cfg_entry_point")
         n_stack = agent_cfg.get("frame_stack", 1)
-        policy = torch.jit.load(export_policy(ckpt, norm_path, n_stack), map_location="cuda:0")
+        policy = torch.jit.load(str(export_policy(ckpt, n_stack, os.path.join(args.frame_dir, "policy.pt"))), map_location="cuda:0")
         venv = Sb3SharedPolicyVecEnv(env)
         if n_stack > 1:
             venv = VecFrameStack(venv, n_stack=n_stack)

@@ -1,0 +1,529 @@
+"""Sanity checks for AS-Tello-Room-v0: four Tellos form up 1 m in front of tag 10.
+
+  geometry   every mapped tag is in the USD stage at its map.yaml pose (in every env); the
+             four start in the 2 m box, 6-7 m from tag 10, >= 0.5 m apart; the four spots
+             are 1 m out, 0.5 m apart, assigned at random per episode
+  sensing    from the start every drone gets tag fixes; published positions are accurate;
+             a drone turned away from every tag goes lost (its position freezes) while its
+             own sticks keep flying it, and publishes again once it turns back
+  commands   the policy sends integer rc in -100..100 on every channel plus the SDK land;
+             land puts every drone on the floor
+  motion     one policy step = one rc packet at the measured rate; link loss as configured;
+             integer rc steps through PhysX give the speeds and response times in
+             control/tello_motion_fit.yaml (the fit of the real flights)
+  baselines  zero sticks never succeed, and the per-step -0.5 landing / no-tag penalties
+             add up exactly (no hand-written pilot: the policy is trained end to end)
+  kalman     the laptop's filter (drone_deployment_infra/core/positional_kalman_filter.py)
+             gives the same numbers on numpy (laptop) and torch (sim), and in flight the
+             filtered position the policy sees is closer to the truth than the raw fix
+  central    one row per env: all drones' blocks in, all their commands out, team reward
+  single     (--task AS-Tello-Room-Single-v0) one drone from the floor: the firmware takeoff
+             climbs to 0.8-1.0 m ignoring the sticks, takeoff steps pay no closer / no-tag
+             terms, then the sticks fly it; it gets any of the four spots
+             (runs single + kalman + baselines + central; the other tests assume four hovering drones)
+
+    python -u scripts/check_room_env.py --headless --test all > outputs/check_room.log 2>&1
+    python -u scripts/check_room_env.py --headless --task AS-Tello-Room-Single-v0 > outputs/check_room_single.log 2>&1
+"""
+
+import argparse
+
+from isaaclab.app import AppLauncher
+
+parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+parser.add_argument("--task", choices=["AS-Tello-Room-v0", "AS-Tello-Room-Single-v0"], default="AS-Tello-Room-v0")
+parser.add_argument("--test", choices=["geometry", "sensing", "commands", "motion", "baselines", "kalman", "central", "single", "all"],
+                    default="all")
+parser.add_argument("--num_envs", type=int, default=256)
+parser.add_argument("--episodes", type=int, default=256)
+AppLauncher.add_app_launcher_args(parser)
+args_cli = parser.parse_args()
+app_launcher = AppLauncher(args_cli)
+simulation_app = app_launcher.app
+
+import math  # noqa: E402
+
+import gymnasium as gym  # noqa: E402
+import numpy as np  # noqa: E402
+import torch  # noqa: E402
+
+import action_space_kit.tasks  # noqa: E402, F401
+from action_space_kit.control import load_motion_fit  # noqa: E402
+from action_space_kit.tasks.direct.tello_room.tello_room_env import _yaw_of  # noqa: E402
+from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry  # noqa: E402
+
+FAILURES: list[str] = []
+
+
+def check(ok: bool, msg: str) -> None:
+    print(("  [ok]   " if ok else "  [FAIL] ") + msg)
+    if not ok:
+        FAILURES.append(msg)
+
+
+def fresh_start(u) -> None:
+    u._reset_idx(torch.arange(u.num_envs, device=u.device))
+    u.episode_length_buf[:] = 0
+
+
+def sticks(u, rc, land: bool = False) -> dict:
+    """Same integer rc for every drone (clipped to the command envelope) -> actions; the 5th
+    output asks for land or not."""
+    a = u.rc.from_rc(torch.tensor(rc, dtype=torch.float32, device=u.device))
+    a = torch.cat([a, torch.tensor([1.0 if land else -1.0], device=u.device)])
+    return {k: a.expand(u.num_envs, 5) for k in u.cfg.possible_agents}
+
+
+# -- geometry -------------------------------------------------------------------
+
+
+def test_geometry(u) -> None:
+    import omni.usd
+    from pxr import Usd, UsdGeom
+
+    cfg = u.cfg
+    print("\n== geometry ==")
+    stage = omni.usd.get_context().get_stage()
+    cache = UsdGeom.XformCache(Usd.TimeCode.Default())
+    origins = u.scene.env_origins.cpu().numpy()
+    for env in (0, u.num_envs - 1):
+        worst = 0.0
+        missing = []
+        for tid, tag in u.room_tags.items():
+            prim = stage.GetPrimAtPath(f"/World/envs/env_{env}/Room/tag_{tid}")
+            if not prim.IsValid():
+                missing.append(tid)
+                continue
+            m = cache.GetLocalToWorldTransform(prim)
+            pos = np.array(m.ExtractTranslation()) - origins[env]
+            normal = np.array(m.TransformDir((0, 0, 1)))
+            worst = max(worst, float(np.linalg.norm(pos - tag.pos)), float(np.linalg.norm(normal - tag.normal)))
+        check(not missing, f"env {env}: all {len(u.room_tags)} mapped tags spawned {sorted(u.room_tags)}" + (f", missing {missing}" if missing else ""))
+        check(worst < 1e-3, f"env {env}: tag poses match map.yaml (worst error {worst:.2e})")
+    t10 = u.room_tags[10]
+    check(np.allclose(t10.normal, [1, 0, 0], atol=1e-6) and abs(t10.pos[2] - cfg.tag10_height) < 1e-6,
+          "tag 10 is the origin: on the X=0 wall, facing +X, at tag10_height")
+
+    fresh_start(u)
+    pos = u._positions()
+    cx, cy = cfg.spawn_box_center
+    half = 0.5 * cfg.spawn_box_size + 1e-4
+    in_box = ((pos[..., 0] - cx).abs() <= half) & ((pos[..., 1] - cy).abs() <= half)
+    r = torch.linalg.norm(pos[..., :2], dim=-1)
+    check(bool(in_box.all()), f"every start is inside the {cfg.spawn_box_size:.0f} m box centred {cfg.spawn_box_center}")
+    check(bool(((r >= cfg.spawn_range[0] - 1e-4) & (r <= cfg.spawn_range[1] + 1e-4)).all()),
+          f"every start is {cfg.spawn_range[0]:.0f}-{cfg.spawn_range[1]:.0f} m from tag 10 (range {r.min():.2f}-{r.max():.2f} m)")
+    sep = u._pairwise_distance(pos[..., :2].contiguous()).amin().item()
+    check(sep >= cfg.spawn_min_separation - 1e-4, f"starts are >= {cfg.spawn_min_separation} m apart (closest {sep:.2f} m)")
+
+    spots = u._spots
+    check(bool(torch.allclose(spots[..., 0], torch.full_like(spots[..., 0], cfg.spot_distance)))
+          and bool((spots[..., 2] == 0).all()), f"landing spots are on the floor, {cfg.spot_distance:.1f} m in front of the tag-10 wall")
+    check(abs(u._wp_offset[2].item() - cfg.waypoint_height) < 1e-6,
+          f"each waypoint is {cfg.waypoint_height} m above its landing spot, radius {cfg.waypoint_radius} m")
+    ys = torch.sort(spots[0, :, 1]).values
+    check(bool(torch.allclose(ys[1:] - ys[:-1], torch.full_like(ys[1:], cfg.spot_spacing))),
+          f"spots are {cfg.spot_spacing} m apart: Y = {[round(v, 2) for v in ys.tolist()]}")
+    perm = (torch.sort(spots[..., 1], -1).values == ys.unsqueeze(0)).all().item()
+    check(bool(perm), "every env assigns each spot to exactly one drone")
+    if cfg.random_assignment:
+        crossed = (torch.argsort(pos[..., 1], -1) != torch.argsort(spots[..., 1], -1)).any(-1).float().mean().item()
+        kinds = len({tuple(r) for r in torch.argsort(spots[..., 1], -1).tolist()})
+        check(kinds >= 20 and crossed > 0.5, f"assignment varies: {kinds} different drone->spot orders over {u.num_envs} envs, "
+              f"{crossed:.0%} not left-to-right")
+    else:
+        same = (torch.argsort(pos[..., 1], -1) == torch.argsort(spots[..., 1], -1)).all().item()
+        check(bool(same), "drone k-th from the left takes spot k (paths don't cross)")
+    obs = u._get_observations()
+    dim = cfg.observation_spaces[cfg.possible_agents[0]]
+    check(all(o.shape == (u.num_envs, dim) for o in obs.values()), f"observation dim {dim}")
+
+
+# -- sensing --------------------------------------------------------------------
+
+
+def test_sensing(env, u) -> None:
+    print("\n== sensing (positions only from AprilTags; no fix -> lost) ==")
+    fresh_start(u)
+    errs, fresh = [], []
+    for k in range(int(3.0 / u.step_dt)):
+        u.step(sticks(u, (0, 0, 0, 0)))
+        if k * u.step_dt > 1.0:
+            m = u.fresh
+            errs.append(torch.linalg.norm(u.pub_pos - u._positions(), dim=-1)[m])
+            fresh.append(m.float().mean().item())
+    acq = u.acquired.float().mean().item()
+    err = torch.cat(errs)
+    check(acq > 0.95, f"{acq:.0%} of drones get a tag fix within 3 s of the start (6-7 m out)")
+    check(err.median().item() < 0.15, f"published position error at 6-7 m: median {err.median():.3f} m, p95 {err.quantile(0.95):.3f} m")
+    print(f"  fix on {np.mean(fresh):.0%} of hovering steps")
+
+    # turn away from every tag: the feed stops and nothing takes over the sticks
+    fresh_start(u)
+    went_lost = torch.zeros_like(u.lost)
+    frozen_ok, policy_flies = True, True
+    for _ in range(int(9.0 / u.step_dt)):  # rc yaw 20 cw ~ 12 deg/s: ~110 deg, past every tag
+        before = u.pub_pos.clone()
+        was_lost = u.lost.clone()
+        u.step(sticks(u, (0, 0, 0, 20)))
+        stay = was_lost & u.lost
+        frozen_ok &= bool(torch.allclose(u.pub_pos[stay], before[stay]))
+        policy_flies &= bool((u.last_rc[..., 3] == 20).all())
+        went_lost |= u.lost
+    check(went_lost.float().mean().item() > 0.5, f"{went_lost.float().mean():.0%} of drones turned away from the tags went lost")
+    check(frozen_ok, "a lost drone publishes nothing new (its last position stays frozen)")
+    check(policy_flies, "the policy's sticks keep flying a lost drone (no scripted search takes over)")
+    back = torch.zeros_like(went_lost)
+    for _ in range(int(12.0 / u.step_dt)):  # turn back the other way
+        u.step(sticks(u, (0, 0, 0, -20)))
+        back |= went_lost & ~u.lost
+    rate = (back.sum() / went_lost.sum().clamp(min=1)).item()
+    check(rate > 0.9, f"{rate:.0%} of lost drones publish again once they turn back to the tags")
+
+
+# -- commands -------------------------------------------------------------------
+
+
+def test_commands(env, u) -> None:
+    print("\n== commands (real Tello SDK: rc -100..100 per channel, land) ==")
+    lo, hi = u.rc.lo.tolist(), u.rc.hi.tolist()
+    print("  range: " + ", ".join(f"{ch} {int(a):+d}..{int(b):+d}" for ch, a, b in zip(("right", "forward", "up", "yaw"), lo, hi)))
+    fresh_start(u)
+    inside = True
+    for _ in range(60):  # random policy outputs, any magnitude
+        acts = {k: (2.5 * torch.randn(u.num_envs, 5, device=u.device)).clamp(-1, 1) for k in u.cfg.possible_agents}
+        for k in acts:
+            acts[k][:, 4] = -1.0  # no land in this part
+        env.step(acts)
+        rc = u.last_rc
+        inside &= bool(((rc >= u.rc.lo - 1e-6) & (rc <= u.rc.hi + 1e-6)).all()) and bool((rc == rc.round()).all())
+    check(inside, f"random policy outputs only ever produce integer rc inside {int(lo[0])}..{int(hi[0])}")
+    ext = u.rc.to_rc(torch.tensor([[1.0] * 4, [-1.0] * 4], device=u.device))
+    check(ext[0].tolist() == [100.0] * 4 and ext[1].tolist() == [-100.0] * 4,
+          f"action +-1 is rc +-100 on every channel: +1 -> {ext[0].tolist()}, -1 -> {ext[1].tolist()}")
+
+    # land gate: before the waypoint, land is blocked and each request costs rew_early_land
+    fresh_start(u)
+    n = 3 * u.cfg.land_confirm_steps
+    for _ in range(n):
+        env.step(sticks(u, (0, 0, 0, 0), land=True))
+    pen = u._ep_rew["early_land_loss"].mean().item() / u.cfg.num_drones
+    check(not u.landing.any().item() and abs(pen - 3 * u.cfg.rew_early_land) < 1e-3,
+          f"before the waypoint land is blocked and penalized ({n} steps of land: {pen:.0f} per drone, no land sent)")
+
+    fresh_start(u)
+    u.at_waypoint[:] = True  # inside the bubble: land goes out, no penalty
+    for _ in range(int(6.0 / u.step_dt)):
+        env.step(sticks(u, (0, 0, 0, 0), land=True))
+        if u.outcome_valid.all():
+            break
+    landed = u.outcome_landed.mean().item()
+    check(landed == u.cfg.num_drones, f"land: all {u.cfg.num_drones} drones touch down ({landed:.2f} on average) with no crash "
+          f"({u.outcome_crash.float().mean():.0%})" if landed == u.cfg.num_drones else f"land: only {landed:.2f} drones touched down")
+    full = u.cfg.rew_time * (u.max_episode_length - 1) * u.cfg.num_drones
+    got = u.outcome_rew["landing_loss"].mean().item()
+    check(abs(got - full) < 0.02 * abs(full), f"landing off the spot early still pays the whole episode's landing loss ({got:.0f} vs {full:.0f})")
+    lr = u.outcome_rew["land_reward"].mean().item() / u.cfg.num_drones
+    el = u.outcome_rew["early_land_loss"].abs().max().item()
+    check(abs(lr - u.cfg.rew_land) < 1e-3 and el < 1e-6,
+          f"after the waypoint land is free and touchdown pays rew_land ({lr:.0f} per drone, early-land loss {el:.0f})")
+
+    # waypoint phase: closing in pays until the waypoint is reached, then nothing
+    for reached in (False, True):
+        fresh_start(u)
+        u.at_waypoint[:] = reached
+        before = u._ep_rew["closer_reward"].clone()
+        for _ in range(int(2.0 / u.step_dt)):
+            env.step(sticks(u, (0, 40, 30, 0)))  # forward and up: toward the waypoint
+            u.at_waypoint[:] = reached
+        gained = (u._ep_rew["closer_reward"] - before).mean().item()
+        if reached:
+            check(abs(gained) < 1e-6, f"after reaching its waypoint a drone earns no closer reward ({gained:.3f})")
+        else:
+            check(gained > 1.0, f"before reaching its waypoint, closing on it pays (+{gained:.1f} per env in 2 s)")
+    # moving away costs rew_away_ratio of the closer rate
+    fresh_start(u)
+    d0 = torch.linalg.norm(u._positions() - (u._spots + u._wp_offset), dim=-1).sum(-1)
+    before = u._ep_rew["closer_reward"].clone()
+    for _ in range(int(1.5 / u.step_dt)):
+        env.step(sticks(u, (0, -30, 0, 0)))  # backward, away from tag 10 and the waypoints
+    d1 = torch.linalg.norm(u._positions() - (u._spots + u._wp_offset), dim=-1).sum(-1)
+    live = ~u.outcome_valid
+    paid = (u._ep_rew["closer_reward"] - before)[live]
+    lost_m = (d1 - d0)[live]
+    want = -u.cfg.rew_away_ratio * u.cfg.rew_closer_scale * lost_m
+    ok = bool(live.any()) and (lost_m > 0.1).all().item() and torch.allclose(paid, want, rtol=0.05, atol=0.05)
+    check(ok, f"moving away costs {u.cfg.rew_away_ratio} x the closer rate ({paid.mean():.2f} for {lost_m.mean():.2f} m lost per env, "
+              f"expected {want.mean():.2f})")
+
+
+# -- motion ---------------------------------------------------------------------
+
+
+def step_response(u, rc, seconds: float):
+    fresh_start(u)
+    for _ in range(int(0.5 / u.step_dt)):  # settle
+        u.step(sticks(u, (0, 0, 0, 0)))
+    traces = []
+    for _ in range(int(seconds / u.step_dt)):
+        u.step(sticks(u, rc))
+        v = u._stack("root_lin_vel_w")
+        yaw = _yaw_of(u._stack("root_quat_w"))
+        c, s = torch.cos(yaw), torch.sin(yaw)
+        fwd = c * v[..., 0] + s * v[..., 1]
+        right = s * v[..., 0] - c * v[..., 1]
+        yaw_rate_cw = -torch.rad2deg(u._stack("root_ang_vel_w")[..., 2])
+        traces.append(torch.stack([right, fwd, v[..., 2], yaw_rate_cw], -1).mean(dim=(0, 1)))
+    return torch.stack(traces).cpu().numpy()  # (T, 4): right, forward, up m/s; yaw deg/s (cw)
+
+
+def test_motion(env, u) -> None:
+    fit = load_motion_fit(u.cfg.rc.fit_path)
+    print("\n== command timing (one policy step = one rc packet) ==")
+    check(abs(u.step_dt - 1.0 / u.cfg.command_rate_hz) < 1e-9,
+          f"policy step {u.step_dt * 1000:.1f} ms = 1 / command_rate_hz ({u.cfg.command_rate_hz:.2f} Hz, "
+          f"{u.cfg.decimation} physics steps of {u.physics_dt * 1000:.0f} ms)")
+    fresh_start(u)
+    lost = []
+    for _ in range(100):
+        u.step(sticks(u, (0, 0, 0, 0)))
+        lost.append(u.rc_lost.float().mean().item())
+    want = 0.5 * sum(u.cfg.link_loss_range)
+    check(abs(np.mean(lost) - want) < 0.02, f"rc packets lost {np.mean(lost):.1%} (link_loss_range mean {want:.1%})")
+
+    print(f"\n== motion vs fit ({fit['source']}) ==")
+    names = ("right", "forward", "up", "yaw")
+    for ch in ("forward", "right", "up", "yaw"):
+        k = names.index(ch)
+        # 3 s at rc 50 stays inside the room; strafe left, away from the tag-5 wall at Y = 1.7 m
+        rc_val = {"yaw": 100, "right": -50}.get(ch, 50)
+        rc = [0, 0, 0, 0]
+        rc[k] = rc_val
+        trace = step_response(u, rc, 3.0)[:, k]
+        gain = fit[ch]["gain"] * (180 / math.pi if ch == "yaw" else 1.0)
+        want = gain * rc_val
+        got = float(np.mean(trace[-10:]))
+        sgn = 1.0 if want >= 0 else -1.0
+        rise = sgn * trace >= 0.63 * abs(want)
+        t63 = (np.argmax(rise) + 1) * u.step_dt if rise.any() else float("inf")
+        want_t = fit[ch]["tau"] + fit[ch]["delay"]
+        unit = "deg/s" if ch == "yaw" else "m/s"
+        check(abs(got - want) <= 0.15 * abs(want), f"rc {ch} {rc_val}: steady {got:.3f} {unit} (fit {want:.3f})")
+        check(t63 <= 2.0 * want_t + 0.15, f"rc {ch} {rc_val}: 63% rise in {t63:.2f} s (fit tau + delay {want_t:.2f} s)")
+    db = int(fit["forward"]["deadband"])
+    if db > 1 and u.rc.hi[1] >= db - 1:
+        trace = step_response(u, (0, db - 1, 0, 0), 1.5)[:, 1]
+        check(abs(trace[-5:].mean()) < 0.02, f"rc forward {db - 1} (inside the deadband) does not move ({trace[-5:].mean():.3f} m/s)")
+
+
+# -- baselines ------------------------------------------------------------------
+
+
+def test_baselines(env, u, episodes: int) -> None:
+    """Zero sticks: never succeeds, and its landing / no-tag losses equal -0.5 x the off-spot
+    and tag-less drone-steps it accumulated."""
+    print("\n== baselines (zero sticks) ==")
+    fresh_start(u)
+    off_steps = torch.zeros(u.num_envs, device=u.device)
+    blind_steps = torch.zeros(u.num_envs, device=u.device)
+    totals = {"success": 0.0, "landing": 0.0, "no_tag": 0.0, "crash": 0.0, "time": 0.0, "off": 0.0, "blind": 0.0}
+    done_count = 0
+    while done_count < episodes:
+        env.step(sticks(u, (0, 0, 0, 0)))
+        off_steps += (~u.land_ok).float().sum(-1)
+        blind_steps += (~u.fresh & ~u.landed & ~u.taking_off).float().sum(-1)
+        fin = u.outcome_valid
+        if fin.any():
+            idx = fin.nonzero().flatten()
+            done_count += len(idx)
+            totals["success"] += u.outcome_success[idx].float().sum().item()
+            totals["landing"] += u.outcome_rew["landing_loss"][idx].sum().item()
+            totals["no_tag"] += u.outcome_rew["no_tag_loss"][idx].sum().item()
+            totals["crash"] += u.outcome_rew["crash_loss"][idx].sum().item()
+            parts = sum(u.outcome_rew[k][idx] for k in u.REWARD_TERMS if k != "total")
+            totals["terms_err"] = max(totals.get("terms_err", 0.0), (parts - u.outcome_rew["total"][idx]).abs().max().item())
+            totals["time"] += u.outcome_time[idx].sum().item()
+            totals["off"] += off_steps[idx].sum().item()
+            totals["blind"] += blind_steps[idx].sum().item()
+            off_steps[idx] = 0.0
+            blind_steps[idx] = 0.0
+    m = {k: v / done_count for k, v in totals.items()}
+    print(f"  zero     : success {m['success']:.0%}, time {m['time']:.1f} s, landing loss {m['landing']:.0f}, "
+          f"no-tag loss {m['no_tag']:.0f}, crash loss {m['crash']:.0f}  ({done_count} episodes)")
+    check(m["success"] == 0.0, f"zero sticks never succeed ({m['success']:.0%})")
+    check(totals.get("terms_err", 0.0) < 1e-2, f"the {len(u.REWARD_TERMS) - 1} logged reward terms add up to the total reward "
+          f"(worst episode mismatch {totals.get('terms_err', 0.0):.1e})")
+    # counts are read after the auto-reset, so an episode's last step may differ by 1 per drone
+    slack = 0.5 * u.cfg.num_drones + 1e-3
+    check(abs(m["landing"] - u.cfg.rew_time * m["off"]) <= slack,
+          f"landing loss = -0.5 x off-spot drone-steps ({m['landing']:.0f} vs {u.cfg.rew_time * m['off']:.0f})")
+    check(abs(m["no_tag"] - u.cfg.rew_no_fix * m["blind"]) <= slack,
+          f"no-tag loss = -0.5 x drone-steps without a tag ({m['no_tag']:.0f} vs {u.cfg.rew_no_fix * m['blind']:.0f})")
+
+
+def test_central(env, u) -> None:
+    from action_space_kit.rl.sb3_shared import Sb3CentralVecEnv
+
+    print(f"\n== central controller (one policy for all {u.cfg.num_drones} drone(s)) ==")
+    venv = Sb3CentralVecEnv(env)
+    obs = venv.reset()
+    D, dim = u.cfg.num_drones, u.cfg.observation_spaces[u.cfg.possible_agents[0]]
+    check(obs.shape == (u.num_envs, D * dim) and venv.action_space.shape == (D * 5,),
+          f"one row per env: observation {obs.shape[1]} (= {D} x {dim}), action {venv.action_space.shape[0]} (= {D} x 5)")
+    acts = np.random.uniform(-1, 1, (u.num_envs, D * 5)).astype(np.float32)
+    acts[:, 4::5] = -1.0  # no land
+    venv.step_async(acts)
+    obs, rew, dones, _ = venv.step_wait()
+    sent = u._actions.reshape(u.num_envs, -1).cpu().numpy()
+    live = ~dones  # an env that finished this step reset and cleared its stored actions
+    check(np.allclose(sent[live], acts[live], atol=1e-6),
+          f"action slice i drives drone i (all {D * 5} numbers reach their drones; {int(live.sum())} running envs)")
+    team = u._ep_rew["total"].cpu().numpy()  # this episode's sum over drones, one step in
+    check(np.allclose(rew[~dones], team[~dones], atol=1e-3), f"the central reward is the team reward (sum over the {D} drone(s))")
+
+
+def test_kalman(env, u) -> None:
+    from action_space_kit.tags.kalman import FILTER_PATH, KalmanCfg, KalmanCV
+
+    print(f"\n== Kalman filter ({FILTER_PATH.name}, shared with the laptop) ==")
+    # 1) one implementation: numpy (laptop) and torch (sim) agree on the same fixes
+    rng = np.random.default_rng(1)
+    kcfg = KalmanCfg()
+    k_np = KalmanCV(kcfg, (2,))
+    k_t = KalmanCV(kcfg, (2,), xp=torch, device=u.device)
+    worst = 0.0
+    for k in range(150):
+        z = np.stack([[5.0 - 0.03 * k, 0.1, 1.0], [6.0, -0.2 + 0.02 * k, 1.2]]) + rng.normal(0, 0.15, (2, 3))
+        if k == 90:
+            z[0, 1] += 0.9  # a pose flip
+        seen = rng.random(2) > 0.2
+        k_np.predict(u.step_dt)
+        k_t.predict(u.step_dt)
+        k_np.update(z, mask=seen)
+        k_t.update(torch.as_tensor(z, dtype=torch.float32, device=u.device), mask=torch.as_tensor(seen, device=u.device))
+        worst = max(worst, float(np.abs(k_t.p.cpu().double().numpy() - k_np.p).max()))
+    check(worst < 1e-3, f"numpy (laptop) and torch (sim) run the same filter (max difference {worst * 1000:.3f} mm over 150 ticks)")
+
+    # 2) in flight: the published (filtered) position is closer to the truth than the raw fix
+    fresh_start(u)
+    for _ in range(int(1.0 / u.step_dt)):  # settle into takeoff / hover
+        env.step(sticks(u, (0, 0, 0, 0)))
+    fly = sticks(u, (0, 35, 0, 0))
+    err_raw, err_kf, n = 0.0, 0.0, 0
+    for _ in range(int(4.0 / u.step_dt)):
+        env.step(fly)
+        ok = u.kf.ready & ~u.lost & ~u.landed & ~u.taking_off & ~u.outcome_valid.unsqueeze(-1)
+        truth = u._positions()
+        err_raw += (torch.linalg.norm(u.raw_pos - truth, dim=-1) * ok).sum().item()
+        err_kf += (torch.linalg.norm(u.pub_pos - truth, dim=-1) * ok).sum().item()
+        n += ok.sum().item()
+    raw_cm, kf_cm = 100 * err_raw / max(n, 1), 100 * err_kf / max(n, 1)
+    check(n > 0 and kf_cm < raw_cm, f"flying at rc 35: filtered position {kf_cm:.1f} cm from the truth vs raw fix {raw_cm:.1f} cm "
+          f"(noise unchanged, {n} drone-steps)")
+
+
+def test_single(env, u) -> None:
+    cfg = u.cfg
+    print("\n== single drone from the floor (takeoff, then the sticks) ==")
+    D = cfg.num_drones
+    dim = cfg.observation_spaces[cfg.possible_agents[0]]
+    obs = env.reset()[0]["drone_0"]
+    fresh_start(u)
+    pos0 = u._positions()
+    check(D == 1 and dim == 25, f"one drone, observation {dim} (= 24 + taking-off flag)")
+    check(((pos0[..., 2] - cfg.rest_height).abs() < 0.01).all().item() and u.taking_off.all().item(),
+          f"starts on the floor (z {pos0[..., 2].mean():.3f} m), takeoff sent")
+    xy = pos0[..., :2]
+    r = torch.linalg.norm(xy, dim=-1)
+    cx, cy = cfg.spawn_box_center
+    h = 0.5 * cfg.spawn_box_size + 1e-3
+    check(((xy[..., 0] - cx).abs() <= h).all().item() and ((xy[..., 1] - cy).abs() <= h).all().item()
+          and (r >= cfg.spawn_range[0] - 1e-3).all().item() and (r <= cfg.spawn_range[1] + 1e-3).all().item(),
+          f"start in the {cfg.spawn_box_size:.0f} m box, {r.min():.2f}-{r.max():.2f} m from tag 10")
+    spot_y = torch.round(u._spots[:, 0, 1] / cfg.spot_spacing * 2).unique().numel()
+    check(spot_y == cfg.spot_count, f"the drone gets every one of the {cfg.spot_count} spots across envs ({spot_y} seen)")
+
+    # full sticks + land during takeoff: ignored, the firmware climbs straight up
+    push = sticks(u, (100, 100, 100, 100), land=True)
+    for _ in range(5):
+        obs = env.step(push)[0]["drone_0"]
+    check(torch.allclose(obs[:, -1], u.taking_off[:, 0].float()), "the observation's last number is the taking-off flag")
+    ep = u._ep_rew
+    check(ep["closer_reward"].abs().max().item() < 1e-6 and ep["no_tag_loss"].abs().max().item() < 1e-6,
+          "takeoff steps pay no closer reward and no no-tag loss (the firmware is flying)")
+    check(torch.allclose(ep["landing_loss"], torch.full_like(ep["landing_loss"], 5 * cfg.rew_time)),
+          f"... but the landing loss runs ({ep['landing_loss'].mean():.1f} after 5 steps)")
+    check(not u.landing.any().item(), "land asked for during takeoff is not sent")
+    steps, t_up = 0, torch.full((u.num_envs,), float("nan"), device=u.device)
+    z_up = torch.zeros(u.num_envs, device=u.device)
+    crashed = torch.zeros(u.num_envs, dtype=torch.bool, device=u.device)
+    hold = sticks(u, (0, 0, 0, 0))  # after its takeoff a drone flies the sticks: hold it
+    while u.taking_off.any() and steps < int(6.0 / u.step_dt):
+        was = u.taking_off[:, 0].clone()
+        env.step(push if steps < 3 else hold)
+        steps += 1
+        crashed |= u.outcome_valid
+        up = was & ~u.taking_off[:, 0]
+        t_up = torch.where(up, torch.full_like(t_up, steps * u.step_dt), t_up)
+        z_up = torch.where(up, u._positions()[:, 0, 2], z_up)
+    drift = torch.linalg.norm(u._positions()[..., :2] - xy, dim=-1).max().item()
+    check(not u.taking_off.any().item() and not crashed.any().item(),
+          f"every takeoff completes without a crash ({(5 * u.step_dt + t_up).mean():.1f} s mean, {int(crashed.sum())} ended)")
+    check((z_up > cfg.takeoff_height[0] - 0.02).all().item() and (z_up < cfg.takeoff_height[1] + 0.1).all().item(),
+          f"takeoff ends at {z_up.min():.2f}-{z_up.max():.2f} m (takeoff_height {cfg.takeoff_height})")
+    check(drift < 0.15, f"full sticks during takeoff are ignored (max horizontal drift {drift * 100:.0f} cm)")
+    # now the sticks fly it: forward toward tag 10
+    fwd = sticks(u, (0, 50, 0, 0))
+    before = u._positions()[..., 0].clone()
+    for _ in range(int(1.5 / u.step_dt)):
+        env.step(fwd)
+    moved = (before - u._positions()[..., 0]).mean().item()
+    check(moved > 0.2, f"after takeoff the sticks fly it (rc forward 50 for 1.5 s: {moved:.2f} m toward tag 10)")
+
+
+def main():
+    cfg = load_cfg_from_registry(args_cli.task, "env_cfg_entry_point")
+    cfg.scene.num_envs = args_cli.num_envs
+    env = gym.make(args_cli.task, cfg=cfg)
+    env.reset()
+    u = env.unwrapped
+    if cfg.num_drones == 1:
+        if args_cli.test in ("single", "all"):
+            test_single(env, u)
+        if args_cli.test in ("kalman", "all"):
+            test_kalman(env, u)
+        if args_cli.test in ("baselines", "all"):
+            test_baselines(env, u, args_cli.episodes)
+        if args_cli.test in ("central", "all"):
+            test_central(env, u)
+        print("\n" + ("ALL CHECKS PASSED" if not FAILURES else f"{len(FAILURES)} CHECK(S) FAILED:\n  " + "\n  ".join(FAILURES)))
+        env.close()
+        return
+    if args_cli.test in ("geometry", "all"):
+        test_geometry(u)
+    if args_cli.test in ("sensing", "all"):
+        test_sensing(env, u)
+    if args_cli.test in ("commands", "all"):
+        test_commands(env, u)
+    if args_cli.test in ("motion", "all"):
+        test_motion(env, u)
+    if args_cli.test in ("baselines", "all"):
+        test_baselines(env, u, args_cli.episodes)
+    if args_cli.test in ("kalman", "all"):
+        test_kalman(env, u)
+    if args_cli.test in ("central", "all"):
+        test_central(env, u)
+    print("\n" + ("ALL CHECKS PASSED" if not FAILURES else f"{len(FAILURES)} CHECK(S) FAILED:\n  " + "\n  ".join(FAILURES)))
+    env.close()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        import traceback
+
+        traceback.print_exc()
+        raise
+    finally:
+        simulation_app.close()

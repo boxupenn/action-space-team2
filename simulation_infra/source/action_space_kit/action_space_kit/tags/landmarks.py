@@ -1,8 +1,8 @@
 """AprilTag landmarks (from the real-world map) for use in simulation training.
 
-`tag_landmarks.yaml` is generated from drone_deployment_infra/config/map.yaml: each tag's
-size and position in the tag-10 origin frame (metres; x right, y up, z out of the tag
-face). Use `positions()` / `load_landmarks()` to place or reference the tags in a sim
+Reads drone_deployment_infra/config/map.yaml and tags.yaml directly (via ``room_map``):
+each tag's size and position in the tag-10 origin frame (metres; x right, y up, z out of
+the tag face). For poses in the sim world frame, use ``room_map.load_room_tags``. Use `positions()` / `load_landmarks()` to place or reference the tags in a sim
 task, and `marker_cfg()` to draw them (Isaac is imported lazily, so this module loads
 fine without Isaac for tooling/tests).
 """
@@ -13,13 +13,15 @@ from pathlib import Path
 
 import yaml
 
-_HERE = Path(__file__).resolve().parent
-LANDMARKS_YAML = _HERE / "tag_landmarks.yaml"
+from action_space_kit.tags.room_map import CONFIG_DIR
+
+LANDMARKS_YAML = CONFIG_DIR / "map.yaml"
 
 
 def load_landmarks(path: Path | None = None) -> dict:
     data = yaml.safe_load((Path(path) if path else LANDMARKS_YAML).read_text())
-    tags = {int(k): {"size_m": float(v["size_m"]), "pos": tuple(float(x) for x in v["pos"])}
+    sizes = yaml.safe_load((CONFIG_DIR / "tags.yaml").read_text())["sizes_mm"]
+    tags = {int(k): {"size_m": (sizes.get(int(k)) or 0.0) / 1000.0, "pos": tuple(float(x) for x in v["t"])}
             for k, v in data["tags"].items()}
     return {"origin_tag": int(data["origin_tag"]), "tags": tags}
 

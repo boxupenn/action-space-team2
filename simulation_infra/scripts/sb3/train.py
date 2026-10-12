@@ -76,7 +76,7 @@ import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import action_space_kit.tasks  # noqa: F401
-from action_space_kit.rl.sb3_shared import LogExtrasCallback, Sb3SharedPolicyVecEnv
+from action_space_kit.rl.sb3_shared import LogExtrasCallback, Sb3CentralVecEnv, Sb3SharedPolicyVecEnv
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -90,8 +90,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.seed = agent_cfg["seed"]
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
 
-    # every agent of a MARL env is one SB3 row, so rollouts are that many times larger
-    num_agents = len(env_cfg.possible_agents) if isinstance(env_cfg, DirectMARLEnvCfg) else 1
+    # shared policy: every agent of a MARL env is one SB3 row, so rollouts are that many times
+    # larger; central policy (agent cfg ``central: true``): one row per env, all agents at once
+    central = bool(agent_cfg.pop("central", False))
+    num_agents = len(env_cfg.possible_agents) if isinstance(env_cfg, DirectMARLEnvCfg) and not central else 1
     num_rows = env_cfg.scene.num_envs * num_agents
     if args_cli.max_iterations is not None:
         agent_cfg["n_timesteps"] = args_cli.max_iterations * agent_cfg["n_steps"] * num_rows
@@ -123,7 +125,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     start_time = time.time()
     if isinstance(env.unwrapped, DirectMARLEnv):
-        env = Sb3SharedPolicyVecEnv(env)
+        env = Sb3CentralVecEnv(env) if central else Sb3SharedPolicyVecEnv(env)
+        print(f"[INFO] {'central policy: one controller for all agents' if central else 'shared per-agent policy'}")
         callbacks = [LogExtrasCallback(env)]
     else:
         env = Sb3VecEnvWrapper(env)

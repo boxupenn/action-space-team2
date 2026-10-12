@@ -56,7 +56,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 from isaaclab_tasks.utils.parse_cfg import get_checkpoint_path
 
 import action_space_kit.tasks  # noqa: F401
-from action_space_kit.rl.sb3_shared import Sb3SharedPolicyVecEnv
+from action_space_kit.rl.sb3_shared import Sb3CentralVecEnv, Sb3SharedPolicyVecEnv
 
 
 def vecnormalize_path(checkpoint_path: str) -> Path:
@@ -97,7 +97,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print_dict(video_kwargs, nesting=4)
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
     shared = isinstance(env.unwrapped, DirectMARLEnv)
-    env = Sb3SharedPolicyVecEnv(env) if shared else Sb3VecEnvWrapper(env)
+    wrapper = Sb3CentralVecEnv if agent_cfg.get("central", False) else Sb3SharedPolicyVecEnv
+    env = wrapper(env) if shared else Sb3VecEnvWrapper(env)
     base_env = env
 
     norm_path = vecnormalize_path(checkpoint_path)

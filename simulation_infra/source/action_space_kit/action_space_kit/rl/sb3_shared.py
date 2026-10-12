@@ -1,4 +1,9 @@
-"""Stable-Baselines3 wrapper that trains one policy shared by every agent of a MARL env.
+"""Stable-Baselines3 wrappers for MARL envs: a shared per-agent policy, or one central policy.
+
+``Sb3CentralVecEnv`` (agent cfg ``central: true``) is one controller for all agents: one row
+per env, all observations in, all actions out, team reward. The rest of this note describes
+the shared per-agent wrapper.
+
 
 Isaac Lab's ``Sb3VecEnvWrapper`` only takes single-agent envs, and its
 ``multi_agent_to_single_agent`` concatenates all agents into one centralized policy (16-D
@@ -124,6 +129,68 @@ class Sb3SharedPolicyVecEnv(VecEnv):
 
     def seed(self, seed: int | None = None):  # noqa: D102
         return [self.unwrapped_env.seed(seed)] * self.num_envs
+
+
+class Sb3CentralVecEnv(Sb3SharedPolicyVecEnv):
+    """One central policy for all agents of a :class:`DirectMARLEnv`: one SB3 row per env.
+
+    The observation is every agent's observation concatenated in agent order, the action is
+    every agent's action concatenated (agent i owns slice [i * act_dim, (i + 1) * act_dim)),
+    and the reward is the team reward, the sum over agents. This is a single controller (the
+    laptop) flying all the drones at once.
+    """
+
+    def __init__(self, env: gym.Env):
+        super().__init__(env)
+        A = self.num_agents
+        obs_dim = int(np.prod(self.observation_space.shape))
+        act = self.action_space
+        self._act_dim = int(np.prod(act.shape))
+        observation_space = gym.spaces.Box(-np.inf, np.inf, shape=(A * obs_dim,), dtype=np.float32)
+        action_space = gym.spaces.Box(np.tile(act.low, A), np.tile(act.high, A), dtype=np.float32)
+        VecEnv.__init__(self, self.num_isaac_envs, observation_space, action_space)
+        self._ep_rew_buf = np.zeros(self.num_envs)
+        self._ep_len_buf = np.zeros(self.num_envs)
+
+    def _central(self, per_agent: dict[str, torch.Tensor]) -> torch.Tensor:
+        """dict of (E, obs_dim) -> (E, A * obs_dim), agent order."""
+        return torch.cat([per_agent[a] for a in self.agents], dim=-1)
+
+    def reset(self) -> VecEnvObs:  # noqa: D102
+        obs_dict, _ = self.env.reset()
+        self._ep_rew_buf[:] = 0.0
+        self._ep_len_buf[:] = 0
+        return self._to_numpy(self._central(obs_dict))
+
+    def step_async(self, actions):  # noqa: D102
+        if not isinstance(actions, torch.Tensor):
+            actions = torch.from_numpy(np.asarray(actions))
+        actions = actions.to(device=self.sim_device, dtype=torch.float32)
+        actions = actions.view(self.num_isaac_envs, self.num_agents, self._act_dim)
+        self._async_actions = {a: actions[:, i] for i, a in enumerate(self.agents)}
+
+    def step_wait(self) -> VecEnvStepReturn:  # noqa: D102
+        obs_dict, rew_dict, term_dict, trunc_dict, extras = self.env.step(self._async_actions)
+        obs = self._to_numpy(self._central(obs_dict))
+        rewards = self._to_numpy(torch.stack([rew_dict[a] for a in self.agents], dim=1).sum(dim=1))
+        a0 = self.agents[0]  # every agent of an env shares its reset
+        terminated = self._to_numpy(term_dict[a0])
+        truncated = self._to_numpy(trunc_dict[a0])
+        dones = terminated | truncated
+
+        if extras.get("log"):
+            self.log_buffer.append(dict(extras["log"]))
+
+        self._ep_rew_buf += rewards
+        self._ep_len_buf += 1
+        infos: list[dict[str, Any]] = [{} for _ in range(self.num_envs)]
+        for idx in dones.nonzero()[0]:
+            infos[idx]["episode"] = {"r": self._ep_rew_buf[idx], "l": self._ep_len_buf[idx]}
+            infos[idx]["TimeLimit.truncated"] = bool(truncated[idx] and not terminated[idx])
+            infos[idx]["terminal_observation"] = obs[idx]
+        self._ep_rew_buf[dones] = 0.0
+        self._ep_len_buf[dones] = 0
+        return obs, rewards, dones, infos
 
 
 class LogExtrasCallback(BaseCallback):
