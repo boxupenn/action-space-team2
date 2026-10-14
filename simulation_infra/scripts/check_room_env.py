@@ -32,7 +32,7 @@ from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 parser.add_argument("--task", choices=["AS-Tello-Room-v0", "AS-Tello-Room-Single-v0"], default="AS-Tello-Room-v0")
-parser.add_argument("--test", choices=["geometry", "sensing", "commands", "motion", "baselines", "kalman", "central", "single", "curriculum", "all"],
+parser.add_argument("--test", choices=["geometry", "sensing", "commands", "motion", "baselines", "kalman", "central", "single", "curriculum", "precision", "all"],
                     default="all")
 parser.add_argument("--num_envs", type=int, default=256)
 parser.add_argument("--episodes", type=int, default=256)
@@ -689,6 +689,38 @@ def test_curriculum(env, u):
         fresh_start(u)
 
 
+def test_precision(env, u):
+    print("\n== continuous precision shaping ==")
+    cfg = u.cfg
+    fields = {"rew_precision_potential": 80., "rew_settle_position": 0., "rew_settle_speed": 0.,
+              "spawn_short_fraction": .3, "spawn_hover_fraction": .15}
+    original = {key: getattr(cfg, key) for key in fields}
+    try:
+        for key, value in fields.items():
+            setattr(cfg, key, value)
+        fresh_start(u)
+        initial = u._potential(u._positions())
+        check(torch.allclose(u._prev_potential, initial, atol=1e-4),
+              "reset potential matches the actual state for all start modes")
+        u.at_waypoint[:] = True
+        check(torch.equal(initial, u._potential(u._positions())),
+              "latching the waypoint introduces no new precision cost")
+        finite = True
+        for _ in range(40):
+            obs, reward, _, _, _ = env.step(sticks(u, (0, 0, 0, 0)))
+            finite &= all(bool(torch.isfinite(v).all()) for v in (*obs.values(), *reward.values()))
+        check(finite, "precision shaping produces finite observations and rewards")
+        check(bool((u._ep_rew["settling_loss"] == 0).all()), "milestone-triggered settling costs are disabled")
+        ids = torch.arange(0, u.num_envs, 2, device=u.device)
+        u._reset_idx(ids)
+        check(torch.allclose(u._prev_potential[ids], u._potential(u._positions())[ids], atol=1e-4),
+              "partial resets initialize precision potential from reset pose and zero velocity")
+    finally:
+        for key, value in original.items():
+            setattr(cfg, key, value)
+        fresh_start(u)
+
+
 def main():
     cfg = load_cfg_from_registry(args_cli.task, "env_cfg_entry_point")
     cfg.scene.num_envs = args_cli.num_envs
@@ -700,6 +732,8 @@ def main():
             test_single(env, u)
         if args_cli.test in ("curriculum", "all"):
             test_curriculum(env, u)
+        if args_cli.test in ("precision", "all"):
+            test_precision(env, u)
         if args_cli.test in ("kalman", "all"):
             test_kalman(env, u)
         if args_cli.test in ("baselines", "all"):

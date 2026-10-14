@@ -212,6 +212,9 @@ class TelloRoomEnvCfg(DirectMARLEnvCfg):
     reward_version = 2
     reward_gamma = 0.995  # train.py verifies this equals PPO gamma
     rew_potential_scale = 40.0
+    rew_precision_potential = 0.0  # opt-in; replaces milestone-triggered settling costs in new runs
+    precision_position_scale = 0.20
+    precision_speed_scale = 0.15
     rew_settle_position = -2.0  # per metre per second after reaching the waypoint
     rew_settle_speed = -1.0  # per m/s per second after reaching the waypoint
     rew_closer_scale = 100.0  # legacy reward_version=1 only

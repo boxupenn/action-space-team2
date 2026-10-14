@@ -94,6 +94,25 @@ with patch.dict(sys.modules, {"isaaclab.envs": isaac_stub}):
 
 
 class PolicyContractTests(unittest.TestCase):
+    def test_precision_shaping_prefers_slow_accurate_arrival(self):
+        distance = np.array([0., .2, .5, 0.])
+        speed = np.array([0., 0., 0., .3])
+        p = rewards.precision_potential(distance, speed, 80., .2, .15, np)
+        self.assertEqual(p[0], 80.)
+        self.assertTrue(np.all((p >= 0) & (p <= 80)))
+        self.assertGreater(p[0], p[1])
+        self.assertGreater(p[1], p[2])
+        self.assertGreater(p[0], p[3])
+        tensor = rewards.precision_potential(torch.tensor(distance), torch.tensor(speed), 80., .2, .15, torch)
+        np.testing.assert_allclose(p, tensor.numpy())
+        # Adding precision shaping retains the same discounted telescoping property.
+        gamma = .995
+        total = sum(gamma**i * rewards.potential_delta(p[i], p[i+1], np.array(i == 2), gamma, np)
+                    for i in range(3))
+        self.assertAlmostEqual(total, -p[0])
+        with self.assertRaises(ValueError):
+            rewards.precision_potential(distance, speed, 80., 0., .15, np)
+
     def test_warm_start_preserves_deterministic_actor(self):
         env = gym.make("Pendulum-v1")
         model = PPO("MlpPolicy", env, n_steps=8, batch_size=8, n_epochs=1, device="cpu", seed=9)

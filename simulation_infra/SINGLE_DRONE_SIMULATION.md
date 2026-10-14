@@ -201,6 +201,15 @@ checkpoint's return variance. This scales the value head and clears its critic o
 moments while preserving actor outputs. Record the exact factor with the run; evaluation
 always reports the original physical success metrics, with reward normalization disabled.
 
+An experimental continuous settling reward is available with
+`env.rew_precision_potential=80.0 env.rew_settle_position=0.0 env.rew_settle_speed=0.0`.
+It adds a bounded position/speed potential before and after the waypoint, rather than
+introducing a new per-step liability when the waypoint flag latches. The precision term
+peaks at 80 at the waypoint with zero horizontal speed, with 0.20 m position and 0.15 m/s
+speed scales. It uses the same discounted potential difference and absorbing-terminal
+handling as the approach term. This changes training rewards only; the landing gate and
+success radius stay unchanged. The default weight is zero to preserve saved-run replay.
+
 For example, after the landing stage passes its evaluations:
 
 ```bash

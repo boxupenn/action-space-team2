@@ -47,7 +47,7 @@ from isaaclab.utils.math import matrix_from_quat, quat_from_euler_xyz
 from action_space_kit.assets import TELLO_CFG
 from action_space_kit.control import RcAction, TelloCascadeController, apply_motion_fit, load_motion_fit
 from action_space_kit.control.landing import update_landing_gate
-from action_space_kit.rl.rewards import potential_delta
+from action_space_kit.rl.rewards import potential_delta, precision_potential
 from action_space_kit.rl.start_curriculum import mix_starts, validate_start_mixture
 from action_space_kit.rl.terminal_observation import TerminalObservationMixin
 from action_space_kit.tags.kalman import KalmanCV
@@ -590,9 +590,15 @@ class TelloRoomEnv(TerminalObservationMixin, DirectMARLEnv):
     def _potential(self, pos):
         cfg = self.cfg
         dist = torch.linalg.norm(pos - (self._spots + self._wp_offset), dim=-1)
-        approach = torch.exp(-dist / 2.0)
+        approach = cfg.rew_potential_scale * torch.exp(-dist / 2.0)
+        peak = cfg.rew_potential_scale
+        if cfg.rew_precision_potential:
+            speed = torch.linalg.norm(self._stack("root_lin_vel_w")[..., :2], dim=-1)
+            approach += precision_potential(dist, speed, cfg.rew_precision_potential,
+                                            cfg.precision_position_scale, cfg.precision_speed_scale, torch)
+            peak += cfg.rew_precision_potential
         descent = 1.0 + (1.0 - pos[..., 2] / cfg.waypoint_height).clamp(0.0, 1.0)
-        return cfg.rew_potential_scale * torch.where(self.landing, descent, approach)
+        return torch.where(self.landing, peak * descent, approach)
 
     def _get_observations(self) -> dict[str, torch.Tensor]:
         """Each drone's block of the central observation (Sb3CentralVecEnv concatenates them)."""
@@ -745,6 +751,10 @@ class TelloRoomEnv(TerminalObservationMixin, DirectMARLEnv):
         self._early_land[env_ids] = False
         self._prev_dist[env_ids] = torch.linalg.norm(start - (self._spots[env_ids] + self._wp_offset), dim=-1)
         self._prev_potential[env_ids] = cfg.rew_potential_scale * torch.exp(-self._prev_dist[env_ids] / 2.0)
+        if cfg.rew_precision_potential:
+            self._prev_potential[env_ids] += precision_potential(
+                self._prev_dist[env_ids], torch.zeros_like(self._prev_dist[env_ids]),
+                cfg.rew_precision_potential, cfg.precision_position_scale, cfg.precision_speed_scale, torch)
         self._ep_collision[env_ids] = False
         self._ep_crash[env_ids] = False
         self._ep_fast_entry[env_ids] = False
