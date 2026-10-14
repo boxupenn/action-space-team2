@@ -100,10 +100,10 @@ class TelloRoomEnvCfg(DirectMARLEnvCfg):
 
     # -- room (from drone_deployment_infra/config/map.yaml; only the floor is hand-measured)
     num_drones = NUM_DRONES
-    tag10_height = 1.2  # [m] centre of tag 10 above the floor (>= ~1.0: tags 6/7 sit 0.9 m below it)
+    tag10_height = 1.22  # [m] centre of tag 10 above the floor: measured ~48 in (2026-10-14)
     wall_x = -0.10  # [m] tag-10 wall surface (tags 8/9 map ~8 cm behind tag 10)
     side_wall_y = 1.70  # [m] tag-5 wall surface
-    room_y_min = -2.5  # [m] open side, not mapped
+    room_y_min = -2.0  # [m] left wall (facing tag 10): measured 2 m left of tag 10's centre
     room_x_max = 8.5  # [m] not mapped; the start box reaches 7.5 m
     ceiling = 2.74  # [m] 9 ft
     wall_clearance = 0.2  # [m] closer than this to a wall counts as a crash
@@ -137,12 +137,20 @@ class TelloRoomEnvCfg(DirectMARLEnvCfg):
     # for landing (land is gated until then; landing on the spot: formation) on top of the penalties.
     waypoint_height = 1.5  # [m] above the landing spot
     waypoint_radius = 0.3  # [m]
+    waypoint_max_speed = 0.3
+    """[m/s] the waypoint only counts when the drone is this slow (the Kalman filter's speed
+    estimate, which the laptop has too; the true speed with env.kalman.enabled=False): flights
+    032-034 crossed the bubble at ~2 m/s and kept going."""
     success_radius = 0.3  # [m] true touchdown point within this of the spot: landed on it
     # success: all four landed on their spots
 
     # -- land: the SDK command; the firmware descends and stops the motors at touchdown
     land_threshold = 0.5  # 5th action above this ...
     land_confirm_steps = 3  # ... this many steps in a row (~0.2 s) sends land
+    auto_land = True
+    """Send ``land`` automatically the step after a drone's published fix enters its waypoint;
+    the policy's 5th output is then ignored (no early-land loss). False: the policy decides
+    (land_threshold / land_confirm_steps, gated on the waypoint). The laptop must do the same."""
     land_speed = 0.4  # [m/s] firmware descent during land
     touchdown_height = 0.08  # [m] body centre below this: down, motors off
 
@@ -174,12 +182,14 @@ class TelloRoomEnvCfg(DirectMARLEnvCfg):
     # -- rewards (per drone, per policy step)
     rew_closer_scale = 100.0  # per metre closer to the own waypoint (until reached)
     rew_away_ratio = 0.25  # moving away costs this fraction of rew_closer_scale per metre
+    rew_waypoint = 1000.0  # once, when the drone's published fix first gets inside its waypoint
     rew_time = -0.5  # every step a drone is not landed on its spot ("landing loss"); a drone
     #                  that ends the episode early (crash, landed off the spot) pays the rest
     rew_land = 100.0  # at touchdown (land is only sent after the waypoint, see land gate)
     rew_early_land = -100.0  # each land asked for before the waypoint: blocked, and penalized
     rew_all_landed = 200.0  # to every drone, when all four landed on their spots (success)
     rew_no_fix = -0.5  # every step a flying drone has no AprilTag in view
-    rew_violation = -100.0  # collision, crash, leaving the room ("crash loss")
+    rew_violation = -100.0  # crash, wall, ceiling, flipping, leaving the room ("crash loss")
+    rew_collision = -1000.0  # to each drone closer than collision_distance to another ("collision loss")
     rew_scale_separation = -20.0  # per second, scaled by how far inside separation_distance
     rew_scale_action_rate = -0.05  # per second

@@ -6,7 +6,8 @@ one rc packet):
   action    [right, forward, up, yaw_cw, land] in [-1, 1]: the sticks become integer rc inside
             the logged command envelope (``RcAction``: only values real drones were sent);
             land > land_threshold for land_confirm_steps sends the SDK ``land``: the firmware
-            descends and cuts the motors at touchdown
+            descends and cuts the motors at touchdown (``auto_land``, the default: land is sent
+            on its own once the waypoint is reached, and the 5th output is ignored)
             -> lost on the WiFi link with the episode's loss rate (the drone holds the last rc)
             -> lands 0-16 ms late in the step -> the motion-fitted Tello firmware model -> PhysX
   sensing   the frame captured now is checked against every mapped tag (``tags.sensing``);
@@ -149,6 +150,8 @@ class TelloRoomEnv(DirectMARLEnv):
         self._done_now = torch.zeros(E, dtype=torch.bool, device=dev)
         self._all_event = torch.zeros(E, dtype=torch.bool, device=dev)
         self._violation = torch.zeros(E, D, dtype=torch.bool, device=dev)
+        self._crash = torch.zeros(E, D, dtype=torch.bool, device=dev)  # this step: crash / wall
+        self._collision = torch.zeros(E, D, dtype=torch.bool, device=dev)  # this step: too close to another drone
         self._prev_dist = torch.zeros(E, D, device=dev)
         self._ep_collision = torch.zeros(E, dtype=torch.bool, device=dev)
         self._ep_crash = torch.zeros(E, dtype=torch.bool, device=dev)
@@ -185,6 +188,8 @@ class TelloRoomEnv(DirectMARLEnv):
                  (0.1, width, cfg.ceiling)),
             Wall("tag5_wall", (cfg.wall_x + 0.5 * depth, cfg.side_wall_y + 0.05, 0.5 * cfg.ceiling),
                  (depth, 0.1, cfg.ceiling)),
+            Wall("left_wall", (cfg.wall_x + 0.5 * depth, cfg.room_y_min - 0.05, 0.5 * cfg.ceiling),
+                 (depth, 0.1, cfg.ceiling)),
         ]
 
     def _setup_scene(self):
@@ -206,9 +211,11 @@ class TelloRoomEnv(DirectMARLEnv):
     # every reward term, tallied per episode and logged as Rewards/avg_<term>_per_episode
     REWARD_TERMS = (
         "closer_reward",  # +10 per metre gained toward the own waypoint until reached, -5 per metre lost
+        "waypoint_reward",  # +1000 once, on first getting inside the waypoint radius
         "landing_loss",  # -0.5 per step not landed on the spot (+ the rest, if ended early)
         "no_tag_loss",  # -0.5 per step a flying drone has no AprilTag in view
-        "crash_loss",  # -100 per contact / crash / leaving the room
+        "crash_loss",  # -100 per crash / wall / leaving the room
+        "collision_loss",  # -1000 per drone that came within collision_distance of another
         "separation_loss",  # closer than 0.5 m to another drone
         "action_rate_loss",  # jerky sticks
         "early_land_loss",  # -100 each time land is asked for before the waypoint (blocked)
@@ -290,6 +297,9 @@ class TelloRoomEnv(DirectMARLEnv):
         self._early_land = asked & ~self.at_waypoint
         self._land_votes = torch.where(self._early_land, torch.zeros_like(self._land_votes), self._land_votes)
         self._land_event = asked & self.at_waypoint
+        if self.cfg.auto_land:  # land goes out on its own once inside the waypoint; the 5th output is unused
+            self._early_land = torch.zeros_like(self._early_land)
+            self._land_event = ~self.landing & self.at_waypoint & ~self.taking_off
         self.landing |= self._land_event
         rc[self.landing | self.taking_off] = 0.0  # during land / takeoff the firmware ignores sticks
         self.last_rc = rc
@@ -352,7 +362,10 @@ class TelloRoomEnv(DirectMARLEnv):
         offset = R @ self._cam_offset
         cam_pos = pos.reshape(-1, 3) + offset
         cam_rot = camera_axes(R, cfg.tag_sensor.camera_pitch)
-        fix, ok, mask = sighting(cfg.tag_sensor, cam_pos, cam_rot, self._tag_pos, self._tag_normal, self._tag_size)
+        ts = cfg.tag_sensor
+        blur = (torch.linalg.norm(self._stack("root_lin_vel_w"), dim=-1)
+                + ts.blur_rot_weight * torch.linalg.norm(self._stack("root_ang_vel_w"), dim=-1)).reshape(-1)
+        fix, ok, mask = sighting(ts, cam_pos, cam_rot, self._tag_pos, self._tag_normal, self._tag_size, blur_speed=blur)
         self.tags_seen = mask.view(E, D, -1)
         self._fix_buf = torch.roll(self._fix_buf, 1, dims=2)
         self._fix_ok_buf = torch.roll(self._fix_ok_buf, 1, dims=2)
@@ -397,10 +410,14 @@ class TelloRoomEnv(DirectMARLEnv):
 
         # takeoff done: the firmware levels off at its takeoff height and hands over to rc
         self.taking_off &= pos[..., 2] < self._takeoff_z
-        # waypoint reached: decided on the published position (what the controller sees); latched
+        # waypoint reached: decided on the published position (what the controller sees), and
+        # only when slow: the filter's speed estimate (the laptop has it too) under
+        # waypoint_max_speed (true speed without the filter); latched
         self._wp_before = self.at_waypoint.clone()
         near_wp = torch.linalg.norm(self.pub_pos - (self._spots + self._wp_offset), dim=-1) < cfg.waypoint_radius
-        self._waypoint_event = ~self.at_waypoint & near_wp & self.fresh & ~self.landing
+        self.est_speed = torch.linalg.norm(self.kf.v if cfg.kalman.enabled else self._stack("root_lin_vel_w"), dim=-1)
+        slow = self.est_speed < cfg.waypoint_max_speed
+        self._waypoint_event = ~self.at_waypoint & near_wp & slow & self.fresh & ~self.landing
         self.at_waypoint |= self._waypoint_event
         # touchdown: motors off; judged on the true touchdown point
         self._touchdown_event = self.landing & ~self.landed & (pos[..., 2] < cfg.touchdown_height)
@@ -427,6 +444,7 @@ class TelloRoomEnv(DirectMARLEnv):
         both_down = self.landed.unsqueeze(-1) & self.landed.unsqueeze(-2)
         collision = ((pair < cfg.collision_distance) & ~both_down).any(dim=-1)
         self._violation = crash | collision
+        self._crash, self._collision = crash, collision
         self._ep_collision |= collision.any(dim=-1)
         self._ep_crash |= crash.any(dim=-1)
         self._ep_fresh_steps += self.fresh.float().mean(-1)
@@ -483,9 +501,11 @@ class TelloRoomEnv(DirectMARLEnv):
         landing = landing + cfg.rew_time * not_done * (self._done_now.float() * remaining).unsqueeze(-1)
         terms = {
             "closer_reward": closer,
+            "waypoint_reward": cfg.rew_waypoint * self._waypoint_event.float(),
             "landing_loss": landing,
             "no_tag_loss": cfg.rew_no_fix * (~self.fresh).float() * flying,
-            "crash_loss": cfg.rew_violation * self._violation.float(),
+            "crash_loss": cfg.rew_violation * (self._crash & ~self._collision).float(),
+            "collision_loss": cfg.rew_collision * self._collision.float(),
             "separation_loss": cfg.rew_scale_separation * sep * self.step_dt,
             "action_rate_loss": cfg.rew_scale_action_rate * action_rate * self.step_dt,
             "early_land_loss": cfg.rew_early_land * self._early_land.float(),
@@ -646,6 +666,8 @@ class TelloRoomEnv(DirectMARLEnv):
         self.extras["log"] = {
             "Episode/success_rate": self.outcome_success[finished].float().mean().item(),
             "Episode/drones_reached_waypoint": self.outcome_waypoints[finished].mean().item(),
+            # share of drones that got inside their waypoint this episode, 0-100
+            "Episode/waypoint_reached_pct": 100.0 * (self.outcome_waypoints[finished] / self.cfg.num_drones).mean().item(),
             "Episode/drones_landed": self.outcome_landed[finished].mean().item(),
             "Episode/drones_landed_on_spot": self.outcome_land_ok[finished].mean().item(),
             "Episode/collision_rate": self.outcome_collision[finished].float().mean().item(),

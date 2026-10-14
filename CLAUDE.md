@@ -196,8 +196,9 @@ Run from `simulation_infra/` with the Step 2 environment.
   frame, waypoint-reached flag, tag-10 bearing, Tello `h`, its previous command, landing flag.
   Fixes carry camera-model noise, 3 cm per-fix noise and a 3 cm per-drone bias; frames are lost
   on the link at a per-drone, per-episode rate.
-- **Waypoint**: 1.5 m above each landing spot, radius 0.3 m. Until a drone's published fix is
-  inside it, `closer_reward` pays +10 per metre gained toward the waypoint (3D); after that only
+- **Waypoint**: 1.5 m above each landing spot, radius 0.3 m; it counts only when the drone is slow
+  (Kalman speed estimate < `waypoint_max_speed` 0.3 m/s; flights 032-034 crossed it at ~2 m/s). Until a drone's published fix is
+  inside it, `closer_reward` pays +100 per metre gained toward the waypoint (3D); after that only
   landing rewards (touchdown, formation) and the penalties apply.
 - **Per-drone dynamics**: TWR x0.95-1.05, rotor drag x0.5-2.0, body-rate PID kp/ki x0.85-1.15,
   kd x0.7-1.3, plus outer-loop gains, motor lag, mass, latency, rc->speed gain. No wind.
@@ -205,23 +206,28 @@ Run from `simulation_infra/` with the Step 2 environment.
   SDK range), plus `land` (5th output > 0.5 for 3 steps). The logs' sent range is still recorded
   as `command_envelope` in the fit file (`rc.use_envelope=True` would restrict to it); speeds past
   the logged sticks (~21-35) extrapolate the fitted gains.
-- **Rewards** (per drone-step, summed over the drones for the controller): +10 per metre closer
-  to the waypoint until reached, -5 per metre away (`closer_reward`, `rew_away_ratio` 0.5), -0.5
+- **Rewards** (per drone-step, summed over the drones for the controller): +100 per metre closer
+  to the waypoint until reached, -25 per metre away (`closer_reward`, `rew_away_ratio` 0.25),
+  +1000 once on entering the waypoint (`waypoint_reward`, `rew_waypoint`), -0.5 per step
   until landed on the spot (`landing_loss`; ending early pays the rest), -0.5 flying without a tag,
-  -100 contact / crash, +100 at touchdown (`land_reward`), +200 all landed on spot.
-- **Land gate**: `land` is sent only once the drone's published fix has been inside its waypoint
-  (the obs waypoint-reached flag); before that it is blocked and costs -100 (`early_land_loss`).
-  The laptop must apply the same gate at deploy. Each is logged as
+  -100 crash / wall (`crash_loss`), -1000 per drone within 0.25 m of another (`collision_loss`, `rew_collision`), +100 at touchdown (`land_reward`), +200 all landed on spot.
+- **Auto land** (`env.auto_land`, on by default): the step after a drone's published fix enters
+  its waypoint (the obs waypoint-reached flag) `land` is sent automatically and the policy's 5th
+  output is ignored. The laptop must do the same at deploy. With `env.auto_land=False` the policy
+  sends land itself, gated: before the waypoint it is blocked and costs -100 (`early_land_loss`).
+  Each reward term is logged as
   `Rewards/avg_<term>_per_episode` (per drone).
 - **Overlapped envs**: `scene.env_spacing` defaults to 0, so every env shares one room (the GUI
   shows the whole batch). PhysX filters contacts between envs and every reward/crash uses the
   env's own positions; measured no slower than the 14 m grid (`env.scene.env_spacing=14.0`).
 - **Room**: read live from `drone_deployment_infra/config/map.yaml` + `tags.yaml` (no copy;
   re-mapping the room updates the sim). Tag 10's wall is X = 0, Z up from the floor; the floor
-  isn't in the map, so `env.tag10_height` (default 1.2 m, **assumed, measure it**) places it.
+  isn't in the map, so `env.tag10_height` (1.22 m, measured ~48 in) places it. The left wall
+  (facing tag 10) is `room_y_min` = -2.0 m, measured 2 m left of tag 10's centre.
   Tags are textured tag36h11 quads, orientation verified against the real detector.
 - **Sensing**: a tag counts only if it is inside the Tello camera's view (FOV, range, view
-  angle, pixel size, dropout, 0.2 s video delay, link loss). Observations are the positional
+  angle, pixel size, dropout, 0.2 s video delay, link loss). Motion blur drops whole frames: probability
+  0.3 per m/s of (speed + angular rate) above 0.2, capped at 0.6 (`tag_sensor.blur_*`, fitted to flights 032-034). Observations are the positional
   feed only, never ground truth.
 - **Kalman filter** (`env.kalman`, on by default; `env.kalman.enabled=False` trains on the raw
   fix): the observed position is the estimate of `drone_deployment_infra/core/positional_kalman_filter.py`,
@@ -231,7 +237,7 @@ Run from `simulation_infra/` with the Step 2 environment.
   drone_deployment_infra/core/positional_kalman_filter.py` (pass: `SELFTEST PASSED`).
 - **Motion**: the integer sticks go through the deadband and gains in
   `source/action_space_kit/action_space_kit/control/tello_motion_fit.yaml`. Deploy by sending
-  `env.last_rc` (the same rounding) as `rc a b c d`, and `land` when the 5th output says so.
+  `env.last_rc` (the same rounding) as `rc a b c d`, and `land` once the waypoint is reached (auto land).
 - **Command rate**: one policy step = one rc packet, 74 ms (`env.command_rate_hz` = 500/37 =
   13.5 Hz) with 0-16 ms arrival jitter. Measured in flight: `recordings/027_TELLO-1.train.jsonl`
   sent at 13.43 Hz (median 70 ms, 80 ms cruising, 55-110 ms), because each tick runs a full-frame
@@ -257,12 +263,16 @@ grep -E "^\s*\[(ok|FAIL)|^== |zero |scripted " outputs/check_room.log
 python -u scripts/check_room_render.py > outputs/check_room_render.log 2>&1        # real localizer on sim renders
 python -u scripts/render_room_overview.py --out outputs/room_overview.png > outputs/room_overview.log 2>&1
 ```
-Pass: every line `[ok]` (49); `zero` 0% success, with landing / no-tag losses equal to -0.5 x
+Pass: every line `[ok]` (50); `zero` 0% success, with landing / no-tag losses equal to -0.5 x
 the off-spot / tag-less drone-steps. Render check: every view `[ok]`; a
 `[WARN real localizer: ambiguous pose flip]` line is a finding about `positional.py`, not a sim failure.
 Train (detached; central, ~27 s per iteration at 512 envs on the RTX 5080, 1500 iterations ~11 h):
 `setsid nohup python -u scripts/sb3/train.py --task AS-Tello-Room-v0 --headless --num_envs 512 --max_iterations 1500 > outputs/train_room.log 2>&1 &`.
 Watch it from anywhere: `dashboard/serve.sh` prints a public TensorBoard URL (see `dashboard/README.md`).
+Live view: `scripts/stream_room.py` flies the newest checkpoint (hot-reloaded every 5 min) with Isaac Sim's
+WebRTC livestream (`livestream=2`, port 49100); connect NVIDIA's Isaac Sim WebRTC Streaming Client to the
+desktop over Tailscale (Cloudflare quick tunnels can't carry WebRTC). `sb3/play.py --livestream` fails
+(Kit's numpy 1.26 can't unpickle the checkpoints), so it exports to TorchScript first like the recorder.
 
 Video (the core recorder for this task; works mid-training: with no `--checkpoint` it takes the
 newest `model_N_steps.zip` of the newest run):

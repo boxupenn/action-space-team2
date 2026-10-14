@@ -46,3 +46,12 @@ CF_TUNNEL_TOKEN=<token from the dashboard> ./serve.sh
 ```
 
 `cloudflared` lives in `~/.local/bin/` (official release binary).
+
+
+## Render page (videos of the simulation)
+
+`./render_serve.sh` starts `render_loop.py`, which records one episode of the newest
+checkpoint (at most every 30 min, `--min_gap`), plus a page on `127.0.0.1:8790`
+(`render_site/`) and a second quick tunnel. The URL is written to `RENDER_URL.txt`.
+`./render_stop.sh` stops all three. Logs are in `run/render_loop.log` and
+`run/render_record.log` (the last recording).

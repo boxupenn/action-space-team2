@@ -256,8 +256,8 @@ def main() -> int:
         if done:
             verdict = "SUCCESS" if o["success"] else "FAIL"
             why = "  collision" if o["collision"] else "  crash" if o["crash"] else ""
-            short = (f"{verdict}  waypoints {o['waypoints']:.0f}/4  landed {o['landed']:.0f}/4  "
-                     f"on spot {o['land_ok']:.0f}/4{why}")
+            short = (f"{verdict}  waypoints {o['waypoints']:.0f}/{u.cfg.num_drones}  landed {o['landed']:.0f}/{u.cfg.num_drones}  "
+                     f"on spot {o['land_ok']:.0f}/{u.cfg.num_drones}{why}")
         else:
             short = f"cut at {max_s:.0f} s"
             obs = venv.reset()

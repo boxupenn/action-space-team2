@@ -13,7 +13,8 @@ Two Isaac Lab tasks fly simulated DJI Tellos in the real mapped room. In both, a
 
 Both start inside a 2 m × 2 m box, 6–7 m from tag 10. The landing spots are on the floor
 1 m in front of the tag-10 wall, 0.5 m apart. Each spot has a **waypoint 1.5 m above it**
-(radius 0.3 m).
+(radius 0.3 m). It counts only when the drone is slow: the Kalman filter's speed estimate
+under 0.3 m/s (`waypoint_max_speed`), so a drone can't register by flying through it.
 
 ---
 
@@ -45,7 +46,7 @@ python -u scripts/check_room_env.py --headless --task AS-Tello-Room-Single-v0 > 
 grep -E "^\s*\[(ok|FAIL)|^== |zero |PASSED|FAILED" outputs/check_room_single.log
 ```
 
-Pass: 21 `[ok]` lines and `ALL CHECKS PASSED`. For the 4-drone task, drop `--task` (49 checks).
+Pass: 21 `[ok]` lines and `ALL CHECKS PASSED`. For the 4-drone task, drop `--task` (50 checks).
 To run only the Kalman filter checks: add `--test kalman`.
 
 ---
@@ -60,12 +61,14 @@ The reward weights are in
 
 | Field | Default | Logged as | What it does |
 |---|---|---|---|
-| `rew_closer_scale` | `10.0` | `closer_reward` | + per metre gained toward the **waypoint**. Only until the waypoint is reached, and never during takeoff or land |
-| `rew_away_ratio` | `0.5` | `closer_reward` | moving away costs this fraction of `rew_closer_scale` per metre (−5 per metre by default) |
+| `rew_closer_scale` | `100.0` | `closer_reward` | + per metre gained toward the **waypoint**. Only until the waypoint is reached, and never during takeoff or land |
+| `rew_away_ratio` | `0.25` | `closer_reward` | moving away costs this fraction of `rew_closer_scale` per metre (−25 per metre by default) |
+| `rew_waypoint` | `1000.0` | `waypoint_reward` | once, when the drone's published position first gets inside its waypoint (the same moment the land gate opens and the closer reward stops) |
 | `rew_time` | `-0.5` | `landing_loss` | every step until landed on the spot; ending early (crash, landing off the spot) pays the remaining steps |
 | `rew_no_fix` | `-0.5` | `no_tag_loss` | every step the drone flies with no tag fix |
-| `rew_violation` | `-100.0` | `crash_loss` | crash, wall, ceiling, flipping, contact with another drone |
-| `rew_early_land` | `-100.0` | `early_land_loss` | **land gate**: each `land` asked for before the waypoint is blocked (not sent) and costs this |
+| `rew_violation` | `-100.0` | `crash_loss` | crash, wall, ceiling, flipping |
+| `rew_collision` | `-1000.0` | `collision_loss` | each drone within 0.25 m of another (4-drone task); ends the episode |
+| `rew_early_land` | `-100.0` | `early_land_loss` | only with `auto_land=False`: each `land` the policy asks for before the waypoint is blocked (not sent) and costs this |
 | `rew_land` | `100.0` | `land_reward` | at touchdown. Land is only sent after the waypoint, so this only ever pays after the bubble |
 | `rew_all_landed` | `200.0` | `formation_reward` | success bonus: every drone landed within `success_radius` of its spot |
 | `rew_scale_separation` | `-20.0` | `separation_loss` | per second, closer than 0.5 m to another drone (always 0 with one drone) |
@@ -105,6 +108,7 @@ episode), so you can see which term dominates. Outcomes are under `Episode/`:
 
 - `success_rate`
 - `drones_reached_waypoint`
+- `waypoint_reached_pct`: % of drones that got inside their waypoint, per episode
 - `drones_landed`
 - `drones_landed_on_spot`
 - `spot_err_m`
@@ -240,6 +244,67 @@ dashboard/stop.sh
 It shows every run under `logs/sb3/`, and new runs appear on their own. The quick-tunnel URL
 is public and changes each time you restart it. See `dashboard/README.md`.
 
+
+### Watch the simulation live (Isaac Sim WebRTC stream, over Tailscale)
+
+This is the real Isaac Sim viewport, streamed live: the newest checkpoint flying in real time,
+16 envs overlapped in one room, with the markers on.
+
+**On the desktop:**
+
+```bash
+setsid nohup python -u scripts/stream_room.py > outputs/stream_room.log 2>&1 &
+grep "\[stream\]" outputs/stream_room.log      # "streaming ...", then one line per finished episode
+```
+
+- **Keeps up with training:** every 5 minutes it swaps in the newest checkpoint (`--reload_min`).
+- **Options:**
+  - `--checkpoint <zip>`: fly one fixed checkpoint
+  - `--num_envs 8`: fewer drones on screen
+  - `--task AS-Tello-Room-v0`: the 4-drone task
+- **To stop it:** `pkill -TERM -f "[s]tream_room.py"`
+- **Not `sb3/play.py --livestream`:** the stream loads an older numpy that can't read the
+  checkpoint files, so `play.py` crashes. `stream_room.py` converts the checkpoint first,
+  like the recorder.
+
+**On the computer you watch from:**
+
+1. **Install the client:** NVIDIA's *Isaac Sim WebRTC Streaming Client* (Isaac Sim docs, "Livestream
+   Clients" page; Linux AppImage, Windows, macOS). Use the version made for Isaac Sim 5.x.
+2. **Join the tailnet:** be on the same Tailscale network as the desktop (`tailscale status` lists it).
+3. **Connect:** in the client, enter the desktop's Tailscale address, **`100.122.106.39`**, and
+   connect. On the home network, `192.168.68.58` works too.
+
+**Limits:**
+- **Tailscale only:** the stream doesn't go through the Cloudflare links (they only carry web
+  pages), so you need Tailscale or the same local network.
+- **Cost:** it uses about 5 GB of GPU memory and some GPU time, so training is a little slower
+  while it runs. With the video page also recording, the 16 GB card can run out of memory: run
+  one or the other.
+- **One viewer:** one client at a time.
+
+### Watch the simulation render from anywhere (video page)
+
+```bash
+dashboard/render_serve.sh      # prints a public https://….trycloudflare.com URL (also in dashboard/RENDER_URL.txt)
+dashboard/render_stop.sh
+```
+
+- **What it shows:** while training runs, `dashboard/render_loop.py` records one full episode
+  of the newest checkpoint with `record_room.py`, at most once every 30 minutes. It uses the
+  same task and Kalman setting the run trains with.
+- **The page:** it plays the newest video and lists the earlier ones (the last 30). When a new
+  one is ready it shows a "new video" button, so playback is never cut off.
+- **Cost:** each recording takes about 10 min of GPU time while training runs (about 3 min on an
+  idle GPU), so training slows a little while it records.
+- **Options:** add them after `render_serve.sh`:
+  - `--min_gap 900`: record every 15 min
+  - `--max_seconds 30`: shorter clips, less GPU time
+  - `--view top`: a top-down camera
+- **Link:** it has its own URL, separate from TensorBoard. The URL is public and changes each
+  time you start the page.
+- **Live GUI:** a live stream of the Isaac Sim window (Isaac's WebRTC livestream) doesn't work
+  through this kind of tunnel, so the page shows recorded episodes instead.
 ---
 
 ## 6. Watch a trained policy
@@ -311,6 +376,8 @@ PPO stacks the last 8 steps. The numbers:
 
 Noise on the fixes:
 - the camera model: field of view, range, view angle, pixel size, dropout, 0.2 s video delay
+- motion blur: a whole frame is lost with probability 0.3 per m/s of (speed + angular rate)
+  above 0.2, capped at 0.6 (`tag_sensor.blur_*`), fitted to real flights 032-034
 - 3 cm noise per fix
 - 3 cm bias per drone
 - 0–15% link loss per drone
@@ -322,10 +389,12 @@ the checks, flying at rc 35, it puts the position ~10 cm from the truth vs ~13 c
 **Action:** the real Tello commands.
 - `rc right forward up yaw`: integers −100…100, sent once per 74 ms step (13.5 Hz, the
   measured flight rate), with 0–16 ms jitter.
-- A 5th output above 0.5 for 3 steps in a row asks for `land`. **Land gate:** it is sent only
-  once the drone's published fix has been inside its waypoint (the observation's
-  waypoint-reached flag). Before that, it is blocked and costs `rew_early_land`. The laptop
-  must apply the same gate at deploy.
+- **Auto land** (`auto_land`, on by default): the step after the drone's published fix enters
+  its waypoint (the observation's waypoint-reached flag), `land` is sent automatically and the
+  policy's 5th output is ignored. The laptop must do the same at deploy.
+- With `env.auto_land=False` the policy lands itself: a 5th output above 0.5 for 3 steps in a
+  row asks for `land`, sent only once the waypoint has been reached; before that it is blocked
+  and costs `rew_early_land`.
 
 At deploy, send `env.last_rc` as `rc a b c d`.
 
@@ -368,7 +437,8 @@ That changes its observation size, so it needs a fresh training run.
 | `fit_tello_motion.py` | re-fit the motion from new `recordings/*.train.jsonl` |
 
 The room itself is read live from `drone_deployment_infra/config/map.yaml` + `tags.yaml`.
-The floor height under tag 10 (`tag10_height`, 1.2 m) is **assumed**: measure it.
+Tag 10's centre is 1.22 m above the floor (`tag10_height`, measured ~48 in). The left wall,
+facing tag 10, is 2 m left of tag 10's centre (`room_y_min` = -2.0).
 
 ---
 

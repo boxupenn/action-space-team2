@@ -50,6 +50,8 @@ import torch  # noqa: E402
 import action_space_kit.tasks  # noqa: E402, F401
 from action_space_kit.control import load_motion_fit  # noqa: E402
 from action_space_kit.tasks.direct.tello_room.tello_room_env import _yaw_of  # noqa: E402
+from action_space_kit.tags.sensing import camera_axes, sighting  # noqa: E402
+from isaaclab.utils.math import matrix_from_quat  # noqa: E402
 from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry  # noqa: E402
 
 FAILURES: list[str] = []
@@ -158,6 +160,23 @@ def test_sensing(env, u) -> None:
     check(err.median().item() < 0.15, f"published position error at 6-7 m: median {err.median():.3f} m, p95 {err.quantile(0.95):.3f} m")
     print(f"  fix on {np.mean(fresh):.0%} of hovering steps")
 
+    # motion blur: a fast-moving / turning camera loses whole frames (tags.sensing blur_*)
+    ts = u.cfg.tag_sensor
+    quat = u._stack("root_quat_w").reshape(-1, 4)
+    R = matrix_from_quat(quat)
+    cam_pos = u._positions().reshape(-1, 3) + R @ u._cam_offset
+    cam_rot = camera_axes(R, ts.camera_pitch)
+    rates = {}
+    for v in (0.0, 1.0, 2.0, 5.0):
+        speed = torch.full((cam_pos.shape[0],), v, device=u.device)
+        rates[v] = np.mean([sighting(ts, cam_pos, cam_rot, u._tag_pos, u._tag_normal, u._tag_size,
+                                     blur_speed=speed)[1].float().mean().item() for _ in range(50)])
+    want = {v: rates[0.0] * (1 - min(ts.blur_max_loss, max(0.0, ts.blur_loss_per_mps * (v - ts.blur_free_speed))))
+            for v in rates}
+    check(all(abs(rates[v] - want[v]) < 0.03 for v in rates),
+          "motion blur drops whole frames: frames with a tag at blur speed "
+          + ", ".join(f"{v:.0f} m/s {rates[v]:.0%}" for v in rates) + f" (expected {', '.join(f'{want[v]:.0%}' for v in rates)})")
+
     # turn away from every tag: the feed stops and nothing takes over the sticks
     fresh_start(u)
     went_lost = torch.zeros_like(u.lost)
@@ -203,18 +222,22 @@ def test_commands(env, u) -> None:
           f"action +-1 is rc +-100 on every channel: +1 -> {ext[0].tolist()}, -1 -> {ext[1].tolist()}")
 
     # land gate: before the waypoint, land is blocked and each request costs rew_early_land
+    # (auto_land: the request is ignored, free)
+    auto = u.cfg.auto_land
     fresh_start(u)
     n = 3 * u.cfg.land_confirm_steps
     for _ in range(n):
         env.step(sticks(u, (0, 0, 0, 0), land=True))
     pen = u._ep_rew["early_land_loss"].mean().item() / u.cfg.num_drones
-    check(not u.landing.any().item() and abs(pen - 3 * u.cfg.rew_early_land) < 1e-3,
-          f"before the waypoint land is blocked and penalized ({n} steps of land: {pen:.0f} per drone, no land sent)")
+    want = 0.0 if auto else 3 * u.cfg.rew_early_land
+    check(not u.landing.any().item() and abs(pen - want) < 1e-3,
+          f"before the waypoint land is {'ignored (auto_land)' if auto else 'blocked and penalized'} "
+          f"({n} steps of land: {pen:.0f} per drone, no land sent)")
 
     fresh_start(u)
-    u.at_waypoint[:] = True  # inside the bubble: land goes out, no penalty
+    u.at_waypoint[:] = True  # inside the bubble: land goes out (auto_land: without asking), no penalty
     for _ in range(int(6.0 / u.step_dt)):
-        env.step(sticks(u, (0, 0, 0, 0), land=True))
+        env.step(sticks(u, (0, 0, 0, 0), land=not auto))
         if u.outcome_valid.all():
             break
     landed = u.outcome_landed.mean().item()
@@ -226,7 +249,7 @@ def test_commands(env, u) -> None:
     lr = u.outcome_rew["land_reward"].mean().item() / u.cfg.num_drones
     el = u.outcome_rew["early_land_loss"].abs().max().item()
     check(abs(lr - u.cfg.rew_land) < 1e-3 and el < 1e-6,
-          f"after the waypoint land is free and touchdown pays rew_land ({lr:.0f} per drone, early-land loss {el:.0f})")
+          f"after the waypoint land {'is sent automatically' if auto else 'is free'} and touchdown pays rew_land ({lr:.0f} per drone, early-land loss {el:.0f})")
 
     # waypoint phase: closing in pays until the waypoint is reached, then nothing
     for reached in (False, True):
@@ -241,6 +264,75 @@ def test_commands(env, u) -> None:
             check(abs(gained) < 1e-6, f"after reaching its waypoint a drone earns no closer reward ({gained:.3f})")
         else:
             check(gained > 1.0, f"before reaching its waypoint, closing on it pays (+{gained:.1f} per env in 2 s)")
+    # entering the waypoint pays rew_waypoint once per drone
+    fresh_start(u)
+    E = torch.arange(u.num_envs, device=u.device)
+    target = u._spots + u._wp_offset + u.scene.env_origins.unsqueeze(1)
+    for i, drone in enumerate(u._drones):
+        pose = drone.data.root_state_w[:, :7].clone()
+        pose[:, :3] = target[:, i]
+        drone.write_root_pose_to_sim(pose, E)
+        drone.write_root_velocity_to_sim(torch.zeros(u.num_envs, 6, device=u.device), E)
+    u._prev_dist[:] = 0.0
+    for _ in range(int(4.0 / u.step_dt)):
+        env.step(sticks(u, (0, 0, 0, 0)))
+        if u.at_waypoint.all():
+            break
+    for _ in range(int(1.0 / u.step_dt)):  # stay inside: no second payment
+        env.step(sticks(u, (0, 0, 0, 0)))
+    live = ~u.outcome_valid
+    paid = u._ep_rew["waypoint_reward"][live] / u.cfg.num_drones
+    reached = u.at_waypoint[live].float().mean().item()
+    # (facing the wall, a drone at a middle spot's waypoint sees no tag: tag 10 is too big to fit
+    # in the frame from 1.1 m and tags 8/9 are outside the field of view, so it registers only
+    # once it turns toward one; that's the sensing geometry, not the reward)
+    check(reached > 0.3 and torch.allclose(paid, u.at_waypoint[live].float().mean(-1) * u.cfg.rew_waypoint),
+          f"entering the waypoint pays {u.cfg.rew_waypoint:.0f} once per drone that registers ({reached:.0%} "
+          f"registered facing the wall; {paid.mean():.0f} per drone after 1 s more inside)")
+
+    # the waypoint counts only when slow: the filter's speed estimate under waypoint_max_speed
+    registered, speeds = {}, []
+    for limit in (0.0, u.cfg.waypoint_max_speed):  # limit 0: nothing is ever slow enough
+        u.cfg.waypoint_max_speed = limit
+        fresh_start(u)
+        for i, drone in enumerate(u._drones):
+            pose = drone.data.root_state_w[:, :7].clone()
+            pose[:, :3] = target[:, i]
+            drone.write_root_pose_to_sim(pose, E)
+            drone.write_root_velocity_to_sim(torch.zeros(u.num_envs, 6, device=u.device), E)
+        ever = torch.zeros_like(u.at_waypoint)
+        seen = torch.zeros_like(u.at_waypoint)  # had a fresh fix inside the waypoint
+        for _ in range(int(2.0 / u.step_dt)):  # (auto_land: registered drones land, episodes end)
+            env.step(sticks(u, (0, 0, 0, 0)))
+            ever |= u._waypoint_event
+            inside = torch.linalg.norm(u.pub_pos - (u._spots + u._wp_offset), dim=-1) < u.cfg.waypoint_radius
+            seen |= inside & u.fresh & ~u.landing
+            if limit > 0:
+                speeds.append(u.est_speed[u.fresh])
+        registered[limit] = (ever & seen).sum().item() / max(1, seen.sum().item())
+    sp = torch.cat(speeds)
+    check(registered[0.0] == 0.0 and registered[limit] > 0.9,
+          f"the waypoint counts only below waypoint_max_speed: of the drones with a fix inside it, hovering "
+          f"registers {registered[limit]:.0%} "
+          f"with {limit} m/s, {registered[0.0]:.0%} with 0 (hover speed estimate median {sp.median():.2f}, "
+          f"p90 {sp.quantile(0.9):.2f} m/s)")
+
+    # two drones within collision_distance: each pays rew_collision (not the crash loss), episode ends
+    if u.cfg.num_drones > 1:
+        fresh_start(u)
+        for _ in range(3):
+            env.step(sticks(u, (0, 0, 0, 0)))
+        pose = u._drones[0].data.root_state_w[:, :7].clone()
+        pose[:, 0] += 0.1
+        u._drones[1].write_root_pose_to_sim(pose, E)
+        u._drones[1].write_root_velocity_to_sim(torch.zeros(u.num_envs, 6, device=u.device), E)
+        env.step(sticks(u, (0, 0, 0, 0)))
+        col, cr = u.outcome_rew["collision_loss"], u.outcome_rew["crash_loss"]
+        check(bool(u.outcome_collision.all()) and torch.allclose(col, torch.full_like(col, 2 * u.cfg.rew_collision))
+              and float(cr.abs().max()) < 1e-6,
+              f"two drones 0.1 m apart: collision ends the episode and each pays rew_collision "
+              f"({col.mean() / 2:.0f} per drone, crash loss {cr.abs().max():.0f})")
+
     # moving away costs rew_away_ratio of the closer rate
     fresh_start(u)
     d0 = torch.linalg.norm(u._positions() - (u._spots + u._wp_offset), dim=-1).sum(-1)
