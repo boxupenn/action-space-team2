@@ -53,6 +53,7 @@ def main():
     agent_cfg = load_cfg_from_registry("AS-Tello-Room-Single-v0", "sb3_cfg_entry_point")
     restore_run_config(args.checkpoint, cfg, agent_cfg)
     cfg.scene.num_envs = 1
+    cfg.episode_length_s = 2.0  # force multiple timeout/reset cases for any single-drone checkpoint
     base = Sb3CentralVecEnv(gym.make("AS-Tello-Room-Single-v0", cfg=cfg))
     u = base.unwrapped_env
     normal = VecNormalize.load(str(norm_path_for(args.checkpoint)), base)

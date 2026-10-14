@@ -59,13 +59,13 @@ grep -E "^\s*\[(ok|FAIL)|^== |zero |PASSED|FAILED" outputs/check_room_single.log
 Pass: all `[ok]` lines and `ALL CHECKS PASSED`.
 To run only the Kalman filter checks: add `--test kalman`.
 
-The policy-specific checks use a short saved checkpoint (two iterations with
-`--num_envs 32 agent.n_steps=32 env.episode_length_s=2.0`):
+The policy-specific checks accept any saved single-drone checkpoint; the integration check
+temporarily uses two-second episodes to exercise timeout/reset behavior:
 
 ```bash
 python -u tests/test_policy_contract.py > outputs/policy_contract_tests.log 2>&1
-python -u scripts/check_policy_pipeline.py --headless --checkpoint <short-run>/model.zip > outputs/policy_pipeline.log 2>&1
-python -u tests/check_export_replay.py --checkpoint <short-run>/model.zip > outputs/export_replay.log 2>&1
+python -u scripts/check_policy_pipeline.py --headless --checkpoint <run>/model.zip > outputs/policy_pipeline.log 2>&1
+python -u tests/check_export_replay.py --checkpoint <run>/model.zip > outputs/export_replay.log 2>&1
 ```
 
 These check terminal observations through normalization/frame stacking, exact episode counts,
@@ -149,7 +149,7 @@ episode), so you can see which term dominates. Outcomes are under `Episode/`:
 
 ```bash
 setsid nohup python -u scripts/sb3/train.py --task AS-Tello-Room-Single-v0 --headless --num_envs 512 --max_iterations 1500 \
-  --curriculum landing env.episode_length_s=15.0 \
+  --curriculum landing env.auto_land=True env.episode_length_s=15.0 \
   > outputs/train_room_single.log 2>&1 &
 ```
 
@@ -160,6 +160,11 @@ restores takeoff nearer the target; full restores the 6–7 m start. Monitor
 `Episode/land_gate_ready_frac` to distinguish failure to settle from failure to request land.
 `--checkpoint` resumes both PPO and its matching normalization statistics and transition count.
 `--max_iterations` specifies additional iterations on resume.
+
+The command above uses gated auto-land: PPO flies the RC channels, and the controller sends
+SDK land only when the current-state gate passes. This avoids depending on an undertrained
+fifth action. Use `env.auto_land=False` to research policy-requested landing, and qualify that
+mode independently. The saved checkpoint config records the chosen mode.
 
 For example, after the landing stage passes its evaluations:
 
