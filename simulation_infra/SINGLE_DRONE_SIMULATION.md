@@ -187,6 +187,13 @@ evaluation suites explicitly disable both replay fractions, so easy starts canno
 the full-mission score. For a direct `play.py` evaluation of a mixed-start checkpoint, add
 `env.spawn_short_fraction=0.0 env.spawn_hover_fraction=0.0`.
 
+For a controlled fine-tuning experiment, `--action-std 0.2` reduces Gaussian exploration
+on resume without changing the deterministic actor or value predictions. It also clears
+the optimizer moments for that exploration parameter. `agent.freeze_normalization=True`
+keeps the matching checkpoint's input and reward statistics fixed; this requires a
+checkpoint. Both are optional, recorded in the run, and need full-mission evaluation
+against the parent checkpoint before promotion. They do not add a navigation controller.
+
 For example, after the landing stage passes its evaluations:
 
 ```bash

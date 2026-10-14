@@ -25,6 +25,7 @@ max_grad_norm: 1.0
 target_kl: 0.02
 normalize_input: True
 normalize_value: False
+freeze_normalization: False  # warm-start option: preserve the checkpoint's observation/reward statistics
 clip_obs: 10.0
 frame_stack: 8
 device: "cuda:0"

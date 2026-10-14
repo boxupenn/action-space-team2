@@ -12,6 +12,7 @@ from unittest.mock import patch
 import gymnasium as gym
 import numpy as np
 import torch
+from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import VecFrameStack, VecNormalize
 
 REPO = Path(__file__).resolve().parents[2]
@@ -30,6 +31,7 @@ terminal = load("terminal_test", RL / "terminal_observation.py")
 evaluation = load("evaluation_test", RL / "evaluation.py")
 rewards = load("rewards_test", RL / "rewards.py")
 starts = load("starts_test", RL / "start_curriculum.py")
+finetune = load("finetune_test", RL / "finetune.py")
 run_config = load("run_config_test", RL / "run_config.py")
 gate = load("gate_test", REPO / "drone_deployment_infra/core/landing_gate.py")
 sensor = load("sensor_test", RL.parent / "tags/sensing.py")
@@ -92,6 +94,23 @@ with patch.dict(sys.modules, {"isaaclab.envs": isaac_stub}):
 
 
 class PolicyContractTests(unittest.TestCase):
+    def test_warm_start_preserves_deterministic_actor(self):
+        env = gym.make("Pendulum-v1")
+        model = PPO("MlpPolicy", env, n_steps=8, batch_size=8, n_epochs=1, device="cpu", seed=9)
+        obs = np.array([[1.0, 0.0, 0.2], [0.0, 1.0, -0.3]], dtype=np.float32)
+        before, _ = model.predict(obs, deterministic=True)
+        with torch.no_grad():
+            values_before = model.policy.predict_values(torch.from_numpy(obs)).clone()
+        finetune.prepare_finetune(model, action_std=.25)
+        after, _ = model.predict(obs, deterministic=True)
+        np.testing.assert_array_equal(before, after)
+        with torch.no_grad():
+            self.assertTrue(torch.equal(model.policy.predict_values(torch.from_numpy(obs)), values_before))
+        np.testing.assert_allclose(model.policy.log_std.detach().exp().numpy(), .25)
+        with self.assertRaises(ValueError):
+            finetune.prepare_finetune(model, action_std=0)
+        env.close()
+
     def test_start_mixture_preserves_full_task_and_replays_easier_starts(self):
         cfg = types.SimpleNamespace(num_drones=1, spawn_short_fraction=0.0, spawn_hover_fraction=0.0,
                                     spawn_short_x_range=(1.5, 5.5), spawn_short_y_radius=0.4,

@@ -30,6 +30,8 @@ parser.add_argument(
 )
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--checkpoint", type=str, default=None, help="Continue the training from checkpoint.")
+parser.add_argument("--action-std", type=float, default=None,
+                    help="Explicitly reset Gaussian exploration std on warm start; deterministic actions are unchanged.")
 parser.add_argument("--config-source", choices=("checkpoint", "current"), default="checkpoint",
                     help="On resume, restore the saved configuration or explicitly use the current task.")
 parser.add_argument("--max_iterations", type=int, default=None, help="PPO iterations (rollout + update cycles).")
@@ -38,6 +40,8 @@ parser.add_argument("--curriculum", choices=("landing", "approach", "full"), def
                     help="Single-drone stage, preserving the same observation/action shapes.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
+if args_cli.action_std is not None and not args_cli.checkpoint:
+    parser.error("Warm-start adjustments require --checkpoint")
 if args_cli.video:
     args_cli.enable_cameras = True
 sys.argv = [sys.argv[0]] + hydra_args
@@ -68,6 +72,7 @@ from datetime import datetime
 import action_space_kit.tasks  # noqa: F401
 import gymnasium as gym
 import numpy as np
+from action_space_kit.rl.finetune import prepare_finetune
 from action_space_kit.rl.policy_export import norm_path_for
 from action_space_kit.rl.run_config import restore_run_config, snapshot_run
 from action_space_kit.rl.sb3_shared import LogExtrasCallback, Sb3CentralVecEnv, Sb3SharedPolicyVecEnv
@@ -163,15 +168,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         callbacks = []
 
     frame_stack = agent_cfg.pop("frame_stack", 1)
-    norm_args = {key: agent_cfg.pop(key) for key in ("normalize_input", "normalize_value", "clip_obs") if key in agent_cfg}
+    norm_args = {key: agent_cfg.pop(key) for key in
+                 ("normalize_input", "normalize_value", "clip_obs", "freeze_normalization") if key in agent_cfg}
     if norm_args.get("normalize_input"):
         print(f"Normalizing input, {norm_args=}")
+        if norm_args.get("freeze_normalization") and not args_cli.checkpoint:
+            raise ValueError("Freezing normalization requires fitted statistics from a checkpoint")
         if args_cli.checkpoint:
             norm_path = norm_path_for(args_cli.checkpoint)
             if not norm_path.is_file():
                 raise FileNotFoundError(f"Resume requires the matching normalizer: {norm_path}")
             env = VecNormalize.load(str(norm_path), env)
-            env.training = True
+            env.training = not norm_args.get("freeze_normalization", False)
             env.norm_reward = norm_args.get("normalize_value", False)
             env.clip_obs = norm_args.get("clip_obs", env.clip_obs)
             env.gamma = agent_cfg["gamma"]
@@ -197,6 +205,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"[resume] Starting at {agent.num_timesteps} transitions")
     else:
         agent = PPO(policy_arch, env, verbose=1, tensorboard_log=log_dir, **agent_cfg)
+    if args_cli.action_std is not None:
+        prepare_finetune(agent, args_cli.action_std)
+        print(f"[warm-start] action_std={args_cli.action_std}")
 
     # CheckpointCallback counts vec-env steps (one per iteration step), not transitions
     callbacks.append(
