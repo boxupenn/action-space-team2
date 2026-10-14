@@ -12,6 +12,7 @@ policy that each real drone can run on its own, instead of Isaac Lab's centraliz
 
 import argparse
 import contextlib
+import copy
 import signal
 import sys
 from pathlib import Path
@@ -29,8 +30,12 @@ parser.add_argument(
 )
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--checkpoint", type=str, default=None, help="Continue the training from checkpoint.")
+parser.add_argument("--config-source", choices=("checkpoint", "current"), default="checkpoint",
+                    help="On resume, restore the saved configuration or explicitly use the current task.")
 parser.add_argument("--max_iterations", type=int, default=None, help="PPO iterations (rollout + update cycles).")
 parser.add_argument("--save_interval", type=int, default=50, help="Save a checkpoint every n iterations.")
+parser.add_argument("--curriculum", choices=("landing", "approach", "full"), default=None,
+                    help="Single-drone stage, preserving the same observation/action shapes.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 if args_cli.video:
@@ -60,8 +65,12 @@ import random
 import time
 from datetime import datetime
 
+import action_space_kit.tasks  # noqa: F401
 import gymnasium as gym
 import numpy as np
+from action_space_kit.rl.policy_export import norm_path_for
+from action_space_kit.rl.run_config import restore_run_config, snapshot_run
+from action_space_kit.rl.sb3_shared import LogExtrasCallback, Sb3CentralVecEnv, Sb3SharedPolicyVecEnv
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.vec_env import VecFrameStack, VecNormalize
@@ -75,13 +84,27 @@ from isaaclab_rl.sb3 import Sb3VecEnvWrapper, process_sb3_cfg
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
-import action_space_kit.tasks  # noqa: F401
-from action_space_kit.rl.sb3_shared import LogExtrasCallback, Sb3CentralVecEnv, Sb3SharedPolicyVecEnv
-
 
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: dict):
     """Train with a Stable-Baselines3 agent."""
+    if args_cli.checkpoint and args_cli.config_source == "checkpoint":
+        restore_run_config(args_cli.checkpoint, env_cfg, agent_cfg, hydra_args)
+    if args_cli.curriculum:
+        if getattr(env_cfg, "num_drones", None) != 1:
+            raise ValueError("Validate the single-drone curriculum before expanding the team")
+        stages = {"landing": ((1.25, 0.), .8, (.8, 1.9), False),
+                  "approach": ((2.5, 0.), 1.5, (1.8, 3.4), True),
+                  "full": ((6.5, 0.), 2., (6., 7.), True)}
+        fields = dict(zip(("spawn_box_center", "spawn_box_size", "spawn_range", "takeoff_at_reset"),
+                          stages[args_cli.curriculum]))
+        fields["spawn_height"] = ((env_cfg.waypoint_height - .05, env_cfg.waypoint_height + .05)
+                                  if args_cli.curriculum == "landing" else (0.9, 1.4))
+        fields["spawn_near_target_radius"] = 0.10 if args_cli.curriculum == "landing" else 0.0
+        explicit = {arg.split("=", 1)[0].lstrip("+") for arg in hydra_args}
+        for name, value in fields.items():
+            if "env." + name not in explicit:
+                setattr(env_cfg, name, value)
     if args_cli.seed == -1:
         args_cli.seed = random.randint(0, 10000)
 
@@ -92,7 +115,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # shared policy: every agent of a MARL env is one SB3 row, so rollouts are that many times
     # larger; central policy (agent cfg ``central: true``): one row per env, all agents at once
-    central = bool(agent_cfg.pop("central", False))
+    central = bool(agent_cfg.get("central", False))
     num_agents = len(env_cfg.possible_agents) if isinstance(env_cfg, DirectMARLEnvCfg) and not central else 1
     num_rows = env_cfg.scene.num_envs * num_agents
     if args_cli.max_iterations is not None:
@@ -102,9 +125,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     log_root_path = os.path.abspath(os.path.join("logs", "sb3", args_cli.task))
     print(f"[INFO] Logging experiment in directory: {log_root_path}")
     log_dir = os.path.join(log_root_path, run_info)
-    dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
+    Path(log_dir).mkdir(parents=True, exist_ok=False)
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
     (Path(log_dir) / "command.txt").write_text(" ".join(sys.orig_argv))
+    saved_agent_cfg = copy.deepcopy(agent_cfg)
+    agent_cfg.pop("central", None)
+    if getattr(env_cfg, "reward_version", 1) >= 2 and env_cfg.reward_gamma != agent_cfg["gamma"]:
+        raise ValueError("env.reward_gamma must equal agent.gamma for potential shaping")
 
     agent_cfg = process_sb3_cfg(agent_cfg, num_rows)
     policy_arch = agent_cfg.pop("policy")
@@ -112,6 +139,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.log_dir = log_dir
 
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+    # Construction applies the motion fit: save the effective dynamics, not pre-fit defaults.
+    dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
+    snapshot_run(log_dir, env_cfg, saved_agent_cfg, args_cli.task, sys.orig_argv)
     if args_cli.video:
         video_kwargs = {
             "video_folder": os.path.join(log_dir, "videos", "train"),
@@ -136,24 +166,37 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     norm_args = {key: agent_cfg.pop(key) for key in ("normalize_input", "normalize_value", "clip_obs") if key in agent_cfg}
     if norm_args.get("normalize_input"):
         print(f"Normalizing input, {norm_args=}")
-        env = VecNormalize(
-            env,
-            training=True,
-            norm_obs=norm_args["normalize_input"],
-            norm_reward=norm_args.get("normalize_value", False),
-            clip_obs=norm_args.get("clip_obs", 100.0),
-            gamma=agent_cfg["gamma"],
-            clip_reward=np.inf,
-        )
+        if args_cli.checkpoint:
+            norm_path = norm_path_for(args_cli.checkpoint)
+            if not norm_path.is_file():
+                raise FileNotFoundError(f"Resume requires the matching normalizer: {norm_path}")
+            env = VecNormalize.load(str(norm_path), env)
+            env.training = True
+            env.norm_reward = norm_args.get("normalize_value", False)
+            env.clip_obs = norm_args.get("clip_obs", env.clip_obs)
+            env.gamma = agent_cfg["gamma"]
+            print(f"[resume] Restored normalization from {norm_path}; count={env.obs_rms.count}")
+        else:
+            env = VecNormalize(
+                env,
+                training=True,
+                norm_obs=norm_args["normalize_input"],
+                norm_reward=norm_args.get("normalize_value", False),
+                clip_obs=norm_args.get("clip_obs", 100.0),
+                gamma=agent_cfg["gamma"],
+                clip_reward=np.inf,
+            )
     vec_norm = env if isinstance(env, VecNormalize) else None
     if frame_stack > 1:
         # the policy sees each drone's last `frame_stack` (normalized) observations
         print(f"Stacking the last {frame_stack} observations")
         env = VecFrameStack(env, n_stack=frame_stack)
 
-    agent = PPO(policy_arch, env, verbose=1, tensorboard_log=log_dir, **agent_cfg)
     if args_cli.checkpoint is not None:
-        agent = agent.load(args_cli.checkpoint, env, print_system_info=True)
+        agent = PPO.load(args_cli.checkpoint, env, print_system_info=True, tensorboard_log=log_dir, **agent_cfg)
+        print(f"[resume] Starting at {agent.num_timesteps} transitions")
+    else:
+        agent = PPO(policy_arch, env, verbose=1, tensorboard_log=log_dir, **agent_cfg)
 
     # CheckpointCallback counts vec-env steps (one per iteration step), not transitions
     callbacks.append(
@@ -166,7 +209,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         )
     )
     with contextlib.suppress(KeyboardInterrupt):
-        agent.learn(total_timesteps=n_timesteps, callback=callbacks, progress_bar=True, log_interval=1)
+        agent.learn(total_timesteps=n_timesteps, callback=callbacks, progress_bar=True, log_interval=1,
+                    reset_num_timesteps=args_cli.checkpoint is None)
 
     agent.save(os.path.join(log_dir, "model"))
     print(f"Saving to:\n{os.path.join(log_dir, 'model.zip')}")

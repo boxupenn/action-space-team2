@@ -25,6 +25,10 @@ parser.add_argument(
 parser.add_argument("--checkpoint", type=str, default=None, help="Path to model checkpoint (default: latest run).")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--episodes", type=int, default=0, help="Stop after this many finished episodes (0 = run forever).")
+parser.add_argument("--config-source", choices=("checkpoint", "current"), default="checkpoint")
+parser.add_argument("--report", type=str, default=None, help="Write exact episode cohort and summary to JSON.")
+parser.add_argument("--pilot", choices=("policy", "hold"), default="policy",
+                    help="hold: room gate baseline with zero RC and continuous land request; not a policy score.")
 parser.add_argument("--no_dr", action="store_true", default=False, help="Fly with nominal dynamics (no randomization).")
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
 AppLauncher.add_app_launcher_args(parser)
@@ -37,12 +41,19 @@ simulation_app = app_launcher.app
 
 """Rest everything follows."""
 
+import hashlib
+import json
 import os
 import re
 import time
 
+import action_space_kit.tasks  # noqa: F401
 import gymnasium as gym
+import numpy as np
 import torch
+from action_space_kit.rl.evaluation import EpisodeCohort
+from action_space_kit.rl.run_config import restore_run_config
+from action_space_kit.rl.sb3_shared import Sb3CentralVecEnv, Sb3SharedPolicyVecEnv
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import VecFrameStack, VecNormalize
 
@@ -54,9 +65,6 @@ from isaaclab_rl.sb3 import Sb3VecEnvWrapper
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils.hydra import hydra_task_config
 from isaaclab_tasks.utils.parse_cfg import get_checkpoint_path
-
-import action_space_kit.tasks  # noqa: F401
-from action_space_kit.rl.sb3_shared import Sb3CentralVecEnv, Sb3SharedPolicyVecEnv
 
 
 def vecnormalize_path(checkpoint_path: str) -> Path:
@@ -70,20 +78,21 @@ def vecnormalize_path(checkpoint_path: str) -> Path:
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: dict):
     """Play with a Stable-Baselines3 agent."""
-    env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
-    env_cfg.seed = args_cli.seed if args_cli.seed is not None else agent_cfg["seed"]
-    env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
-    if hasattr(env_cfg, "debug_vis"):
-        env_cfg.debug_vis = True  # scene markers, for the livestream
-    if args_cli.no_dr and hasattr(env_cfg, "dynamics"):
-        env_cfg.dynamics.domain_randomization = False
-
     if args_cli.checkpoint is None:
         log_root_path = os.path.abspath(os.path.join("logs", "sb3", args_cli.task))
         checkpoint_path = get_checkpoint_path(log_root_path, ".*", "model.zip", sort_alpha=False)
     else:
         checkpoint_path = os.path.abspath(args_cli.checkpoint)
     log_dir = os.path.dirname(checkpoint_path)
+    if args_cli.config_source == "checkpoint":
+        restore_run_config(checkpoint_path, env_cfg, agent_cfg, hydra_args)
+    env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
+    env_cfg.seed = args_cli.seed if args_cli.seed is not None else agent_cfg["seed"]
+    env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+    if hasattr(env_cfg, "debug_vis"):
+        env_cfg.debug_vis = not args_cli.headless
+    if args_cli.no_dr and hasattr(env_cfg, "dynamics"):
+        env_cfg.dynamics.domain_randomization = False
     env_cfg.log_dir = log_dir
 
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
@@ -107,18 +116,24 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env = VecNormalize.load(str(norm_path), env)
         env.training = False
         env.norm_reward = False
-    else:
-        print(f"[WARN] No normalization file at {norm_path}; running with raw observations.")
+    elif agent_cfg.get("normalize_input", False):
+        raise FileNotFoundError(f"Checkpoint requires normalization statistics: {norm_path}")
     frame_stack = agent_cfg.get("frame_stack", 1)
     if frame_stack > 1:
         env = VecFrameStack(env, n_stack=frame_stack)
 
     print(f"Loading checkpoint from: {checkpoint_path}")
     agent = PPO.load(checkpoint_path, env, print_system_info=True)
+    # PPO.load restores the training seed; seed again AFTER loading and BEFORE first reset.
+    agent.set_random_seed(env_cfg.seed)
+    print(f"[eval] effective_seed={env_cfg.seed} pilot={args_cli.pilot}")
+    if args_cli.pilot == "hold" and not args_cli.task.startswith("AS-Tello-Room"):
+        raise ValueError("The hold/land baseline is only defined for room tasks")
     dt = base_env.unwrapped_env.step_dt if shared else base_env.unwrapped.step_dt
 
-    totals: dict[str, float] = {}
-    count = 0.0
+    slots = base_env.num_isaac_envs if shared else env.num_envs
+    cohort = EpisodeCohort(slots, args_cli.episodes or 10**12,
+                           retain_records=bool(args_cli.episodes or args_cli.report))
     obs = env.reset()
     if shared:
         # a full reset staggers episode clocks for training; scored episodes must get the whole
@@ -128,26 +143,52 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     while simulation_app.is_running():
         start_time = time.time()
         with torch.inference_mode():
-            actions, _ = agent.predict(obs, deterministic=True)
-            obs, _, _, _ = env.step(actions)
-        if shared and base_env.log_buffer:
-            for entry in base_env.log_buffer:
-                n = entry.get("Episode/count", 0.0)
-                count += n
-                for k, v in entry.items():
-                    if k != "Episode/count":
-                        totals[k] = totals.get(k, 0.0) + v * n
+            if args_cli.pilot == "policy":
+                actions, _ = agent.predict(obs, deterministic=True)
+            else:
+                actions = np.zeros((env.num_envs, *env.action_space.shape), dtype=np.float32)
+                actions[:, 4::5] = 1.0
+            obs, _, dones, infos = env.step(actions)
+        changed = False
+        if shared:
+            for record in base_env.episode_buffer:
+                changed |= cohort.add(record)
+            base_env.episode_buffer.clear()
             base_env.log_buffer.clear()
-            print(f"[{int(count)} episodes] " + ", ".join(f"{k.split('/')[-1]}={v / count:.3f}" for k, v in sorted(totals.items())))
-            if args_cli.episodes and count >= args_cli.episodes:
-                break
+        else:
+            for i, done in enumerate(dones):
+                if done:
+                    changed |= cohort.add({"env_id": i, "episode_id": timestep + 1,
+                                           "metrics": infos[i].get("episode", {})})
+        if changed:
+            summary = cohort.summary()
+            values = ", ".join(f"{k.split('/')[-1]}={v:.3f}" for k, v in summary["metrics"].items())
+            print(f"[{summary['episodes']} episodes] " + values)
+        if args_cli.episodes and cohort.complete:
+            break
         timestep += 1
         if args_cli.video and timestep == args_cli.video_length:
             break
         sleep_time = dt - (time.time() - start_time)
         if args_cli.real_time and sleep_time > 0:
             time.sleep(sleep_time)
+    summary = cohort.summary()
+    if args_cli.report:
+        report = Path(args_cli.report)
+        report.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint_hash = hashlib.sha256(Path(checkpoint_path).read_bytes()).hexdigest()
+        norm_hash = hashlib.sha256(norm_path.read_bytes()).hexdigest() if norm_path.exists() else None
+        report.write_text(json.dumps({"checkpoint": checkpoint_path,
+                                     "checkpoint_sha256": checkpoint_hash,
+                                     "normalizer_sha256": norm_hash,
+                                     "seed": env_cfg.seed,
+                                     "pilot": args_cli.pilot,
+                                     "config_source": args_cli.config_source, "overrides": hydra_args,
+                                     "summary": summary, "records": cohort.records}, indent=2, allow_nan=False) + "\n")
+        print(f"[eval] report={report} complete={cohort.complete}")
     env.close()
+    if args_cli.episodes and not cohort.complete:
+        raise RuntimeError(f"Incomplete evaluation: {summary['episodes']}/{args_cli.episodes} episodes")
 
 
 if __name__ == "__main__":

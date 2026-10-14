@@ -66,6 +66,8 @@ _build
 
 # Tests
 tests/
+!simulation_infra/tests/
+!simulation_infra/tests/*.py
 
 # Docker history
 .isaac-lab-docker-history

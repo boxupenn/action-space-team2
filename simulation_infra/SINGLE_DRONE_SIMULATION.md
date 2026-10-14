@@ -12,11 +12,13 @@ Two Isaac Lab tasks fly simulated DJI Tellos in the real mapped room. In both, a
 | `AS-Tello-Room-v0` | 4, one central controller | hovering (takeoff already done) | each lands on its own spot, no contact | the full formation |
 
 Both start inside a 2 m × 2 m box, 6–7 m from tag 10. The landing spots are on the floor
-1 m in front of the tag-10 wall, 0.5 m apart. Each spot has a **waypoint 1.5 m above it**
+1 m in front of the tag-10 wall, 0.5 m apart. Each spot has a **waypoint 1.22 m above it**
 (radius 0.3 m). Entering it counts only at or below 0.3 m/s (`waypoint_max_speed`, the Kalman
-filter's speed estimate, judged once the filter's velocity is settled: `speed_trust_std`). Faster,
-the episode fails with -500 per 0.3 m/s over (0.6 m/s: -500, 0.9 m/s: -1000). Within 2 m of tag 10
-the drone earns +200 per m/s of speed it sheds, counted only for new lows so it can't be farmed.
+filter's speed estimate, judged once the filter's velocity is settled: `speed_trust_std`).
+New runs use reward version 2: fast entries can recover, progress uses discounted potential
+shaping, and accurate touchdown is the main reward. Reaching the waypoint does not by itself
+authorize landing: the current estimated pose, speed, uncertainty and freshness must pass
+the shared landing gate continuously for 0.5 seconds.
 
 ---
 
@@ -39,6 +41,12 @@ and send output to a log under `outputs/`: Isaac Sim prints hundreds of harmless
 and it can drop buffered output when it exits. Conda's `(base)` can stay active, but the
 `unset` is required: otherwise Isaac Lab picks conda's python.
 
+When using an isolated checkout, ensure its source wins over any editable installation:
+
+```bash
+export PYTHONPATH="$PWD/source/action_space_kit${PYTHONPATH:+:$PYTHONPATH}"
+```
+
 ---
 
 ## 2. Check the environment first (~3 min)
@@ -48,8 +56,20 @@ python -u scripts/check_room_env.py --headless --task AS-Tello-Room-Single-v0 > 
 grep -E "^\s*\[(ok|FAIL)|^== |zero |PASSED|FAILED" outputs/check_room_single.log
 ```
 
-Pass: 21 `[ok]` lines and `ALL CHECKS PASSED`. For the 4-drone task, drop `--task` (50 checks).
+Pass: all `[ok]` lines and `ALL CHECKS PASSED`.
 To run only the Kalman filter checks: add `--test kalman`.
+
+The policy-specific checks use a short saved checkpoint (two iterations with
+`--num_envs 32 agent.n_steps=32 env.episode_length_s=2.0`):
+
+```bash
+python -u tests/test_policy_contract.py > outputs/policy_contract_tests.log 2>&1
+python -u scripts/check_policy_pipeline.py --headless --checkpoint <short-run>/model.zip > outputs/policy_pipeline.log 2>&1
+python -u tests/check_export_replay.py --checkpoint <short-run>/model.zip > outputs/export_replay.log 2>&1
+```
+
+These check terminal observations through normalization/frame stacking, exact episode counts,
+landing-gate failures, four controlled touchdowns, and simulator/adapter/export inference parity.
 
 ---
 
@@ -63,17 +83,17 @@ The reward weights are in
 
 | Field | Default | Logged as | What it does |
 |---|---|---|---|
-| `rew_closer_scale` | `100.0` | `closer_reward` | + per metre gained toward the **waypoint**. Only until the waypoint is reached, and never during takeoff or land |
-| `rew_away_ratio` | `0.25` | `closer_reward` | moving away costs this fraction of `rew_closer_scale` per metre (−25 per metre by default) |
-| `rew_waypoint` | `1000.0` | `waypoint_reward` | once, when the drone's published position first gets inside its waypoint (the same moment the land gate opens and the closer reward stops) |
-| `rew_fast_entry_per_mps` | `-1666.7` | `fast_entry_loss` | entering the waypoint above 0.3 m/s: per m/s over (0.6 m/s: -500); the episode ends |
-| `rew_slowdown` | `200.0` | `slowdown_reward` | per m/s of new low true speed within `slow_zone_radius` (2 m) of tag 10, until the waypoint |
+| `rew_potential_scale` | `40.0` | `closer_reward` | bounded potential toward waypoint, then descent; `gamma * Phi(next) - Phi(previous)`, zero next potential on true termination |
+| `reward_gamma` | `0.995` | — | must equal PPO gamma; timeouts retain their final-state potential and bootstrap |
+| `rew_waypoint` | `25.0` | `waypoint_reward` | once on slow waypoint entry; does not open the landing gate by itself |
+| `rew_settle_position` / `rew_settle_speed` | `-2.0` / `-1.0` | `settling_loss` | per-second position and speed costs after waypoint entry, before landing |
+| `rew_slowdown` | `0.0` | `slowdown_reward` | legacy new-low-speed term, disabled by default |
 | `rew_time` | `-0.5` | `landing_loss` | every step until landed on the spot; ending early (crash, landing off the spot) pays the remaining steps |
 | `rew_no_fix` | `-0.5` | `no_tag_loss` | every step the drone flies with no tag fix |
 | `rew_violation` | `-100.0` | `crash_loss` | crash, wall, ceiling, flipping |
 | `rew_collision` | `-1000.0` | `collision_loss` | each drone within 0.25 m of another (4-drone task); ends the episode |
-| `rew_early_land` | `-100.0` | `early_land_loss` | only with `auto_land=False`: each `land` the policy asks for before the waypoint is blocked (not sent) and costs this |
-| `rew_land` | `100.0` | `land_reward` | at touchdown. Land is only sent after the waypoint, so this only ever pays after the bubble |
+| `rew_early_land` | `-5.0` | `early_land_loss` | confirmed requests before the waypoint; afterward blocked requests wait for the gate without a repeated penalty |
+| `rew_land` | `1000.0` | `land_reward` | only touchdown within the assigned spot's success radius |
 | `rew_all_landed` | `200.0` | `formation_reward` | success bonus: every drone landed within `success_radius` of its spot |
 | `rew_scale_separation` | `-20.0` | `separation_loss` | per second, closer than 0.5 m to another drone (always 0 with one drone) |
 | `rew_scale_action_rate` | `-0.05` | `action_rate_loss` | per second, jerky sticks |
@@ -82,8 +102,8 @@ Geometry that shapes the rewards:
 
 | Field | Default | Meaning |
 |---|---|---|
-| `waypoint_height` | `1.5` m | waypoint height above the spot |
-| `waypoint_radius` | `0.3` m | inside this (by the published tag fix) counts as reached: from then on, only the landing rewards and the penalties pay |
+| `waypoint_height` | `1.22` m | aligned with the measured tag center; the old 1.5 m target clips the large tag in the camera view |
+| `waypoint_radius` | `0.3` m | slow entry counts as reached; settling guidance continues afterward |
 | `success_radius` | `0.3` m | touchdown this close to the spot counts as on the spot |
 | `episode_length_s` | `75` s | episode cap |
 | `takeoff_height` | `(0.8, 1.0)` m | where the firmware takeoff stops (single-drone task) |
@@ -97,12 +117,12 @@ to the train command. The code is untouched, and the values used are saved with 
 `logs/sb3/<task>/<run>/params/env.yaml`.
 
 ```bash
-... env.rew_closer_scale=20.0 env.rew_no_fix=-0.25 env.rew_land=150.0
+... env.rew_potential_scale=30.0 env.rew_no_fix=-0.25 env.rew_land=1000.0
 ```
 
 **Permanently:**
 - **Single-drone task only:** add the field to the class in `tello_room_single_env_cfg.py`
-  (e.g. `rew_closer_scale = 20.0`).
+  (e.g. `rew_potential_scale = 30.0`).
 - **Both tasks:** edit the defaults in `tello_room_env_cfg.py`.
 
 ### Reading the result
@@ -129,17 +149,24 @@ episode), so you can see which term dominates. Outcomes are under `Episode/`:
 
 ```bash
 setsid nohup python -u scripts/sb3/train.py --task AS-Tello-Room-Single-v0 --headless --num_envs 512 --max_iterations 1500 \
-  env.rew_closer_scale=10.0 env.rew_time=-0.5 env.rew_no_fix=-0.5 env.rew_land=100.0 \
+  --curriculum landing env.episode_length_s=15.0 \
   > outputs/train_room_single.log 2>&1 &
 ```
 
-**2048 envs, `closer_reward` +2 per metre** (a 4x bigger batch per iteration; same PPO
-settings, minibatches of 131k samples; ~20 s per iteration and ~26.6k steps/s on the RTX 5080,
-so 1500 iterations is ~8.3 h):
+Advance through `--curriculum landing`, `approach`, then `full`, evaluating each stage before
+advancing. All three keep the same 25 observations and five actions. Landing starts hovering
+within 10 cm per horizontal axis of its assigned pad (`spawn_near_target_radius`); approach
+restores takeoff nearer the target; full restores the 6–7 m start. Monitor
+`Episode/land_gate_ready_frac` to distinguish failure to settle from failure to request land.
+`--checkpoint` resumes both PPO and its matching normalization statistics and transition count.
+`--max_iterations` specifies additional iterations on resume.
+
+For example, after the landing stage passes its evaluations:
 
 ```bash
-setsid nohup python -u scripts/sb3/train.py --task AS-Tello-Room-Single-v0 --headless --num_envs 2048 --max_iterations 1500 \
-  env.rew_closer_scale=2.0 > outputs/train_room_single_2048.log 2>&1 &
+setsid nohup python -u scripts/sb3/train.py --task AS-Tello-Room-Single-v0 --headless --num_envs 512 --max_iterations 1500 \
+  --checkpoint <landing-run>/model.zip --curriculum approach env.episode_length_s=75.0 \
+  > outputs/train_room_single_approach.log 2>&1 &
 ```
 
 - The run keeps going after you close the terminal.
@@ -358,7 +385,25 @@ python -u scripts/sb3/play.py --task AS-Tello-Room-Single-v0 --headless --num_en
 grep "episodes\]" outputs/play_single.log | tail -1
 ```
 
-Pass the same `env.*` overrides you trained with.
+The evaluator restores saved config automatically; explicit `env.*` overrides win. It seeds
+after loading PPO and collects a fixed quota per simulator slot. `--report outputs/eval.json`
+saves individual episode IDs, target assignments, results, and per-pad Wilson intervals.
+Use `--config-source current` only to deliberately test a checkpoint under changed conditions.
+Legacy runs have no external-asset snapshot, so their historical replay is approximate.
+
+New runs save `params/run.json`, `params/source.tar.gz`, `params/working.diff`, dependency
+versions, and copies/hashes of the map, tag sizes and motion fit. Missing normalization is an
+error. The config snapshot is taken after motion-fit application.
+
+```bash
+python -u scripts/sb3/evaluate_suite.py --checkpoint <run>/model.zip --scenario full --out outputs/full_suite
+python -u scripts/sb3/evaluate_suite.py --checkpoint <run>/model.zip --scenario dropout --out outputs/dropout_suite
+```
+
+Default suites cover three seeds and all four pads. Promotion requires at least 95% accurate
+touchdowns and zero crashes in each seed/pad cohort; inspect confidence intervals too.
+The one-drone checkpoint cannot be loaded as a four-drone central controller: their input and
+output dimensions differ. Team training remains a separate step after single-drone validation.
 
 ---
 
@@ -393,14 +438,17 @@ the checks, flying at rc 35, it puts the position ~10 cm from the truth vs ~13 c
 **Action:** the real Tello commands.
 - `rc right forward up yaw`: integers −100…100, sent once per 74 ms step (13.5 Hz, the
   measured flight rate), with 0–16 ms jitter.
-- **Auto land** (`auto_land`, on by default): the step after the drone's published fix enters
-  its waypoint (the observation's waypoint-reached flag), `land` is sent automatically and the
-  policy's 5th output is ignored. The laptop must do the same at deploy.
-- With `env.auto_land=False` the policy lands itself: a 5th output above 0.5 for 3 steps in a
-  row asks for `land`, sent only once the waypoint has been reached; before that it is blocked
-  and costs `rew_early_land`.
+- By default, the fifth output above 0.5 for three steps requests `land`.
+- Both requested landing and optional `env.auto_land=True` require the same gate: waypoint
+  reached, projected XY error <=15 cm, horizontal speed <=0.1 m/s, height within 20 cm of the
+  waypoint, position std <=12 cm, velocity std <=0.35 m/s, and accepted-fix age including video
+  delay <=0.35 s, continuously for 0.5 s. Lost, uninitialized, or non-finite estimates block it.
+  These are initial simulation tuning values, not hardware-validated limits.
 
-At deploy, send `env.last_rc` as `rc a b c d`.
+`drone_deployment_infra/core/room_policy.py` implements inference, map/camera/body transforms,
+normalization-before-frame-stacking, RC rounding, and the shared gate. Its CLI replays recorded
+feeds offline and sends no commands. The flight engine owns takeoff, command acknowledgement,
+and touchdown detection. Record full filter covariance and accepted-fix timestamps for replay.
 
 **Dynamics:** randomized per drone, per episode. No wind.
 - thrust-to-weight ×0.95–1.05
@@ -412,7 +460,7 @@ At deploy, send `env.last_rc` as `rc a b c d`.
 - The drone starts on the floor with motors off.
 - The firmware climbs at 0.5 m/s to 0.8–1.0 m, ignoring sticks and `land` (about 2.2 s),
   then the policy flies.
-- Takeoff steps pay no closer reward and no no-tag loss, but the landing loss runs.
+- Takeoff steps pay no no-tag loss; time cost and version-2 potential shaping continue.
 
 To start the 4-drone task from the floor too, set `start_on_floor = True` in its config.
 That changes its observation size, so it needs a fresh training run.
@@ -457,3 +505,25 @@ facing tag 10, is 2 m left of tag 10's centre (`room_y_min` = -2.0).
 | `TELLO_USD_PATH` / asset not found | `export TELLO_USD_PATH=$HOME/isaac/assets/tello.usd` |
 | obs shape mismatch loading a checkpoint | the checkpoint is from the other task (25 vs 96 inputs) or an older observation layout |
 | training slow | another run or recorder is using the GPU: `nvidia-smi` |
+
+## Research and calibration
+
+The changes retain PPO and the existing Tello RC interface. The [Swift drone-racing
+paper](https://www.nature.com/articles/s41586-023-06419-4) supports measuring dynamics and
+perception errors on the real platform and incorporating them in simulation. Its thrust/body-rate
+actions are not directly available through Tello RC, so its control interface is not copied here.
+The [inclined-landing PPO paper](https://arxiv.org/abs/2103.09043) supports starting near a goal
+and increasing difficulty gradually. These motivate our experiments; they do not validate our
+particular thresholds or establish that this policy transfers to real Tellos.
+
+```bash
+python -u scripts/audit_flight_coverage.py '../drone_deployment_infra/recordings/*.train.jsonl' \
+  --report outputs/flight_coverage.json > outputs/flight_coverage.log 2>&1
+```
+
+The coverage report identifies missing command directions, independent flights, pose rotations
+and filter covariance. Fit and hold out entire flights, including different drones. Verify
+telemetry velocity units and camera/map/body axes before fitting. The historical fit's one-sided
+command envelope (no positive up) is insufficient for this task; do not blindly enable it and
+make climbing impossible. No updated dynamics fit should replace the current one until those
+data gaps and held-out residuals have been checked.

@@ -12,8 +12,9 @@ flattened (num_envs * num_drones, ...) view, row = env * num_drones + drone.
 from __future__ import annotations
 
 import math
-import torch
 from collections.abc import Sequence
+
+import torch
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import RigidObject
@@ -24,11 +25,12 @@ from isaaclab.utils.math import quat_from_euler_xyz
 
 from action_space_kit.assets import TELLO_CFG
 from action_space_kit.control import TelloCascadeController
+from action_space_kit.rl.terminal_observation import TerminalObservationMixin
 
 from .tello_approach_env_cfg import TelloApproachEnvCfg
 
 
-class TelloApproachEnv(DirectMARLEnv):
+class TelloApproachEnv(TerminalObservationMixin, DirectMARLEnv):
     cfg: TelloApproachEnvCfg
 
     def __init__(self, cfg: TelloApproachEnvCfg, render_mode: str | None = None, **kwargs):
@@ -504,9 +506,18 @@ class TelloApproachEnv(DirectMARLEnv):
     def _log_outcomes(self, env_ids: torch.Tensor) -> None:
         """Episode statistics for the envs about to reset, as ``extras['log']``."""
         finished = env_ids[self.outcome_valid[env_ids]]
+        self.extras["episode_records"] = []
         if len(finished) == 0:
             self.extras["log"] = {}
             return
+        fields = {"success_rate": "success", "drones_arrived": "arrived", "drones_landed": "landed",
+                  "near_base_frac": "near_base", "gates_passed": "gates", "illegal_entry_rate": "illegal_entry",
+                  "collision_rate": "collision", "crash_rate": "crash", "duration_s": "time"}
+        values = {key: getattr(self, "outcome_" + name)[finished].detach().cpu().tolist()
+                  for key, name in fields.items()}
+        self.extras["episode_records"] = [
+            {"env_id": env_id, "metrics": {"Episode/" + key: float(v[j]) for key, v in values.items()}}
+            for j, env_id in enumerate(finished.cpu().tolist())]
         self.extras["log"] = {
             "Episode/success_rate": self.outcome_success[finished].float().mean().item(),
             "Episode/drones_arrived": self.outcome_arrived[finished].mean().item(),

@@ -7,8 +7,9 @@ default and dive towards the protected site.
 
 from __future__ import annotations
 
-import torch
 from collections.abc import Sequence
+
+import torch
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import RigidObject
@@ -19,11 +20,12 @@ from isaaclab.utils.math import sample_uniform
 
 from action_space_kit.assets import TELLO_CFG, TELLO_MASS
 from action_space_kit.control import TelloVelocityController
+from action_space_kit.rl.terminal_observation import TerminalObservationMixin
 
 from .tello_defend_env_cfg import TelloDefendEnvCfg
 
 
-class TelloDefendEnv(DirectMARLEnv):
+class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
     cfg: TelloDefendEnvCfg
 
     def __init__(self, cfg: TelloDefendEnvCfg, render_mode: str | None = None, **kwargs):

@@ -143,11 +143,12 @@ class FilteredPositioner:
         self.kf = KalmanCV(self.cfg)
         self._t = None
         self._last_fix_t = None
+        self._lost = True
 
     def locate(self, frame_bgr, t: float) -> dict:
         """Filtered position at time ``t`` (seconds, monotonic) from this frame (if it has tags)."""
         if self._t is not None:
-            self.kf.predict(max(t - self._t, 0.0))
+            self.kf.predict(max(t - self._t, 0.0), active=np.asarray(not self._lost))
         self._t = t
         raw = self.positioner.locate(frame_bgr)
         accepted = False
@@ -155,10 +156,12 @@ class FilteredPositioner:
             if self._last_fix_t is not None and t - self._last_fix_t > self.cfg.lost_after:
                 self.kf.reset(np.asarray(True))  # back from lost: restart from this fix
             accepted = bool(self.kf.update(np.asarray(raw["xyz"], float)))
-            self._last_fix_t = t
+            if accepted:
+                self._last_fix_t = t
         lost = self._last_fix_t is None or t - self._last_fix_t > self.cfg.lost_after
         if lost:
             self.kf.freeze(np.asarray(True))
+        self._lost = lost
         ready = bool(self.kf.ready)
         return {
             "xyz": [round(float(v), 3) for v in self.kf.p] if ready else None,
@@ -166,6 +169,9 @@ class FilteredPositioner:
             "raw": raw,
             "accepted": accepted,
             "lost": lost,
+            "fix_age": t - self._last_fix_t if self._last_fix_t is not None else float("inf"),
+            "position_variance": self.kf.a.tolist() if ready else None,
+            "velocity_variance": self.kf.c.tolist() if ready else None,
         }
 
 

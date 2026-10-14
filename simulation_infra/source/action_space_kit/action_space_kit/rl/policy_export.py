@@ -27,7 +27,7 @@ if os.path.exists(norm_path):
     if v.norm_obs:
         mean, var, clip, eps = v.obs_rms.mean, v.obs_rms.var, v.clip_obs, v.epsilon
 else:
-    print(f"[export] WARNING: no normalization stats at {norm_path}", flush=True)
+    raise FileNotFoundError(f"Missing checkpoint normalization statistics: {norm_path}")
 f32 = lambda a: torch.as_tensor(np.asarray(a, dtype=np.float32))
 
 
@@ -41,9 +41,18 @@ class Exported(torch.nn.Module):
         self.register_buffer("low", f32(model.action_space.low))
         self.register_buffer("high", f32(model.action_space.high))
         self.clip = float(clip)
+        self.n_stack = n_stack
+        self.frame_dim = dim
 
     def forward(self, obs):
-        obs = torch.clamp((obs - self.mean) / self.std, -self.clip, self.clip)
+        raw = obs
+        obs = torch.clamp((raw - self.mean) / self.std, -self.clip, self.clip)
+        if self.n_stack > 1:
+            # Recorders stack raw observations. SB3 stacks normalized observations, with
+            # absent history set to zero AFTER normalization. Room/approach frames contain
+            # a unit heading/quaternion, so an all-zero frame uniquely denotes padding.
+            padding = (raw.reshape(raw.shape[0], self.n_stack, self.frame_dim) == 0).all(-1)
+            obs = torch.where(padding.repeat_interleave(self.frame_dim, dim=-1), torch.zeros_like(obs), obs)
         return torch.maximum(torch.minimum(self.policy._predict(obs, deterministic=True), self.high), self.low)
 
 

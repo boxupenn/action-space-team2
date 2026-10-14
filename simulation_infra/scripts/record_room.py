@@ -41,6 +41,7 @@ parser.add_argument("--width", type=int, default=1280)
 parser.add_argument("--height", type=int, default=720)
 parser.add_argument("--no_dr", action="store_true", help="Nominal dynamics instead of randomized.")
 parser.add_argument("--seed", type=int, default=7)
+parser.add_argument("--config-source", choices=("checkpoint", "current"), default="checkpoint")
 parser.add_argument("--set", nargs="*", default=[], help="Extra env cfg overrides, key=python_literal.")
 parser.add_argument("--label", type=str, default="", help="Text shown in the top line.")
 parser.add_argument("--ticks_per_capture", type=int, default=3, help="App ticks after each capture.")
@@ -60,17 +61,19 @@ import ast  # noqa: E402
 import shutil  # noqa: E402
 from pathlib import Path  # noqa: E402
 
+import action_space_kit.tasks  # noqa: F401, E402
 import cv2  # noqa: E402
 import gymnasium as gym  # noqa: E402
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
+from action_space_kit.rl.policy_export import export_policy, latest_checkpoint  # noqa: E402
+from action_space_kit.rl.run_config import restore_run_config  # noqa: E402
+from action_space_kit.rl.sb3_shared import Sb3CentralVecEnv  # noqa: E402
 from stable_baselines3.common.vec_env import VecFrameStack  # noqa: E402
 
-import action_space_kit.tasks  # noqa: F401, E402
-from action_space_kit.rl.policy_export import export_policy, latest_checkpoint  # noqa: E402
-from action_space_kit.rl.sb3_shared import Sb3CentralVecEnv  # noqa: E402
-from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry  # noqa: E402
 from omni.kit.viewport.utility import capture_viewport_to_file, get_active_viewport  # noqa: E402
+
+from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry  # noqa: E402
 
 TASK = args.task
 H_AP = 20.955  # camera horizontal aperture [mm]
@@ -175,6 +178,11 @@ def main() -> int:
         os.remove(os.path.join(args.frame_dir, stale))
 
     cfg = load_cfg_from_registry(TASK, "env_cfg_entry_point")
+    if args.pilot == "policy":
+        ckpt = (Path(args.checkpoint) if args.checkpoint else latest_checkpoint(Path("logs", "sb3", TASK))).resolve()
+        agent_cfg = load_cfg_from_registry(TASK, "sb3_cfg_entry_point")
+        if args.config_source == "checkpoint":
+            restore_run_config(ckpt, cfg, agent_cfg)
     cfg.scene.num_envs = 1
     cfg.seed = args.seed
     cfg.sim.device = "cuda:0"
@@ -194,9 +202,6 @@ def main() -> int:
 
     head = args.label
     if args.pilot == "policy":
-        ckpt = Path(args.checkpoint) if args.checkpoint else latest_checkpoint(Path("logs", "sb3", TASK))
-        ckpt = ckpt.resolve()
-        agent_cfg = load_cfg_from_registry(TASK, "sb3_cfg_entry_point")
         n_stack = agent_cfg.get("frame_stack", 1)
         policy = torch.jit.load(str(export_policy(ckpt, n_stack, os.path.join(args.frame_dir, "policy.pt"))), map_location="cuda:0")
         os.remove(os.path.join(args.frame_dir, "policy.pt"))

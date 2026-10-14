@@ -43,15 +43,16 @@ simulation_app = app_launcher.app
 
 import math  # noqa: E402
 
+import action_space_kit.tasks  # noqa: E402, F401
 import gymnasium as gym  # noqa: E402
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
-
-import action_space_kit.tasks  # noqa: E402, F401
 from action_space_kit.control import load_motion_fit  # noqa: E402
-from action_space_kit.tasks.direct.tello_room.tello_room_env import _yaw_of  # noqa: E402
 from action_space_kit.tags.sensing import camera_axes, sighting  # noqa: E402
+from action_space_kit.tasks.direct.tello_room.tello_room_env import _yaw_of  # noqa: E402
+
 from isaaclab.utils.math import matrix_from_quat  # noqa: E402
+
 from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry  # noqa: E402
 
 FAILURES: list[str] = []
@@ -207,6 +208,59 @@ def test_sensing(env, u) -> None:
 
 
 def test_commands(env, u) -> None:
+    if u.cfg.reward_version == 1:
+        test_commands_legacy(env, u)
+        return
+    print("\n== version 2 commands and rewards ==")
+    fresh_start(u)
+    finite, integer = True, True
+    for _ in range(40):
+        actions = {k: torch.randn(u.num_envs, 5, device=u.device).clamp(-1, 1) for k in u.cfg.possible_agents}
+        _, reward, _, _, _ = env.step(actions)
+        finite &= all(bool(torch.isfinite(r).all()) for r in reward.values())
+        finite &= all(bool(torch.isfinite(r).all()) for r in u._ep_rew.values())
+        integer &= bool(((u.last_rc == u.last_rc.round()) & (u.last_rc.abs() <= 100)).all())
+    check(finite, "all reward terms stay finite, including outside the slowdown zone")
+    check(integer, "all actions map to integer RC inside the configured range")
+    fresh_start(u)
+    for _ in range(u.cfg.land_confirm_steps):
+        env.step(sticks(u, (0, 0, 0, 0), land=True))
+    expected = u.cfg.rew_early_land * u.cfg.num_drones
+    check(bool(torch.allclose(u._ep_rew["early_land_loss"],
+                              torch.full_like(u._ep_rew["early_land_loss"], expected))),
+          "confirmed pre-waypoint land requests retain their penalty")
+    fresh_start(u)
+    u.at_waypoint[:] = True  # historical entry must NOT authorize land back at the start
+    for _ in range(10):
+        env.step(sticks(u, (0, 0, 0, 0), land=True))
+    check(not bool(u.landing.any()), "latched waypoint plus current off-target pose blocks landing")
+    check(bool((u._ep_rew["early_land_loss"] == 0).all()),
+          "post-waypoint requests can wait for the gate without repeated request penalties")
+    for auto in (False, True):
+        previous_auto = u.cfg.auto_land
+        u.cfg.auto_land = auto
+        fresh_start(u)
+        u.at_waypoint[:] = True
+        u.pub_pos[:] = u._spots + u._wp_offset
+        u.acquired[:] = u.fresh[:] = True
+        u.lost[:] = u.taking_off[:] = False
+        u.fix_age[:] = 0
+        u.kf.v[:] = 0
+        u.kf.a[:] = .005
+        u.kf.c[:] = .04
+        for i in range(int(math.ceil(u.cfg.land_dwell_s / u.step_dt))):
+            u._pre_physics_step(sticks(u, (0, 0, 0, 0), land=True))
+            if (i+1)*u.step_dt < u.cfg.land_dwell_s:
+                check(not bool(u.landing.any()), f"auto_land={auto}: no land before dwell, tick {i+1}")
+        # Confirmed requests can have had their vote counter reset while the gate was closed.
+        for _ in range(u.cfg.land_confirm_steps):
+            u._pre_physics_step(sticks(u, (0, 0, 0, 0), land=True))
+        check(bool(u.landing.all()), f"auto_land={auto}: current settled, confident pose permits landing")
+        u.cfg.auto_land = previous_auto
+    fresh_start(u)
+
+
+def test_commands_legacy(env, u) -> None:
     print("\n== commands (real Tello SDK: rc -100..100 per channel, land) ==")
     lo, hi = u.rc.lo.tolist(), u.rc.hi.tolist()
     print("  range: " + ", ".join(f"{ch} {int(a):+d}..{int(b):+d}" for ch, a, b in zip(("right", "forward", "up", "yaw"), lo, hi)))
@@ -570,8 +624,9 @@ def test_single(env, u) -> None:
         obs = env.step(push)[0]["drone_0"]
     check(torch.allclose(obs[:, -1], u.taking_off[:, 0].float()), "the observation's last number is the taking-off flag")
     ep = u._ep_rew
-    check(ep["closer_reward"].abs().max().item() < 1e-6 and ep["no_tag_loss"].abs().max().item() < 1e-6,
-          "takeoff steps pay no closer reward and no no-tag loss (the firmware is flying)")
+    check((cfg.reward_version >= 2 or ep["closer_reward"].abs().max().item() < 1e-6)
+          and ep["no_tag_loss"].abs().max().item() < 1e-6,
+          "takeoff pays no no-tag loss (version 2 retains consistent potential shaping)")
     check(torch.allclose(ep["landing_loss"], torch.full_like(ep["landing_loss"], 5 * cfg.rew_time)),
           f"... but the landing loss runs ({ep['landing_loss'].mean():.1f} after 5 steps)")
     check(not u.landing.any().item(), "land asked for during takeoff is not sent")

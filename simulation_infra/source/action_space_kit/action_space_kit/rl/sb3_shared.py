@@ -19,11 +19,11 @@ SB3 logger by :class:`LogExtrasCallback`.
 
 from __future__ import annotations
 
+from typing import Any
+
 import gymnasium as gym
 import numpy as np
 import torch
-from typing import Any
-
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.vec_env.base_vec_env import VecEnv, VecEnvObs, VecEnvStepReturn
 
@@ -56,6 +56,8 @@ class Sb3SharedPolicyVecEnv(VecEnv):
         self._ep_rew_buf = np.zeros(self.num_envs)
         self._ep_len_buf = np.zeros(self.num_envs)
         self.log_buffer: list[dict[str, float]] = []
+        self.episode_buffer: list[dict] = []
+        self._episode_ids = np.zeros(self.num_isaac_envs, dtype=np.int64)
 
     # -- helpers ------------------------------------------------------------------
 
@@ -67,12 +69,36 @@ class Sb3SharedPolicyVecEnv(VecEnv):
     def _to_numpy(self, x: torch.Tensor) -> np.ndarray:
         return x.detach().cpu().numpy()
 
+    def _collect_extras(self, extras, env_dones):
+        # Consume each emission once. Isaac's extras dict persists across steps.
+        log = extras.pop("log", None)
+        if log and np.any(env_dones):
+            self.log_buffer.append(dict(log))
+        records = {int(r["env_id"]): r for r in extras.pop("episode_records", [])}
+        for env_id in np.flatnonzero(env_dones):
+            self._episode_ids[env_id] += 1
+            record = records.get(int(env_id), {"env_id": int(env_id), "metrics": {}})
+            record["episode_id"] = int(self._episode_ids[env_id])
+            self.episode_buffer.append(record)
+        terminal = extras.pop("terminal_observations", None)
+        if np.any(env_dones) and terminal is None:
+            raise RuntimeError("Missing pre-reset observation. Add TerminalObservationMixin to the task.")
+        return terminal
+
+    def _reset_statistics(self):
+        self._ep_rew_buf[:] = 0.0
+        self._ep_len_buf[:] = 0
+        self.log_buffer.clear()
+        self.episode_buffer.clear()
+        self._episode_ids[:] = 0
+        self.unwrapped_env.extras.pop("log", None)
+        self.unwrapped_env.extras.pop("episode_records", None)
+
     # -- VecEnv API ---------------------------------------------------------------
 
     def reset(self) -> VecEnvObs:  # noqa: D102
         obs_dict, _ = self.env.reset()
-        self._ep_rew_buf[:] = 0.0
-        self._ep_len_buf[:] = 0
+        self._reset_statistics()
         return self._to_numpy(self._flatten(obs_dict))
 
     def step_async(self, actions):  # noqa: D102
@@ -90,8 +116,12 @@ class Sb3SharedPolicyVecEnv(VecEnv):
         truncated = self._to_numpy(self._flatten(trunc_dict))
         dones = terminated | truncated
 
-        if extras.get("log"):
-            self.log_buffer.append(dict(extras["log"]))
+        terminal = self._collect_extras(extras, dones.reshape(self.num_isaac_envs, self.num_agents).any(-1))
+        final_obs = {}
+        if terminal is not None:
+            for j, env_id in enumerate(self._to_numpy(terminal["env_ids"])):
+                for a, name in enumerate(self.agents):
+                    final_obs[int(env_id) * self.num_agents + a] = self._to_numpy(terminal["observations"][name][j])
 
         self._ep_rew_buf += rewards
         self._ep_len_buf += 1
@@ -99,9 +129,7 @@ class Sb3SharedPolicyVecEnv(VecEnv):
         for idx in dones.nonzero()[0]:
             infos[idx]["episode"] = {"r": self._ep_rew_buf[idx], "l": self._ep_len_buf[idx]}
             infos[idx]["TimeLimit.truncated"] = bool(truncated[idx] and not terminated[idx])
-            # Isaac Lab resets inside step(), so this is the first observation of the next
-            # episode, exactly as with Isaac Lab's own Sb3VecEnvWrapper.
-            infos[idx]["terminal_observation"] = obs[idx]
+            infos[idx]["terminal_observation"] = final_obs[idx]
         self._ep_rew_buf[dones] = 0.0
         self._ep_len_buf[dones] = 0
         return obs, rewards, dones, infos
@@ -158,8 +186,7 @@ class Sb3CentralVecEnv(Sb3SharedPolicyVecEnv):
 
     def reset(self) -> VecEnvObs:  # noqa: D102
         obs_dict, _ = self.env.reset()
-        self._ep_rew_buf[:] = 0.0
-        self._ep_len_buf[:] = 0
+        self._reset_statistics()
         return self._to_numpy(self._central(obs_dict))
 
     def step_async(self, actions):  # noqa: D102
@@ -178,8 +205,11 @@ class Sb3CentralVecEnv(Sb3SharedPolicyVecEnv):
         truncated = self._to_numpy(trunc_dict[a0])
         dones = terminated | truncated
 
-        if extras.get("log"):
-            self.log_buffer.append(dict(extras["log"]))
+        terminal = self._collect_extras(extras, dones)
+        final_obs = {}
+        if terminal is not None:
+            values = self._to_numpy(self._central(terminal["observations"]))
+            final_obs = dict(zip(self._to_numpy(terminal["env_ids"]), values))
 
         self._ep_rew_buf += rewards
         self._ep_len_buf += 1
@@ -187,7 +217,7 @@ class Sb3CentralVecEnv(Sb3SharedPolicyVecEnv):
         for idx in dones.nonzero()[0]:
             infos[idx]["episode"] = {"r": self._ep_rew_buf[idx], "l": self._ep_len_buf[idx]}
             infos[idx]["TimeLimit.truncated"] = bool(truncated[idx] and not terminated[idx])
-            infos[idx]["terminal_observation"] = obs[idx]
+            infos[idx]["terminal_observation"] = final_obs[idx]
         self._ep_rew_buf[dones] = 0.0
         self._ep_len_buf[dones] = 0
         return obs, rewards, dones, infos
@@ -204,6 +234,8 @@ class LogExtrasCallback(BaseCallback):
         self._vec_env = vec_env
 
     def _on_step(self) -> bool:
+        # Detailed records are for evaluation; do not retain an entire training run.
+        self._vec_env.episode_buffer.clear()
         return True
 
     def _on_rollout_end(self) -> None:
