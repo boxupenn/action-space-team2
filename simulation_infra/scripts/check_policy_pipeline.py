@@ -17,11 +17,14 @@ import json
 import action_space_kit.tasks  # noqa: F401
 import gymnasium as gym
 import numpy as np
+import torch
 from action_space_kit.rl.policy_export import norm_path_for
 from action_space_kit.rl.run_config import restore_run_config
 from action_space_kit.rl.sb3_shared import Sb3CentralVecEnv
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import VecFrameStack, VecNormalize
+
+from isaaclab.utils.math import quat_from_euler_xyz
 
 from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry
 
@@ -99,7 +102,7 @@ def main():
     cfg.spawn_yaw_noise = 0.0
     successes = 0
     for target_index in range(4):
-        cfg.fixed_spot_index = target_index  # keep reset heading consistent with the controlled pad
+        cfg.fixed_spot_index = target_index
         env.reset()
         u.episode_length_buf[:] = 0
         u._spots[0, 0] = u._spot_table[target_index]
@@ -108,10 +111,16 @@ def main():
         u._link_loss[:] = 0
         pose = u._drones[0].data.root_state_w.clone()
         pose[:, :3] = u._spots[:, 0] + u._wp_offset + u.scene.env_origins
+        # Teleport orientation as well as position: the far-start heading may hide all
+        # tags over this pad. A zero-stick gate fixture cannot turn to reacquire them.
+        yaw = torch.atan2(-u._spots[:, 0, 1], -u._spots[:, 0, 0])
+        zero = torch.zeros_like(yaw)
+        pose[:, 3:7] = quat_from_euler_xyz(zero, zero, yaw)
         pose[:, 7:] = 0
         u._drones[0].write_root_pose_to_sim(pose[:, :7])
         u._drones[0].write_root_velocity_to_sim(pose[:, 7:])
         u.pub_pos[:] = u._spots + u._wp_offset
+        u.pub_yaw[:] = yaw[:, None]
         for tick in range(int(12 / u.step_dt)):
             _, _, done, _ = env.step(np.array([[0.0, 0.0, 0.0, 0.0, 1.0]], np.float32))
             if tick < int(cfg.land_dwell_s / u.step_dt):
@@ -119,6 +128,21 @@ def main():
             if done[0]:
                 successes += int(u.outcome_success[0])
                 break
+        if not (bool(done[0]) and bool(u.outcome_success[0])):
+            diagnostic = {
+                "pad": target_index,
+                "done": bool(done[0]),
+                "feed": feed(u),
+                "true_position": u._positions()[0].cpu().tolist(),
+                "at_waypoint": u.at_waypoint[0].cpu().tolist(),
+                "landing": u.landing[0].cpu().tolist(),
+                "dwell": u.land_dwell[0].cpu().tolist(),
+                "outcome_success": bool(u.outcome_success[0]) if done[0] else None,
+                "outcome_crash": bool(u.outcome_crash[0]) if done[0] else None,
+            }
+            path = Path(f"outputs/pipeline_pad_{target_index}_failure.json")
+            path.write_text(json.dumps(diagnostic, indent=2) + "\n")
+            print(f"[FAIL] Controlled landing diagnostic: {path}")
         assert bool(done[0]) and bool(u.outcome_success[0]), f"Controlled landing failed for pad {target_index}"
     print(f"[ok] Gated, on-target touchdown on all {successes} landing pads")
     env.close()
