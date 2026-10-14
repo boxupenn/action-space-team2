@@ -196,8 +196,10 @@ Run from `simulation_infra/` with the Step 2 environment.
   frame, waypoint-reached flag, tag-10 bearing, Tello `h`, its previous command, landing flag.
   Fixes carry camera-model noise, 3 cm per-fix noise and a 3 cm per-drone bias; frames are lost
   on the link at a per-drone, per-episode rate.
-- **Waypoint**: 1.5 m above each landing spot, radius 0.3 m; it counts only when the drone is slow
-  (Kalman speed estimate < `waypoint_max_speed` 0.3 m/s; flights 032-034 crossed it at ~2 m/s). Until a drone's published fix is
+- **Waypoint**: 1.5 m above each landing spot, radius 0.3 m. Entering it counts only at <= 0.3 m/s
+  (`waypoint_max_speed`, Kalman speed estimate, judged once its velocity std < `speed_trust_std` 0.35);
+  faster ends the episode with -500 per 0.3 m/s over (`fast_entry_loss`). Within 2 m of tag 10
+  (`slow_zone_radius`) `slowdown_reward` pays +200 per m/s of new low true speed (flights 032-034 crossed it at ~2 m/s). Until a drone's published fix is
   inside it, `closer_reward` pays +100 per metre gained toward the waypoint (3D); after that only
   landing rewards (touchdown, formation) and the penalties apply.
 - **Per-drone dynamics**: TWR x0.95-1.05, rotor drag x0.5-2.0, body-rate PID kp/ki x0.85-1.15,

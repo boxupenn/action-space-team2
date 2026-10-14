@@ -138,9 +138,16 @@ class TelloRoomEnvCfg(DirectMARLEnvCfg):
     waypoint_height = 1.5  # [m] above the landing spot
     waypoint_radius = 0.3  # [m]
     waypoint_max_speed = 0.3
-    """[m/s] the waypoint only counts when the drone is this slow (the Kalman filter's speed
+    """[m/s] entering the waypoint counts only at or below this speed (the Kalman filter's speed
     estimate, which the laptop has too; the true speed with env.kalman.enabled=False): flights
-    032-034 crossed the bubble at ~2 m/s and kept going."""
+    032-034 crossed the bubble at ~2 m/s and kept going. Faster: the episode fails
+    (``rew_fast_entry_per_mps``)."""
+    speed_trust_std = 0.35
+    """[m/s] the filter's speed counts only once its velocity std (sqrt of the covariance) is
+    below this: a filter restart (back from lost, outliers) sets velocity 0 with std 0.5, and
+    ~8 fixes (~0.6 s) bring it to ~0.3. Until then an entry is neither passed nor failed."""
+    slow_zone_radius = 2.0
+    """[m] horizontal distance to tag 10 inside which slowing down pays (``rew_slowdown``)."""
     success_radius = 0.3  # [m] true touchdown point within this of the spot: landed on it
     # success: all four landed on their spots
 
@@ -182,7 +189,11 @@ class TelloRoomEnvCfg(DirectMARLEnvCfg):
     # -- rewards (per drone, per policy step)
     rew_closer_scale = 100.0  # per metre closer to the own waypoint (until reached)
     rew_away_ratio = 0.25  # moving away costs this fraction of rew_closer_scale per metre
-    rew_waypoint = 1000.0  # once, when the drone's published fix first gets inside its waypoint
+    rew_waypoint = 1000.0  # once, when the drone's published fix first gets inside its waypoint (slow enough)
+    rew_fast_entry_per_mps = -500.0 / 0.3  # entering the waypoint faster than waypoint_max_speed: per m/s
+    #                  over it (0.6 m/s: -500), and the episode ends (fails)
+    rew_slowdown = 200.0  # per m/s below the slowest speed so far inside slow_zone_radius of tag 10
+    #                  (true speed; until the waypoint): pays for braking, can't be farmed by re-speeding
     rew_time = -0.5  # every step a drone is not landed on its spot ("landing loss"); a drone
     #                  that ends the episode early (crash, landed off the spot) pays the rest
     rew_land = 100.0  # at touchdown (land is only sent after the waypoint, see land gate)

@@ -151,6 +151,11 @@ class TelloRoomEnv(DirectMARLEnv):
         self._all_event = torch.zeros(E, dtype=torch.bool, device=dev)
         self._violation = torch.zeros(E, D, dtype=torch.bool, device=dev)
         self._crash = torch.zeros(E, D, dtype=torch.bool, device=dev)  # this step: crash / wall
+        self._fast_entry = torch.zeros(E, D, dtype=torch.bool, device=dev)  # this step: entered the waypoint too fast
+        self._ep_fast_entry = torch.zeros(E, dtype=torch.bool, device=dev)
+        self.outcome_fast_entry = torch.zeros(E, dtype=torch.bool, device=dev)
+        self._best_speed = torch.full((E, D), float("inf"), device=dev)  # slowest so far in the slow zone
+        self.est_speed = torch.zeros(E, D, device=dev)
         self._collision = torch.zeros(E, D, dtype=torch.bool, device=dev)  # this step: too close to another drone
         self._prev_dist = torch.zeros(E, D, device=dev)
         self._ep_collision = torch.zeros(E, dtype=torch.bool, device=dev)
@@ -211,7 +216,9 @@ class TelloRoomEnv(DirectMARLEnv):
     # every reward term, tallied per episode and logged as Rewards/avg_<term>_per_episode
     REWARD_TERMS = (
         "closer_reward",  # +10 per metre gained toward the own waypoint until reached, -5 per metre lost
-        "waypoint_reward",  # +1000 once, on first getting inside the waypoint radius
+        "waypoint_reward",  # +1000 once, on first getting inside the waypoint radius at <= 0.3 m/s
+        "slowdown_reward",  # +200 per m/s of new low speed within 2 m of tag 10 (before the waypoint)
+        "fast_entry_loss",  # entering the waypoint too fast: -500 per 0.3 m/s over; the episode fails
         "landing_loss",  # -0.5 per step not landed on the spot (+ the rest, if ended early)
         "no_tag_loss",  # -0.5 per step a flying drone has no AprilTag in view
         "crash_loss",  # -100 per crash / wall / leaving the room
@@ -410,14 +417,19 @@ class TelloRoomEnv(DirectMARLEnv):
 
         # takeoff done: the firmware levels off at its takeoff height and hands over to rc
         self.taking_off &= pos[..., 2] < self._takeoff_z
-        # waypoint reached: decided on the published position (what the controller sees), and
-        # only when slow: the filter's speed estimate (the laptop has it too) under
-        # waypoint_max_speed (true speed without the filter); latched
+        # entering the waypoint: decided on the published position (what the controller sees) and
+        # the filter's speed estimate (the laptop has it too; true speed without the filter).
+        # At or below waypoint_max_speed it is reached (latched); faster, the episode fails
         self._wp_before = self.at_waypoint.clone()
         near_wp = torch.linalg.norm(self.pub_pos - (self._spots + self._wp_offset), dim=-1) < cfg.waypoint_radius
         self.est_speed = torch.linalg.norm(self.kf.v if cfg.kalman.enabled else self._stack("root_lin_vel_w"), dim=-1)
-        slow = self.est_speed < cfg.waypoint_max_speed
-        self._waypoint_event = ~self.at_waypoint & near_wp & slow & self.fresh & ~self.landing
+        slow = self.est_speed <= cfg.waypoint_max_speed
+        # a just-restarted filter reads velocity 0: judge the speed only once it has settled
+        trusted = (torch.sqrt(self.kf.c).amax(-1) < cfg.speed_trust_std) if cfg.kalman.enabled else torch.ones_like(slow)
+        entry = ~self.at_waypoint & near_wp & self.fresh & ~self.landing & trusted
+        self._waypoint_event = entry & slow
+        self._fast_entry = entry & ~slow
+        self._ep_fast_entry |= self._fast_entry.any(dim=-1)
         self.at_waypoint |= self._waypoint_event
         # touchdown: motors off; judged on the true touchdown point
         self._touchdown_event = self.landing & ~self.landed & (pos[..., 2] < cfg.touchdown_height)
@@ -454,7 +466,7 @@ class TelloRoomEnv(DirectMARLEnv):
 
         spot_err = torch.where(self.landed, self.touchdown_err, err)
         success = self._all_event
-        done = self._violation.any(dim=-1) | all_landed
+        done = self._violation.any(dim=-1) | self._fast_entry.any(dim=-1) | all_landed
         self._done_now = done
         time_out = self.episode_length_buf >= self.max_episode_length - 1
 
@@ -468,6 +480,7 @@ class TelloRoomEnv(DirectMARLEnv):
         self.outcome_land_ok = latch(self.land_ok.float().sum(-1), self.outcome_land_ok)
         self.outcome_collision = latch(self._ep_collision, self.outcome_collision)
         self.outcome_crash = latch(self._ep_crash, self.outcome_crash)
+        self.outcome_fast_entry = latch(self._ep_fast_entry, self.outcome_fast_entry)
         self.outcome_time = latch(self.episode_length_buf.float() * self.step_dt, self.outcome_time)
         self.outcome_fresh_frac = latch(self._ep_fresh_steps / steps, self.outcome_fresh_frac)
         self.outcome_losses = latch(self._ep_losses, self.outcome_losses)
@@ -489,6 +502,13 @@ class TelloRoomEnv(DirectMARLEnv):
         gain = torch.where(gain > 0, gain, cfg.rew_away_ratio * gain)
         closer = cfg.rew_closer_scale * gain * flying * heading_in
         self._prev_dist = dist
+        # braking near tag 10: pays for each new low of the true speed inside the slow zone
+        speed = torch.linalg.norm(self._stack("root_lin_vel_w"), dim=-1)
+        in_zone = (torch.linalg.norm(pos[..., :2], dim=-1) < cfg.slow_zone_radius) & (flying * heading_in).bool()
+        best = torch.where(in_zone & torch.isinf(self._best_speed), speed, self._best_speed)  # entering: start here
+        slowdown = cfg.rew_slowdown * (best - speed).clamp(min=0.0) * in_zone.float()
+        self._best_speed = torch.where(in_zone, torch.minimum(best, speed), self._best_speed)
+        over = (self.est_speed - cfg.waypoint_max_speed).clamp(min=0.0)
 
         sep = ((cfg.separation_distance - self._pairwise_distance(pos)) / cfg.separation_distance).clamp(min=0.0).sum(-1)
         action_rate = torch.sum((self._actions - self._prev_actions) ** 2, dim=-1)
@@ -502,6 +522,8 @@ class TelloRoomEnv(DirectMARLEnv):
         terms = {
             "closer_reward": closer,
             "waypoint_reward": cfg.rew_waypoint * self._waypoint_event.float(),
+            "slowdown_reward": slowdown,
+            "fast_entry_loss": cfg.rew_fast_entry_per_mps * over * self._fast_entry.float(),
             "landing_loss": landing,
             "no_tag_loss": cfg.rew_no_fix * (~self.fresh).float() * flying,
             "crash_loss": cfg.rew_violation * (self._crash & ~self._collision).float(),
@@ -654,6 +676,8 @@ class TelloRoomEnv(DirectMARLEnv):
         self._prev_dist[env_ids] = torch.linalg.norm(start - (self._spots[env_ids] + self._wp_offset), dim=-1)
         self._ep_collision[env_ids] = False
         self._ep_crash[env_ids] = False
+        self._ep_fast_entry[env_ids] = False
+        self._best_speed[env_ids] = float("inf")
         self._ep_fresh_steps[env_ids] = 0.0
         self._ep_losses[env_ids] = 0.0
         self._ep_min_sep[env_ids] = float("inf")
@@ -665,6 +689,7 @@ class TelloRoomEnv(DirectMARLEnv):
             return
         self.extras["log"] = {
             "Episode/success_rate": self.outcome_success[finished].float().mean().item(),
+            "Episode/fast_entry_rate": self.outcome_fast_entry[finished].float().mean().item(),
             "Episode/drones_reached_waypoint": self.outcome_waypoints[finished].mean().item(),
             # share of drones that got inside their waypoint this episode, 0-100
             "Episode/waypoint_reached_pct": 100.0 * (self.outcome_waypoints[finished] / self.cfg.num_drones).mean().item(),

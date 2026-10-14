@@ -13,8 +13,10 @@ Two Isaac Lab tasks fly simulated DJI Tellos in the real mapped room. In both, a
 
 Both start inside a 2 m × 2 m box, 6–7 m from tag 10. The landing spots are on the floor
 1 m in front of the tag-10 wall, 0.5 m apart. Each spot has a **waypoint 1.5 m above it**
-(radius 0.3 m). It counts only when the drone is slow: the Kalman filter's speed estimate
-under 0.3 m/s (`waypoint_max_speed`), so a drone can't register by flying through it.
+(radius 0.3 m). Entering it counts only at or below 0.3 m/s (`waypoint_max_speed`, the Kalman
+filter's speed estimate, judged once the filter's velocity is settled: `speed_trust_std`). Faster,
+the episode fails with -500 per 0.3 m/s over (0.6 m/s: -500, 0.9 m/s: -1000). Within 2 m of tag 10
+the drone earns +200 per m/s of speed it sheds, counted only for new lows so it can't be farmed.
 
 ---
 
@@ -64,6 +66,8 @@ The reward weights are in
 | `rew_closer_scale` | `100.0` | `closer_reward` | + per metre gained toward the **waypoint**. Only until the waypoint is reached, and never during takeoff or land |
 | `rew_away_ratio` | `0.25` | `closer_reward` | moving away costs this fraction of `rew_closer_scale` per metre (−25 per metre by default) |
 | `rew_waypoint` | `1000.0` | `waypoint_reward` | once, when the drone's published position first gets inside its waypoint (the same moment the land gate opens and the closer reward stops) |
+| `rew_fast_entry_per_mps` | `-1666.7` | `fast_entry_loss` | entering the waypoint above 0.3 m/s: per m/s over (0.6 m/s: -500); the episode ends |
+| `rew_slowdown` | `200.0` | `slowdown_reward` | per m/s of new low true speed within `slow_zone_radius` (2 m) of tag 10, until the waypoint |
 | `rew_time` | `-0.5` | `landing_loss` | every step until landed on the spot; ending early (crash, landing off the spot) pays the remaining steps |
 | `rew_no_fix` | `-0.5` | `no_tag_loss` | every step the drone flies with no tag fix |
 | `rew_violation` | `-100.0` | `crash_loss` | crash, wall, ceiling, flipping |

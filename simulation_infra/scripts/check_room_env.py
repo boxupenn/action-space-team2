@@ -116,7 +116,10 @@ def test_geometry(u) -> None:
     check(bool(((r >= cfg.spawn_range[0] - 1e-4) & (r <= cfg.spawn_range[1] + 1e-4)).all()),
           f"every start is {cfg.spawn_range[0]:.0f}-{cfg.spawn_range[1]:.0f} m from tag 10 (range {r.min():.2f}-{r.max():.2f} m)")
     sep = u._pairwise_distance(pos[..., :2].contiguous()).amin().item()
-    check(sep >= cfg.spawn_min_separation - 1e-4, f"starts are >= {cfg.spawn_min_separation} m apart (closest {sep:.2f} m)")
+    for _ in range(49):  # 50 resets of every env
+        fresh_start(u)
+        sep = min(sep, u._pairwise_distance(u._positions()[..., :2].contiguous()).amin().item())
+    check(sep >= cfg.spawn_min_separation - 1e-4, f"starts are >= {cfg.spawn_min_separation} m apart over 50 resets x {u.num_envs} envs (closest {sep:.2f} m)")
 
     spots = u._spots
     check(bool(torch.allclose(spots[..., 0], torch.full_like(spots[..., 0], cfg.spot_distance)))
@@ -292,6 +295,7 @@ def test_commands(env, u) -> None:
 
     # the waypoint counts only when slow: the filter's speed estimate under waypoint_max_speed
     registered, speeds = {}, []
+    fast_ok, n_fast = True, 0
     for limit in (0.0, u.cfg.waypoint_max_speed):  # limit 0: nothing is ever slow enough
         u.cfg.waypoint_max_speed = limit
         fresh_start(u)
@@ -305,6 +309,12 @@ def test_commands(env, u) -> None:
         for _ in range(int(2.0 / u.step_dt)):  # (auto_land: registered drones land, episodes end)
             env.step(sticks(u, (0, 0, 0, 0)))
             ever |= u._waypoint_event
+            if limit == 0.0 and u._fast_entry.any():  # too fast: -500 per 0.3 m/s over, episode over
+                ev = u._fast_entry.any(-1)
+                want = (u.cfg.rew_fast_entry_per_mps * u.est_speed * u._fast_entry.float()).sum(-1)[ev]
+                got = u.outcome_rew["fast_entry_loss"][ev]
+                fast_ok &= bool(torch.allclose(got, want, atol=1e-3)) and bool(u.outcome_fast_entry[ev].all())
+                n_fast += int(ev.sum())
             inside = torch.linalg.norm(u.pub_pos - (u._spots + u._wp_offset), dim=-1) < u.cfg.waypoint_radius
             seen |= inside & u.fresh & ~u.landing
             if limit > 0:
@@ -316,6 +326,25 @@ def test_commands(env, u) -> None:
           f"registers {registered[limit]:.0%} "
           f"with {limit} m/s, {registered[0.0]:.0%} with 0 (hover speed estimate median {sp.median():.2f}, "
           f"p90 {sp.quantile(0.9):.2f} m/s)")
+    u.cfg.waypoint_max_speed = limit
+    check(fast_ok and n_fast > 0, f"entering faster than waypoint_max_speed fails the episode and costs "
+          f"{-u.cfg.rew_fast_entry_per_mps * 0.3:.0f} per 0.3 m/s over ({n_fast} episodes checked)")
+
+    # braking within slow_zone_radius of tag 10 pays rew_slowdown per m/s of new low speed
+    fresh_start(u)
+    for i, drone in enumerate(u._drones):
+        pose = drone.data.root_state_w[:, :7].clone()
+        pose[:, :3] = u.scene.env_origins + torch.tensor([1.0, 0.9 - 0.6 * i, 1.0], device=u.device)  # in the zone, below the waypoints
+        vel = torch.zeros(u.num_envs, 6, device=u.device)
+        vel[:, 0] = 1.0  # 1 m/s away from the wall, sticks centred: the firmware brakes it
+        drone.write_root_pose_to_sim(pose, E)
+        drone.write_root_velocity_to_sim(vel, E)
+    for _ in range(int(2.0 / u.step_dt)):
+        env.step(sticks(u, (0, 0, 0, 0)))
+    paid = u._ep_rew["slowdown_reward"][~u.outcome_valid] / u.cfg.num_drones
+    check(bool((paid > 0.5 * u.cfg.rew_slowdown).all() & (paid <= 1.05 * u.cfg.rew_slowdown).all()),
+          f"braking from 1 m/s inside the slow zone pays rew_slowdown per m/s shed ({paid.mean():.0f} per drone, "
+          f"at most {u.cfg.rew_slowdown:.0f})")
 
     # two drones within collision_distance: each pays rew_collision (not the crash loss), episode ends
     if u.cfg.num_drones > 1:
