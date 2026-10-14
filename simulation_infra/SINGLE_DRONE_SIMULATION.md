@@ -210,6 +210,21 @@ speed scales. It uses the same discounted potential difference and absorbing-ter
 handling as the approach term. This changes training rewards only; the landing gate and
 success radius stay unchanged. The default weight is zero to preserve saved-run replay.
 
+For a policy that completes missions on only one side of the central tag, the experimental
+`collect_room_demonstrations.py` / `imitate_room.py` workflow collects complete successful
+flights and trains the same actor on original and reflected examples. Reflection changes
+world Y, heading/bearing sine, lateral goal offsets, and lateral/yaw commands. Normalization
+is applied after reflecting raw histories; padding remains zero. Validation splits whole
+trajectories, keeping each original/reflected pair together. The critic is retained and
+PPO actor optimizer moments are cleared before saving. No mirroring or policy routing
+runs at inference time.
+
+This is supervised imitation, not an on-policy PPO update on invented transitions. The
+room walls and auxiliary tags are asymmetric, so reflection is only a training prior;
+every candidate must be evaluated in the original room. The approach is motivated by
+[research on task symmetry in robot learning](https://arxiv.org/abs/2403.04359), not by a
+claim that this room is a perfectly symmetric MDP.
+
 For example, after the landing stage passes its evaluations:
 
 ```bash

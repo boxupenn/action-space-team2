@@ -32,6 +32,7 @@ evaluation = load("evaluation_test", RL / "evaluation.py")
 rewards = load("rewards_test", RL / "rewards.py")
 starts = load("starts_test", RL / "start_curriculum.py")
 finetune = load("finetune_test", RL / "finetune.py")
+symmetry = load("symmetry_test", RL / "symmetry.py")
 run_config = load("run_config_test", RL / "run_config.py")
 gate = load("gate_test", REPO / "drone_deployment_infra/core/landing_gate.py")
 sensor = load("sensor_test", RL.parent / "tags/sensing.py")
@@ -94,6 +95,26 @@ with patch.dict(sys.modules, {"isaaclab.envs": isaac_stub}):
 
 
 class PolicyContractTests(unittest.TestCase):
+    def test_room_reflection_matches_physical_coordinates(self):
+        def observation(position, yaw, target, action):
+            c, s = np.cos(yaw), np.sin(yaw)
+            def heading(point):
+                x, y, z = point - position
+                return [c*x+s*y, s*x-c*y, z]
+            bearing = np.arctan2(-position[1], -position[0]) - yaw
+            return np.array([*position, c, s, 1, .074, 0,
+                             *heading(target), *heading(target * [1, 1, 0]), 0,
+                             np.sin(bearing), np.cos(bearing), position[2], *action, 0, 0])
+        position, target = np.array([2., .4, 1.1]), np.array([1., -.25, 1.22])
+        action = np.array([.2, .5, -.1, .3, 1.])
+        original = observation(position, .6, target, action)
+        expected = observation(position * [1, -1, 1], -.6, target * [1, -1, 1], action * [-1, 1, 1, -1, 1])
+        np.testing.assert_allclose(symmetry.mirror_room_observation(original), expected, atol=1e-12)
+        np.testing.assert_array_equal(symmetry.mirror_room_action(action), action * [-1, 1, 1, -1, 1])
+        stack = np.concatenate([np.zeros(25), original])
+        np.testing.assert_array_equal(symmetry.mirror_room_observation(symmetry.mirror_room_observation(stack)), stack)
+        torch.testing.assert_close(symmetry.mirror_room_observation(torch.tensor(original)), torch.tensor(expected))
+
     def test_precision_shaping_prefers_slow_accurate_arrival(self):
         distance = np.array([0., .2, .5, 0.])
         speed = np.array([0., 0., 0., .3])
