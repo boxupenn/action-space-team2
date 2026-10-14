@@ -21,6 +21,9 @@ with its result.
     python -u scripts/record_room.py --checkpoint logs/sb3/AS-Tello-Room-v0/<run>/model.zip --no_dr --view top
     # scene check without a policy: zero sticks (hover)
     python -u scripts/record_room.py --pilot zero --episodes 1 --max_seconds 10
+    # single-drone policy copied independently to four drones in one room (transfer test)
+    python -u scripts/record_room.py --task AS-Tello-Room-Single-v0 --checkpoint <run>/model.zip \
+        --independent_drones 4 --episodes 1 --report outputs/four_drone_recording.json
     grep "\\[rec\\]" outputs/record_room.log
 """
 
@@ -36,6 +39,9 @@ parser.add_argument("--checkpoint", type=str, default=None,
                     help="SB3 model .zip (default: newest checkpoint of the newest run under logs/sb3/<task>).")
 parser.add_argument("--episodes", type=int, default=2)
 parser.add_argument("--pads", type=int, nargs="+", help="Single-drone pad indices to record in order; overrides --episodes.")
+parser.add_argument("--independent_drones", type=int, choices=(2, 3, 4),
+                    help="Test independent copies of a single-drone policy together in ONE room; no team training.")
+parser.add_argument("--report", type=str, help="Write recording configuration and exact episode outcomes to JSON.")
 parser.add_argument("--max_seconds", type=float, default=None, help="Cap on each attempt (default: the episode length).")
 parser.add_argument("--view", choices=["overview", "side", "top", "landing"], default="overview")
 parser.add_argument("--hide_waypoints", action="store_true", help="Hide waypoint spheres that can obscure the drone.")
@@ -60,6 +66,9 @@ app_launcher = AppLauncher({"headless": True, "enable_cameras": True, "livestrea
 simulation_app = app_launcher.app
 
 import ast  # noqa: E402
+import copy  # noqa: E402
+import hashlib  # noqa: E402
+import json  # noqa: E402
 import shutil  # noqa: E402
 from pathlib import Path  # noqa: E402
 
@@ -68,9 +77,9 @@ import cv2  # noqa: E402
 import gymnasium as gym  # noqa: E402
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
-from action_space_kit.rl.policy_export import export_policy, latest_checkpoint  # noqa: E402
+from action_space_kit.rl.policy_export import export_policy, latest_checkpoint, norm_path_for  # noqa: E402
 from action_space_kit.rl.run_config import restore_run_config  # noqa: E402
-from action_space_kit.rl.sb3_shared import Sb3CentralVecEnv  # noqa: E402
+from action_space_kit.rl.sb3_shared import Sb3CentralVecEnv, Sb3SharedPolicyVecEnv  # noqa: E402
 from stable_baselines3.common.vec_env import VecFrameStack  # noqa: E402
 
 from omni.kit.viewport.utility import capture_viewport_to_file, get_active_viewport  # noqa: E402
@@ -132,6 +141,7 @@ def drone_state(u) -> list[dict]:
         else:
             phase = f"to waypoint {float(torch.linalg.norm(wp[i] - pos[i])):.1f} m"
         rows.append({
+            "pad": round(float(u._spots[0, i, 1]) / u.cfg.spot_spacing + (u.cfg.spot_count - 1) / 2),
             "phase": phase,
             "lost": bool(u.lost[0, i]),
             "rc": [int(v) for v in u.last_rc[0, i].tolist()],
@@ -155,15 +165,15 @@ def overlay(path: str, rec: dict, colors: list[tuple[int, int, int]], result: st
     n = len(rec["drones"])
     y0 = img.shape[0] - 12 - 26 * n
     cv2.rectangle(img, (0, y0 - 24), (760, img.shape[0]), (0, 0, 0), -1)
-    for label, x in (("drone", 10), ("phase", 60), ("rc: right  fwd   up  yaw", 400), ("fix age", 640)):
+    for label, x in (("drone/pad", 10), ("phase", 100), ("rc: right  fwd   up  yaw", 400), ("fix age", 640)):
         text(label, x, y0 - 6, (200, 200, 200), 0.5)
     for i, d in enumerate(rec["drones"]):
         y = y0 + 22 + 26 * i
         cv2.rectangle(img, (12, y - 14), (28, y + 2), colors[i], -1)
         phase = d["phase"] + ("   LOST: no tag" if d["lost"] else "")
         color = (80, 80, 255) if d["lost"] or "OFF" in d["phase"] else (120, 255, 120) if "on spot" in d["phase"] else (255, 255, 255)
-        text(f"{i}", 36, y, colors[i], 0.55)
-        text(phase, 60, y, color, 0.55)
+        text(f"{i}/{d['pad']}", 36, y, colors[i], 0.55)
+        text(phase, 100, y, color, 0.50)
         for k, v in enumerate(d["rc"]):
             text(f"{v:4d}", 430 + 50 * k, y, (255, 255, 255), 0.55)
         text(f"{d['fix_age']:4.1f} s", 640, y, (80, 80, 255) if d["lost"] else (255, 255, 255), 0.55)
@@ -199,6 +209,21 @@ def main() -> int:
         setattr(obj, leaf, ast.literal_eval(v))
     if args.no_dr:
         cfg.dynamics.domain_randomization = False
+    if args.independent_drones:
+        if args.pilot != "policy" or cfg.num_drones != 1 or args.pads:
+            raise ValueError("--independent_drones requires a single-drone policy and cannot be combined with --pads")
+        if args.independent_drones > cfg.spot_count:
+            raise ValueError("Each independent drone needs its own landing pad")
+        # Preserve the single-drone observation/action contract and saved normalization.
+        # Each row gets its own frame history; all bodies share one physics environment.
+        original = cfg.possible_agents[0]
+        observation_space = cfg.observation_spaces[original]
+        action_space = cfg.action_spaces[original]
+        cfg.num_drones = args.independent_drones
+        cfg.possible_agents = [f"drone_{i}" for i in range(cfg.num_drones)]
+        cfg.observation_spaces = {a: copy.deepcopy(observation_space) for a in cfg.possible_agents}
+        cfg.action_spaces = {a: copy.deepcopy(action_space) for a in cfg.possible_agents}
+        cfg.fixed_spot_index = -1
     if args.pads:
         if cfg.num_drones != 1 or any(p < 0 or p >= cfg.spot_count for p in args.pads):
             raise ValueError("--pads requires a single drone and valid landing-pad indices")
@@ -206,7 +231,8 @@ def main() -> int:
         cfg.fixed_spot_index = args.pads[0]
     env = gym.make(TASK, cfg=cfg)
     u = env.unwrapped
-    venv = Sb3CentralVecEnv(env)
+    base_venv = (Sb3SharedPolicyVecEnv if args.independent_drones else Sb3CentralVecEnv)(env)
+    venv = base_venv
 
     head = args.label
     if args.pilot == "policy":
@@ -220,7 +246,10 @@ def main() -> int:
 
         def act(obs):
             with torch.inference_mode():
-                return policy(torch.as_tensor(obs, dtype=torch.float32, device="cuda:0")).cpu().numpy()
+                actions = policy(torch.as_tensor(obs, dtype=torch.float32, device="cuda:0")).cpu().numpy()
+            if actions.shape != (base_venv.num_envs, *base_venv.action_space.shape):
+                raise ValueError(f"Policy action shape {actions.shape} does not match the recording wrapper")
+            return actions
     else:
         head = head or "zero sticks"
 
@@ -234,6 +263,13 @@ def main() -> int:
         u._wp_markers.set_visibility(False)
     venv.seed(args.seed)  # exporting PPO restores its training seed; reseed before recording
     obs = venv.reset()
+    if args.independent_drones:
+        batch = act(obs)
+        with torch.inference_mode():
+            rows = torch.cat([policy(torch.as_tensor(row[None], dtype=torch.float32, device="cuda:0"))
+                              for row in obs]).cpu().numpy()
+        np.testing.assert_allclose(batch, rows, rtol=1e-4, atol=2e-5)
+        print(f"[rec] independent inference parity passed: {len(obs)} actors, one shared room", flush=True)
     for _ in range(30):
         u.sim.render()  # renders without stepping physics
 
@@ -256,6 +292,7 @@ def main() -> int:
     max_steps = int(max_s / u.step_dt)
     hold = int(HOLD_S / u.step_dt)
     summary = []
+    episode_reports = []
     for ep in range(args.episodes):
         if args.pads and ep > 0:
             cfg.fixed_spot_index = args.pads[ep]
@@ -263,10 +300,12 @@ def main() -> int:
         pad_label = f"   pad {args.pads[ep]}" if args.pads else ""
         ep_head = f"{head}{pad_label}   attempt {ep + 1}/{args.episodes}"
         steps, ret, done, rec = 0, 0.0, False, None
+        starts = u._start_positions[0].cpu().tolist()
+        targets = u._spots[0].cpu().tolist()
         while steps < max_steps:
             obs, rew, dones, _ = venv.step(act(obs))
             steps += 1
-            ret += float(rew[0])
+            ret += float(rew.sum())
             if bool(dones[0]):
                 done = True
                 break  # the env has already auto-reset: this frame would show the next episode's start
@@ -274,6 +313,13 @@ def main() -> int:
             rec = {"head": ep_head, "t": steps * u.step_dt, "ret": ret, "drones": drone_state(u)}
             capture(rec)
         o = {k: float(getattr(u, f"outcome_{k}")[0]) for k in ("success", "waypoints", "landed", "land_ok", "collision", "crash", "spot_err")}
+        episode_reports.append({
+            "episode": ep + 1, "complete": done, "duration_s": steps * u.step_dt,
+            "start_positions": starts, "targets": targets,
+            "outcome": o if done else None,
+            "min_separation_m": float(u.outcome_min_sep[0]) if done and cfg.num_drones > 1 else None,
+            "record": base_venv.episode_buffer[-1] if done else None,
+        })
         if done:
             verdict = "SUCCESS" if o["success"] else "FAIL"
             why = "  collision" if o["collision"] else "  crash" if o["crash"] else ""
@@ -325,6 +371,22 @@ def main() -> int:
     if not args.keep_frames:
         shutil.rmtree(args.frame_dir, ignore_errors=True)
     print(f"[rec] wrote {args.out} ({os.path.getsize(args.out)} bytes)", flush=True)
+    if args.report:
+        report = {
+            "video": args.out, "seed": args.seed, "num_drones": cfg.num_drones,
+            "independent_single_drone_actors": bool(args.independent_drones),
+            "same_physics_environment": True, "config_source": args.config_source,
+            "overrides": args.set, "checkpoint": str(ckpt) if args.pilot == "policy" else None,
+            "checkpoint_sha256": hashlib.sha256(ckpt.read_bytes()).hexdigest() if args.pilot == "policy" else None,
+            "normalizer_sha256": hashlib.sha256(norm_path_for(ckpt).read_bytes()).hexdigest() if args.pilot == "policy" else None,
+            "domain_randomization": cfg.dynamics.domain_randomization,
+            "random_assignment": cfg.random_assignment, "collision_distance_m": cfg.collision_distance,
+            "episodes": episode_reports,
+        }
+        path = Path(args.report)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
+        print(f"[rec] report={path}", flush=True)
     return 0
 
 
