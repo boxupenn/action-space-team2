@@ -5,10 +5,19 @@ import math
 import torch
 
 
-def prepare_finetune(model, action_std):
+def prepare_finetune(model, action_std=None, value_scale=None):
     policy = model.policy
-    if not math.isfinite(action_std) or action_std <= 0:
-        raise ValueError("action_std must be finite and positive")
-    with torch.no_grad():
-        policy.log_std.fill_(math.log(action_std))
-    policy.optimizer.state.pop(policy.log_std, None)
+    for name, value in (("action_std", action_std), ("value_scale", value_scale)):
+        if value is not None and (not math.isfinite(value) or value <= 0):
+            raise ValueError(f"{name} must be finite and positive")
+    if action_std is not None:
+        with torch.no_grad():
+            policy.log_std.fill_(math.log(action_std))
+        policy.optimizer.state.pop(policy.log_std, None)
+    if value_scale is not None:
+        # Convert the critic to the new reward units while retaining its learned features.
+        with torch.no_grad():
+            policy.value_net.weight.mul_(value_scale)
+            policy.value_net.bias.mul_(value_scale)
+        for parameter in (*policy.value_net.parameters(), *policy.mlp_extractor.value_net.parameters()):
+            policy.optimizer.state.pop(parameter, None)

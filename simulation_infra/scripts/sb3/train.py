@@ -32,6 +32,8 @@ parser.add_argument("--seed", type=int, default=None, help="Seed used for the en
 parser.add_argument("--checkpoint", type=str, default=None, help="Continue the training from checkpoint.")
 parser.add_argument("--action-std", type=float, default=None,
                     help="Explicitly reset Gaussian exploration std on warm start; deterministic actions are unchanged.")
+parser.add_argument("--value-scale", type=float, default=None,
+                    help="On warm start, scale critic predictions to new reward units; actor is unchanged.")
 parser.add_argument("--config-source", choices=("checkpoint", "current"), default="checkpoint",
                     help="On resume, restore the saved configuration or explicitly use the current task.")
 parser.add_argument("--max_iterations", type=int, default=None, help="PPO iterations (rollout + update cycles).")
@@ -40,7 +42,7 @@ parser.add_argument("--curriculum", choices=("landing", "approach", "full"), def
                     help="Single-drone stage, preserving the same observation/action shapes.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
-if args_cli.action_std is not None and not args_cli.checkpoint:
+if (args_cli.action_std is not None or args_cli.value_scale is not None) and not args_cli.checkpoint:
     parser.error("Warm-start adjustments require --checkpoint")
 if args_cli.video:
     args_cli.enable_cameras = True
@@ -205,9 +207,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"[resume] Starting at {agent.num_timesteps} transitions")
     else:
         agent = PPO(policy_arch, env, verbose=1, tensorboard_log=log_dir, **agent_cfg)
-    if args_cli.action_std is not None:
-        prepare_finetune(agent, args_cli.action_std)
-        print(f"[warm-start] action_std={args_cli.action_std}")
+    if args_cli.action_std is not None or args_cli.value_scale is not None:
+        prepare_finetune(agent, args_cli.action_std, args_cli.value_scale)
+        print(f"[warm-start] action_std={args_cli.action_std}; value_scale={args_cli.value_scale}")
 
     # CheckpointCallback counts vec-env steps (one per iteration step), not transitions
     callbacks.append(

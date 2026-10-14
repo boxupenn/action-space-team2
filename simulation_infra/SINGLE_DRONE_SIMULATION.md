@@ -194,6 +194,13 @@ keeps the matching checkpoint's input and reward statistics fixed; this requires
 checkpoint. Both are optional, recorded in the run, and need full-mission evaluation
 against the parent checkpoint before promotion. They do not add a navigation controller.
 
+When switching a resumed run from raw rewards to `agent.normalize_value=True`, the
+critic must use the new reward units too. With frozen normalization and unclipped rewards,
+pass `--value-scale <1 / sqrt(ret_rms.var + epsilon)>`, using the matching VecNormalize
+checkpoint's return variance. This scales the value head and clears its critic optimizer
+moments while preserving actor outputs. Record the exact factor with the run; evaluation
+always reports the original physical success metrics, with reward normalization disabled.
+
 For example, after the landing stage passes its evaluations:
 
 ```bash

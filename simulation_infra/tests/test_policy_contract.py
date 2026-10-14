@@ -97,6 +97,7 @@ class PolicyContractTests(unittest.TestCase):
     def test_warm_start_preserves_deterministic_actor(self):
         env = gym.make("Pendulum-v1")
         model = PPO("MlpPolicy", env, n_steps=8, batch_size=8, n_epochs=1, device="cpu", seed=9)
+        model.learn(8)
         obs = np.array([[1.0, 0.0, 0.2], [0.0, 1.0, -0.3]], dtype=np.float32)
         before, _ = model.predict(obs, deterministic=True)
         with torch.no_grad():
@@ -107,8 +108,16 @@ class PolicyContractTests(unittest.TestCase):
         with torch.no_grad():
             self.assertTrue(torch.equal(model.policy.predict_values(torch.from_numpy(obs)), values_before))
         np.testing.assert_allclose(model.policy.log_std.detach().exp().numpy(), .25)
+        finetune.prepare_finetune(model, value_scale=.01)
+        np.testing.assert_array_equal(before, model.predict(obs, deterministic=True)[0])
+        with torch.no_grad():
+            torch.testing.assert_close(model.policy.predict_values(torch.from_numpy(obs)), .01 * values_before)
+        self.assertNotIn(model.policy.value_net.weight, model.policy.optimizer.state)
+        self.assertIn(model.policy.action_net.weight, model.policy.optimizer.state)
         with self.assertRaises(ValueError):
             finetune.prepare_finetune(model, action_std=0)
+        with self.assertRaises(ValueError):
+            finetune.prepare_finetune(model, value_scale=float("nan"))
         env.close()
 
     def test_start_mixture_preserves_full_task_and_replays_easier_starts(self):
