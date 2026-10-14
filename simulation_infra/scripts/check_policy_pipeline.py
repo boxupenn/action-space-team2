@@ -96,8 +96,10 @@ def main():
     cfg.fix_noise = cfg.fix_bias = 0.0
     cfg.tag_sensor.pixel_noise = cfg.tag_sensor.dropout = cfg.tag_sensor.blur_max_loss = 0.0
     cfg.link_loss_range = (0.0, 0.0)
+    cfg.spawn_yaw_noise = 0.0
     successes = 0
     for target_index in range(4):
+        cfg.fixed_spot_index = target_index  # keep reset heading consistent with the controlled pad
         env.reset()
         u.episode_length_buf[:] = 0
         u._spots[0, 0] = u._spot_table[target_index]
@@ -126,5 +128,11 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+    except Exception:
+        # Print before shutdown: Kit can stall in close(), hiding the actual assertion.
+        import traceback
+
+        traceback.print_exc()
+        raise
     finally:
         app.app.close()
