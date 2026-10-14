@@ -76,7 +76,8 @@ TASK = args.task
 H_AP = 20.955  # camera horizontal aperture [mm]
 # (eye, target, focal length [mm]) in the room frame: tag-10 wall at X = 0, start box at X ~6.5
 VIEWS = {
-    "overview": ((9.6, -3.4, 3.0), (3.2, 0.0, 0.6), 15.0),  # behind and above the start box
+    "overview": ((9.4, 0.0, 2.5), (3.0, 0.0, 0.6), 15.0),  # straight behind the start box, on tag 10's axis
+    #             (inside the side walls: the left wall at y = -2.0 hid the old corner view)
     "side": ((3.8, -7.5, 2.4), (3.6, 0.0, 0.8), 11.0),  # from the open side: the whole flight left to right
     "top": ((3.8, -0.4, 10.0), (3.8, 0.0, 0.0), 11.0),  # straight down: paths, crossings and spot accuracy
 }
