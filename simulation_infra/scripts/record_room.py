@@ -7,7 +7,7 @@ camera sensors are broken here) through a dedicated wide camera, then stitches t
 
 In frame, per drone one color shared by: its beacon (small sphere = true position), its
 published fix (small cube = what core/positional.py reports; it freezes when the drone is
-lost), its waypoint (big sphere, 1.5 m up, radius = waypoint_radius) and its landing spot
+lost), its waypoint (big sphere at the saved waypoint height) and its landing spot
 (disc on the floor). The panel at the bottom shows, per drone, its phase (to waypoint / at
 waypoint / LANDING / landed on or off its spot / LOST), the rc it is sending and its tag-fix age;
 the top line shows time, attempt and the team return so far. Each attempt ends on a 2 s hold
@@ -35,8 +35,10 @@ parser.add_argument("--pilot", choices=["policy", "zero"], default="policy")
 parser.add_argument("--checkpoint", type=str, default=None,
                     help="SB3 model .zip (default: newest checkpoint of the newest run under logs/sb3/<task>).")
 parser.add_argument("--episodes", type=int, default=2)
+parser.add_argument("--pads", type=int, nargs="+", help="Single-drone pad indices to record in order; overrides --episodes.")
 parser.add_argument("--max_seconds", type=float, default=None, help="Cap on each attempt (default: the episode length).")
-parser.add_argument("--view", choices=["overview", "side", "top"], default="overview")
+parser.add_argument("--view", choices=["overview", "side", "top", "landing"], default="overview")
+parser.add_argument("--hide_waypoints", action="store_true", help="Hide waypoint spheres that can obscure the drone.")
 parser.add_argument("--width", type=int, default=1280)
 parser.add_argument("--height", type=int, default=720)
 parser.add_argument("--no_dr", action="store_true", help="Nominal dynamics instead of randomized.")
@@ -83,6 +85,7 @@ VIEWS = {
     #             (inside the side walls: the left wall at y = -2.0 hid the old corner view)
     "side": ((3.8, -7.5, 2.4), (3.6, 0.0, 0.8), 11.0),  # from the open side: the whole flight left to right
     "top": ((3.8, -0.4, 10.0), (3.8, 0.0, 0.0), 11.0),  # straight down: paths, crossings and spot accuracy
+    "landing": ((3.8, -1.6, 2.3), (1.0, 0.0, 0.65), 18.0),  # all four pads, from inside the room
 }
 HOLD_S = 2.0
 
@@ -196,6 +199,11 @@ def main() -> int:
         setattr(obj, leaf, ast.literal_eval(v))
     if args.no_dr:
         cfg.dynamics.domain_randomization = False
+    if args.pads:
+        if cfg.num_drones != 1 or any(p < 0 or p >= cfg.spot_count for p in args.pads):
+            raise ValueError("--pads requires a single drone and valid landing-pad indices")
+        args.episodes = len(args.pads)
+        cfg.fixed_spot_index = args.pads[0]
     env = gym.make(TASK, cfg=cfg)
     u = env.unwrapped
     venv = Sb3CentralVecEnv(env)
@@ -222,6 +230,9 @@ def main() -> int:
     import omni.usd
 
     viewport = setup_camera(u, omni.usd.get_context().get_stage())
+    if args.hide_waypoints:
+        u._wp_markers.set_visibility(False)
+    venv.seed(args.seed)  # exporting PPO restores its training seed; reseed before recording
     obs = venv.reset()
     for _ in range(30):
         u.sim.render()  # renders without stepping physics
@@ -246,7 +257,11 @@ def main() -> int:
     hold = int(HOLD_S / u.step_dt)
     summary = []
     for ep in range(args.episodes):
-        ep_head = f"{head}   attempt {ep + 1}/{args.episodes}"
+        if args.pads and ep > 0:
+            cfg.fixed_spot_index = args.pads[ep]
+            obs = venv.reset()
+        pad_label = f"   pad {args.pads[ep]}" if args.pads else ""
+        ep_head = f"{head}{pad_label}   attempt {ep + 1}/{args.episodes}"
         steps, ret, done, rec = 0, 0.0, False, None
         while steps < max_steps:
             obs, rew, dones, _ = venv.step(act(obs))
@@ -264,10 +279,12 @@ def main() -> int:
             why = "  collision" if o["collision"] else "  crash" if o["crash"] else ""
             short = (f"{verdict}  waypoints {o['waypoints']:.0f}/{u.cfg.num_drones}  landed {o['landed']:.0f}/{u.cfg.num_drones}  "
                      f"on spot {o['land_ok']:.0f}/{u.cfg.num_drones}{why}")
+            if u.cfg.num_drones == 1 and o["landed"]:
+                short += f"  error {100 * o['spot_err']:.1f} cm"
         else:
             short = f"cut at {max_s:.0f} s"
             obs = venv.reset()
-        line = f"episode {ep + 1}: {short}, {steps * u.step_dt:.1f} s, team return {ret:+.0f}"
+        line = f"episode {ep + 1}{pad_label}: {short}, {steps * u.step_dt:.1f} s, team return {ret:+.0f}"
         summary.append(line)
         print(f"[rec] {line}", flush=True)
         # hold the last frame with the result, so attempts are clearly separated
@@ -298,7 +315,8 @@ def main() -> int:
     cmd = [
         imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-framerate", fps,
         "-i", os.path.join(args.frame_dir, "frame_%05d.png"),
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30", "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", args.out,
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30", "-movflags", "+faststart",
+        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", args.out,
     ]  # fmt: skip
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0 or not os.path.exists(args.out):

@@ -357,7 +357,9 @@ grep "\[rec\]" outputs/record_room_single.log
   run, so it works mid-training. `--checkpoint <path.zip>` picks one.
 - **Real time:** one frame per rc command.
 - **Options:**
-  - `--view overview|side|top`
+  - `--view overview|side|top|landing`: `landing` gives a close-up of the target area
+  - `--pads 0 1 2 3`: single-drone attempts on each pad in order; overrides `--episodes`
+  - `--hide_waypoints`: hide the waypoint spheres when they obscure the drone
   - `--seed N`: different starts and spot assignments
   - `--no_dr`: nominal dynamics
   - `--pilot zero`: no policy, a scene check
