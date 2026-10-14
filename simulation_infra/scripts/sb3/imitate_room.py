@@ -50,8 +50,10 @@ def main():
     # Delivered imitation candidates default to complete missions, never replay starts.
     run["env"]["spawn_short_fraction"] = run["env"]["spawn_hover_fraction"] = 0.
     rng = np.random.default_rng(args.seed)
-    torch.manual_seed(args.seed)
     model = PPO.load(args.checkpoint, device="cuda")
+    # PPO.load restores the parent's seed; apply the requested imitation seed afterward.
+    model.seed = args.seed
+    model.set_random_seed(args.seed)
     model.policy.set_training_mode(True)
     data = np.load(dataset)
     groups = np.unique(data["groups"])
@@ -103,6 +105,7 @@ def main():
                 "dataset_sha256": hashlib.sha256(dataset.read_bytes()).hexdigest(),
                 "git_commit": subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip(),
                 "argv": sys.orig_argv, "heldout_trajectory_groups": heldout.tolist(),
+                "torch_seed": torch.initial_seed(),
                 "train_examples": len(train_ids), "validation_examples": len(validation_ids),
                 "history": history, "qualification": "requires evaluation in the actual unmodified room"}
     run["imitation"] = metadata
