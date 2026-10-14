@@ -95,7 +95,7 @@ def main():
         row = {"epoch": epoch, "training": score(train_ids), "validation": score(validation_ids)}
         history.append(row)
         print(json.dumps(row), flush=True)
-        if epoch in (5, 10, args.epochs):
+        if epoch in (5, 10, 20, 50, args.epochs):
             model.save(out / f"actor_epoch{epoch:02d}.zip")
     model.save(out / "model.zip")
     repo = Path(__file__).resolve().parents[3]
