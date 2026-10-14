@@ -166,6 +166,27 @@ SDK land only when the current-state gate passes. This avoids depending on an un
 fifth action. Use `env.auto_land=False` to research policy-requested landing, and qualify that
 mode independently. The saved checkpoint config records the chosen mode.
 
+The objective is the complete mission from the 6–7 m start, including learned approach,
+braking, tag retention/reacquisition, and arrival at the assigned pad. A landing-stage score
+does not qualify that mission. When a checkpoint already navigates the room, retain that
+behavior by fine-tuning on full starts with shorter episodes mixed in:
+
+```bash
+python -u scripts/sb3/train.py --task AS-Tello-Room-Single-v0 --headless --num_envs 512 \
+  --checkpoint <full-room-checkpoint>/model.zip --config-source current --curriculum full \
+  --max_iterations 40 --save_interval 10 env.auto_land=True \
+  env.spawn_short_fraction=0.30 env.spawn_hover_fraction=0.15 agent.learning_rate=0.0001 \
+  > outputs/train_full_mission.log 2>&1
+```
+
+Fractions apply to episode resets: 55% keep the full start, 30% take off from X=1.5–5.5 m,
+and 15% start hovering near their assigned pad. This changes only initial conditions;
+navigation and recovery remain learned. Per-episode records include start mode and position.
+Resume with saved config after the initial transition to the corrected task. Full/dropout
+evaluation suites explicitly disable both replay fractions, so easy starts cannot inflate
+the full-mission score. For a direct `play.py` evaluation of a mixed-start checkpoint, add
+`env.spawn_short_fraction=0.0 env.spawn_hover_fraction=0.0`.
+
 For example, after the landing stage passes its evaluations:
 
 ```bash

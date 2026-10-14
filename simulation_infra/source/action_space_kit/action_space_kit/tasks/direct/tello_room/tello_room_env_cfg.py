@@ -117,6 +117,13 @@ class TelloRoomEnvCfg(DirectMARLEnvCfg):
     spawn_range = (6.0, 7.0)  # [m] horizontal distance to tag 10
     spawn_min_separation = 0.5  # [m]
     spawn_near_target_radius = 0.0  # single-drone landing curriculum only; 0 uses the start box
+    # Optional training replay: remaining episodes use the configured start box unchanged.
+    # Full-room evaluation must set both fractions to zero.
+    spawn_short_fraction = 0.0
+    spawn_short_x_range = (1.5, 5.5)
+    spawn_short_y_radius = 0.4
+    spawn_hover_fraction = 0.0
+    spawn_hover_radius = 0.10
     spawn_height = (0.9, 1.4)  # [m] hovering after takeoff (start_on_floor = False)
     start_on_floor = False
     takeoff_at_reset = True  # False: curriculum starts hovering, preserving the observation layout

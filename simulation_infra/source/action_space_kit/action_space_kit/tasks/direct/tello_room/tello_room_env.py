@@ -48,6 +48,7 @@ from action_space_kit.assets import TELLO_CFG
 from action_space_kit.control import RcAction, TelloCascadeController, apply_motion_fit, load_motion_fit
 from action_space_kit.control.landing import update_landing_gate
 from action_space_kit.rl.rewards import potential_delta
+from action_space_kit.rl.start_curriculum import mix_starts, validate_start_mixture
 from action_space_kit.rl.terminal_observation import TerminalObservationMixin
 from action_space_kit.tags.kalman import KalmanCV
 from action_space_kit.tags.room_map import load_room_tags
@@ -80,6 +81,7 @@ class TelloRoomEnv(TerminalObservationMixin, DirectMARLEnv):
         self.room_tags = load_room_tags(cfg.tag10_height, cfg.room_map_path or None, cfg.room_tags_path or None)
         if cfg.land_gate_enabled and not cfg.kalman.enabled:
             raise ValueError("The landing gate requires Kalman velocity/covariance (env.kalman.enabled=True).")
+        validate_start_mixture(cfg)
         super().__init__(cfg, render_mode, **kwargs)
         E, D = self.num_envs, self.cfg.num_drones
         dev = self.device
@@ -114,6 +116,8 @@ class TelloRoomEnv(TerminalObservationMixin, DirectMARLEnv):
         )
         self._spots = self._spot_table[:D].expand(E, D, 3).clone()
         self._wp_offset = torch.tensor([0.0, 0.0, self.cfg.waypoint_height], device=dev)
+        self._start_kind = torch.zeros(E, dtype=torch.long, device=dev)
+        self._start_positions = torch.zeros(E, D, 3, device=dev)
 
         self._actions = torch.zeros(E, D, 5, device=dev)
         self._prev_actions = torch.zeros(E, D, 5, device=dev)
@@ -680,6 +684,10 @@ class TelloRoomEnv(TerminalObservationMixin, DirectMARLEnv):
                 raise ValueError("Near-target curriculum requires a single drone")
             xy = self._spots[env_ids, :, :2] + U(-cfg.spawn_near_target_radius, cfg.spawn_near_target_radius, n, D, 2)
             start = torch.cat([xy, z.unsqueeze(-1)], -1)
+        xy, z, takeoff, kind = mix_starts(cfg, xy, z, self._spots[env_ids], floor_start)
+        start = torch.cat([xy, z.unsqueeze(-1)], -1)
+        self._start_kind[env_ids] = kind
+        self._start_positions[env_ids] = start
         yaw = torch.atan2(-xy[..., 1], -xy[..., 0]) + U(-cfg.spawn_yaw_noise, cfg.spawn_yaw_noise, n, D)
         zeros = torch.zeros_like(yaw)
         quat = quat_from_euler_xyz(zeros.flatten(), zeros.flatten(), yaw.flatten()).view(n, D, 4)
@@ -726,7 +734,7 @@ class TelloRoomEnv(TerminalObservationMixin, DirectMARLEnv):
         self.last_rc[env_ids] = 0.0
         self.at_waypoint[env_ids] = False
         self.landing[env_ids] = False
-        self.taking_off[env_ids] = floor_start
+        self.taking_off[env_ids] = takeoff
         self._takeoff_z[env_ids] = U(*cfg.takeoff_height, n, D)
         self.landed[env_ids] = False
         self.land_ok[env_ids] = False
@@ -764,10 +772,14 @@ class TelloRoomEnv(TerminalObservationMixin, DirectMARLEnv):
         landed = self.landed[finished].detach().cpu().tolist()
         ok = self.land_ok[finished].detach().cpu().tolist()
         errors = self.touchdown_err[finished].detach().cpu().tolist()
+        start_kinds = self._start_kind[finished].detach().cpu().tolist()
+        starts = self._start_positions[finished].detach().cpu().tolist()
         for j, env_id in enumerate(finished.cpu().tolist()):
             metrics = {"Episode/" + key: float(value[j]) for key, value in values.items()}
             self.extras["episode_records"].append({
                 "env_id": env_id, "metrics": metrics,
+                "start_kind": ("configured", "short_approach", "hover_landing")[start_kinds[j]],
+                "start_positions": starts[j],
                 "drones": [{"target_index": round(spot[1] / self.cfg.spot_spacing + (self.cfg.spot_count - 1) / 2),
                             "target": spot, "landed": landed[j][d], "land_ok": ok[j][d],
                             "touchdown_error_m": errors[j][d]} for d, spot in enumerate(spots[j])],

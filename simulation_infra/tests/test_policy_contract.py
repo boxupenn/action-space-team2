@@ -29,6 +29,7 @@ def load(name, path):
 terminal = load("terminal_test", RL / "terminal_observation.py")
 evaluation = load("evaluation_test", RL / "evaluation.py")
 rewards = load("rewards_test", RL / "rewards.py")
+starts = load("starts_test", RL / "start_curriculum.py")
 run_config = load("run_config_test", RL / "run_config.py")
 gate = load("gate_test", REPO / "drone_deployment_infra/core/landing_gate.py")
 sensor = load("sensor_test", RL.parent / "tags/sensing.py")
@@ -91,6 +92,34 @@ with patch.dict(sys.modules, {"isaaclab.envs": isaac_stub}):
 
 
 class PolicyContractTests(unittest.TestCase):
+    def test_start_mixture_preserves_full_task_and_replays_easier_starts(self):
+        cfg = types.SimpleNamespace(num_drones=1, spawn_short_fraction=0.0, spawn_hover_fraction=0.0,
+                                    spawn_short_x_range=(1.5, 5.5), spawn_short_y_radius=0.4,
+                                    spawn_hover_radius=0.1, waypoint_height=1.22)
+        xy = torch.tensor([6.5, 0.0]).expand(4096, 1, 2).clone()
+        z = torch.full((4096, 1), 0.025)
+        spots = torch.tensor([1.0, 0.25, 0.0]).expand(4096, 1, 3)
+        before = torch.random.get_rng_state()
+        x0, z0, takeoff0, kind0 = starts.mix_starts(cfg, xy, z, spots, True)
+        self.assertTrue(torch.equal(before, torch.random.get_rng_state()))
+        self.assertTrue(torch.equal(x0, xy) and torch.equal(z0, z))
+        self.assertTrue(takeoff0.all() and (kind0 == 0).all())
+        cfg.spawn_short_fraction, cfg.spawn_hover_fraction = 0.30, 0.15
+        starts.validate_start_mixture(cfg)
+        torch.manual_seed(907)
+        x, height, takeoff, kind = starts.mix_starts(cfg, xy, z, spots, True)
+        full, short, hover = kind == 0, kind == 1, kind == 2
+        self.assertTrue(torch.equal(x[full], xy[full]) and torch.equal(height[full], z[full]))
+        self.assertTrue(takeoff[~hover].all() and not takeoff[hover].any())
+        self.assertTrue(((x[short, :, 0] >= 1.5) & (x[short, :, 0] <= 5.5)).all())
+        self.assertTrue(((x[hover] - spots[hover, :, :2]).abs() <= 0.1 + 1e-6).all())
+        self.assertTrue(((height[hover] - 1.22).abs() <= 0.05 + 1e-6).all())
+        for mask, fraction in ((full, .55), (short, .30), (hover, .15)):
+            self.assertAlmostEqual(mask.float().mean().item(), fraction, delta=.03)
+        cfg.spawn_short_fraction = .9
+        with self.assertRaises(ValueError):
+            starts.validate_start_mixture(cfg)
+
     def test_tag_visible_at_landing_height(self):
         tags = list(room_map.load_room_tags(1.22).values())
         points = torch.tensor([t.pos.tolist() for t in tags], dtype=torch.float32)

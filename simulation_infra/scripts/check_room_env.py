@@ -32,7 +32,7 @@ from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 parser.add_argument("--task", choices=["AS-Tello-Room-v0", "AS-Tello-Room-Single-v0"], default="AS-Tello-Room-v0")
-parser.add_argument("--test", choices=["geometry", "sensing", "commands", "motion", "baselines", "kalman", "central", "single", "all"],
+parser.add_argument("--test", choices=["geometry", "sensing", "commands", "motion", "baselines", "kalman", "central", "single", "curriculum", "all"],
                     default="all")
 parser.add_argument("--num_envs", type=int, default=256)
 parser.add_argument("--episodes", type=int, default=256)
@@ -657,6 +657,38 @@ def test_single(env, u) -> None:
     check(moved > 0.2, f"after takeoff the sticks fly it (rc forward 50 for 1.5 s: {moved:.2f} m toward tag 10)")
 
 
+def test_curriculum(env, u):
+    print("\n== mixed-start curriculum ==")
+    cfg = u.cfg
+    cfg.spawn_short_fraction, cfg.spawn_hover_fraction = 0.30, 0.15
+    try:
+        fresh_start(u)
+        pos, kinds = u._positions().clone(), u._start_kind.clone()
+        full, short, hover = kinds == 0, kinds == 1, kinds == 2
+        check(all(bool(mask.any()) for mask in (full, short, hover)), "all three start modes are sampled")
+        r = torch.linalg.norm(pos[full, :, :2], dim=-1)
+        check(bool(((r >= 6) & (r <= 7)).all()), "configured episodes retain the full 6-7 m start")
+        check(bool((u.taking_off[~hover]).all()) and not bool(u.taking_off[hover].any()),
+              "full and short approaches start with takeoff; hover replay starts airborne")
+        check(bool(((pos[hover, :, :2] - u._spots[hover, :, :2]).abs() <= .10001).all()),
+              "hover replay starts within 10 cm per axis of its own assigned pad")
+        check(bool(((pos[short, :, 0] >= 1.5) & (pos[short, :, 0] <= 5.5)).all()),
+              "short approaches cover the configured intermediate distances")
+        initial = u._start_positions.clone()
+        u.episode_length_buf[:] = u.max_episode_length - 2
+        obs, _, _, _, info = env.step(sticks(u, (0, 0, 0, 0)))
+        records = info["episode_records"]
+        names = ("configured", "short_approach", "hover_landing")
+        check(len(records) == u.num_envs and all(
+            row["start_kind"] == names[int(kinds[row["env_id"]])]
+            and np.allclose(row["start_positions"], initial[row["env_id"]].cpu().numpy())
+            for row in records), "terminal records retain the finished episode's start mode and pose")
+        check(obs["drone_0"].shape == (u.num_envs, 25), "mixed starts preserve the 25-number observation")
+    finally:
+        cfg.spawn_short_fraction = cfg.spawn_hover_fraction = 0.0
+        fresh_start(u)
+
+
 def main():
     cfg = load_cfg_from_registry(args_cli.task, "env_cfg_entry_point")
     cfg.scene.num_envs = args_cli.num_envs
@@ -666,6 +698,8 @@ def main():
     if cfg.num_drones == 1:
         if args_cli.test in ("single", "all"):
             test_single(env, u)
+        if args_cli.test in ("curriculum", "all"):
+            test_curriculum(env, u)
         if args_cli.test in ("kalman", "all"):
             test_kalman(env, u)
         if args_cli.test in ("baselines", "all"):

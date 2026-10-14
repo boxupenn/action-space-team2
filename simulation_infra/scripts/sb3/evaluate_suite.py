@@ -50,6 +50,8 @@ def main():
                     "env.takeoff_at_reset=True",
                     "env.episode_length_s=75.0",
                     "env.spawn_near_target_radius=0.0",
+                    "env.spawn_short_fraction=0.0",
+                    "env.spawn_hover_fraction=0.0",
                 ]
             if args.scenario == "dropout":
                 cmd += ["env.link_loss_range=[0.15,0.25]"]
