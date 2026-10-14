@@ -232,8 +232,20 @@ class LogExtrasCallback(BaseCallback):
     def __init__(self, vec_env: Sb3SharedPolicyVecEnv, verbose: int = 0):
         super().__init__(verbose)
         self._vec_env = vec_env
+        self._episode_totals = {}
 
     def _on_step(self) -> bool:
+        def count(prefix, success):
+            total = self._episode_totals.setdefault(prefix, [0., 0])
+            total[0] += float(success)
+            total[1] += 1
+
+        for record in self._vec_env.episode_buffer:
+            if "start_kind" in record:
+                count(f"Curriculum/{record['start_kind']}", record["metrics"].get("Episode/success_rate", 0.))
+            for drone in record.get("drones", []):
+                if "target_index" in drone:
+                    count(f"Targets/pad_{drone['target_index']}", drone["land_ok"])
         # Detailed records are for evaluation; do not retain an entire training run.
         self._vec_env.episode_buffer.clear()
         return True
@@ -250,4 +262,8 @@ class LogExtrasCallback(BaseCallback):
             if mask.any():
                 self.logger.record(key, float(np.average(vals[mask], weights=weights[mask])))
         self.logger.record("Episode/count", float(weights.sum()))
+        for prefix, (successes, count) in self._episode_totals.items():
+            self.logger.record(prefix + "/success_rate", successes / count)
+            self.logger.record(prefix + "/count", count)
+        self._episode_totals.clear()
         buf.clear()
