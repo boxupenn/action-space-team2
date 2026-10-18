@@ -7,9 +7,9 @@ packet. This module models the sighting half, batched in torch:
 
   detectable  tag centre in front of the camera, the whole tag inside the image, the
               printed face turned toward the camera (``max_view_angle``), its apparent
-              edge at least ``min_side_px`` pixels, and not randomly dropped (decode-margin
-              failures: ``dropout``; motion blur: the whole frame, more likely the faster the
-              drone moves and turns, ``blur_*``)
+              edge at least ``min_side_px`` pixels; then it decodes at ``decode_rate``
+              (``dropout``, falling with the view angle past ``view_full_angle``) unless
+              motion blur loses the whole frame (mostly turning, ``blur_*``)
   fix         the true camera position plus PnP-style noise per tag (depth error grows
               as range^2 / (fx * size), lateral error as range / fx), averaged over the
               detectable tags like ``Positioner.locate``
@@ -39,24 +39,32 @@ class TagSensorCfg:
 
     min_side_px: float = 15.0
     """Smallest apparent tag edge that still decodes (tags.yaml gate is 12 px; blur costs more)."""
-    max_view_angle: float = 70.0 * math.pi / 180.0
-    """[rad] between the tag normal and the line to the camera. tags.yaml turns this gate off,
-    but pupil-apriltags itself rarely decodes a tag past ~70-75 deg."""
+    max_view_angle: float = 62.0 * math.pi / 180.0
+    """[rad] between the tag normal and the line to the camera: past this a tag never decodes."""
+    view_full_angle: float = 10.0 * math.pi / 180.0
+    """[rad] up to this view angle a tag decodes at the full rate (1 - dropout); from here to
+    max_view_angle the rate falls linearly in cos(view angle) to zero. Fitted to 3,700 in-frame
+    tag sightings in flights 030-034 and 040-043: detected 89% at 0-20 deg, 77% at 20-35,
+    41% at 35-50, 16% at 50-60, 6% at 60-70 (the old flat 90% up to 70 deg overcounted)."""
     max_range: float = 8.0
     """[m] beyond this no tag is used (also caps how far the small tags are trusted)."""
     dropout: float = 0.1
     """Per tag, per frame probability that a detectable tag is missed anyway."""
-    blur_free_speed: float = 0.2
-    """[m/s] below this "blur speed" frames are sharp. Blur speed = linear speed +
-    blur_rot_weight * angular rate (rotation smears the image most)."""
-    blur_rot_weight: float = 1.0
-    """[m/s per rad/s] how much angular rate counts toward the blur speed."""
-    blur_loss_per_mps: float = 0.3
-    """Whole-frame loss probability per m/s of blur speed above blur_free_speed. Fitted to
-    flights 032-034 (39M single-drone policy): fresh fixes ~95% hovering, ~67% at 0.5-1.5 m/s,
-    ~52% at 1.5-2 m/s, which includes the link loss and the field of view."""
-    blur_max_loss: float = 0.6
-    """Cap on the blur loss probability."""
+    # Motion blur loses whole frames. Flights 030-034 (IMU yaw rate vs fresh fixes, tags in
+    # view): turning dominates (fix on 95% of frames below 0.2 rad/s, 84% at 0.2-0.5, 53% at
+    # 0.5-1, 56% above 1 rad/s); straight flight barely matters (89-100% up to > 2 m/s).
+    blur_free_speed: float = 0.5
+    """[m/s] below this linear speed frames are sharp."""
+    blur_loss_per_mps: float = 0.05
+    """Whole-frame loss probability per m/s of linear speed above blur_free_speed."""
+    blur_free_rate: float = 0.2
+    """[rad/s] below this yaw rate frames are sharp."""
+    blur_loss_per_radps: float = 1.0
+    """Whole-frame loss probability per rad/s of yaw rate above blur_free_rate."""
+    blur_rot_max_loss: float = 0.45
+    """Cap on the turning loss (the real loss plateaus at ~45% from 0.5 rad/s up)."""
+    blur_max_loss: float = 0.5
+    """Cap on the combined loss 1 - (1 - linear)(1 - turning)."""
     pixel_noise: float = 1.0
     """[px] corner noise that drives the PnP position error."""
     video_delay_steps: int = 4
@@ -109,20 +117,37 @@ def detectable(cfg: TagSensorCfg, cam_pos: torch.Tensor, cam_rot: torch.Tensor, 
     return mask, rng
 
 
+def blur_loss(cfg: TagSensorCfg, speed: torch.Tensor, yaw_rate: torch.Tensor) -> torch.Tensor:
+    """Probability that motion blur loses a whole frame, from linear speed [m/s] and |yaw rate| [rad/s]."""
+    lin = (cfg.blur_loss_per_mps * (speed - cfg.blur_free_speed)).clamp(0.0, 1.0)
+    rot = (cfg.blur_loss_per_radps * (yaw_rate.abs() - cfg.blur_free_rate)).clamp(0.0, cfg.blur_rot_max_loss)
+    return (1.0 - (1.0 - lin) * (1.0 - rot)).clamp(max=cfg.blur_max_loss)
+
+
+def decode_rate(cfg: TagSensorCfg, cos_view: torch.Tensor) -> torch.Tensor:
+    """Per-frame probability that a detectable tag decodes: 1 - dropout up to view_full_angle,
+    then linear in cos(view angle) down to zero at max_view_angle."""
+    c0, c1 = math.cos(cfg.view_full_angle), math.cos(cfg.max_view_angle)
+    return (1.0 - cfg.dropout) * ((cos_view - c1) / (c0 - c1)).clamp(0.0, 1.0)
+
+
 def sighting(cfg: TagSensorCfg, cam_pos: torch.Tensor, cam_rot: torch.Tensor, tag_pos: torch.Tensor,
              tag_normal: torch.Tensor, tag_size: torch.Tensor, noise: bool = True,
-             blur_speed: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+             speed: torch.Tensor | None = None, yaw_rate: torch.Tensor | None = None,
+             ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """One camera frame: (fix (N, 3) world, any_tag (N,) bool, mask (N, T) bool).
 
     ``fix`` is only meaningful where ``any_tag``; elsewhere it is the true position.
-    ``blur_speed`` (N,): linear speed + blur_rot_weight * angular rate; a blurred frame loses
-    every tag (``blur_loss_per_mps``).
+    With ``noise`` each detectable tag decodes at :func:`decode_rate` (dropout and view angle),
+    and ``speed`` / ``yaw_rate`` (N,) blur away whole frames (:func:`blur_loss`).
     """
     mask, rng = detectable(cfg, cam_pos, cam_rot, tag_pos, tag_normal, tag_size)
-    if noise and cfg.dropout > 0.0:
-        mask = mask & (torch.rand_like(rng) >= cfg.dropout)
-    if noise and blur_speed is not None and cfg.blur_loss_per_mps > 0.0:
-        p_blur = (cfg.blur_loss_per_mps * (blur_speed - cfg.blur_free_speed)).clamp(0.0, cfg.blur_max_loss)
+    if noise:
+        d = tag_pos.unsqueeze(0) - cam_pos.unsqueeze(1)
+        cos_view = -(d * tag_normal.unsqueeze(0)).sum(-1) / rng
+        mask = mask & (torch.rand_like(rng) < decode_rate(cfg, cos_view))
+    if noise and speed is not None and yaw_rate is not None:
+        p_blur = blur_loss(cfg, speed, yaw_rate)
         mask = mask & (torch.rand_like(p_blur) >= p_blur).unsqueeze(-1)
     per_tag = cam_pos.unsqueeze(1).expand(-1, tag_pos.shape[0], -1)
     if noise:

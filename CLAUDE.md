@@ -181,9 +181,11 @@ poll the log. Score the result with the Step 4 command, pointing `--checkpoint` 
 
 Human guide for both room tasks (train, tune rewards, watch): `simulation_infra/SINGLE_DRONE_SIMULATION.md`.
 
-Four Tellos start hovering in a 2 m x 2 m box 6-7 m from tag 10 (>= 0.5 m apart), fly to four
+Four Tellos start hovering in a 2 m x 2 m box 6-7 m from tag 10 (>= 0.2 m apart, `spawn_min_separation`;
+a pair spawned closer than `collision_distance` collides only below its start distance - 3 cm), fly to four
 landing spots on the floor 1 m in front of the tag-10 wall, 0.5 m apart, and send `land` over
-them. Start positions and the drone-to-spot assignment are random every episode. Success: all
+them. Start positions and the drone-to-spot assignment are random every episode. Each drone faces tag 10
++-15 deg, or (`spawn_search_prob` 0.3) starts turned 75-180 deg away, with no tag in view, and must turn to find one. Success: all
 four landed within 0.3 m of their spots.
 Trained **end to end** by **one central controller** (the laptop): a single PPO policy sees all
 four drones' positional feeds and outputs all four drones' commands (agent cfg `central: true`,
@@ -196,8 +198,10 @@ Run from `simulation_infra/` with the Step 2 environment.
   frame, waypoint-reached flag, tag-10 bearing, Tello `h`, its previous command, landing flag.
   Fixes carry camera-model noise, 3 cm per-fix noise and a 3 cm per-drone bias; frames are lost
   on the link at a per-drone, per-episode rate.
-- **Waypoint**: 1.5 m above each landing spot, radius 0.3 m; it counts only when the drone is slow
-  (Kalman speed estimate < `waypoint_max_speed` 0.3 m/s; flights 032-034 crossed it at ~2 m/s). Until a drone's published fix is
+- **Waypoint**: 1.5 m above each landing spot, radius 0.3 m. Entering it counts only at <= 0.3 m/s
+  (`waypoint_max_speed`, Kalman speed estimate, judged once its velocity std < `speed_trust_std` 0.35);
+  faster ends the episode with -500 per 0.3 m/s over (`fast_entry_loss`). Within 2 m of tag 10
+  (`slow_zone_radius`) `slowdown_reward` pays +200 per m/s of new low true speed (flights 032-034 crossed it at ~2 m/s). Until a drone's published fix is
   inside it, `closer_reward` pays +100 per metre gained toward the waypoint (3D); after that only
   landing rewards (touchdown, formation) and the penalties apply.
 - **Per-drone dynamics**: TWR x0.95-1.05, rotor drag x0.5-2.0, body-rate PID kp/ki x0.85-1.15,
@@ -226,8 +230,10 @@ Run from `simulation_infra/` with the Step 2 environment.
   (facing tag 10) is `room_y_min` = -2.0 m, measured 2 m left of tag 10's centre.
   Tags are textured tag36h11 quads, orientation verified against the real detector.
 - **Sensing**: a tag counts only if it is inside the Tello camera's view (FOV, range, view
-  angle, pixel size, dropout, 0.2 s video delay, link loss). Motion blur drops whole frames: probability
-  0.3 per m/s of (speed + angular rate) above 0.2, capped at 0.6 (`tag_sensor.blur_*`, fitted to flights 032-034). Observations are the positional
+  angle, pixel size, dropout, 0.2 s video delay, link loss). A detectable tag decodes 90% of frames up to
+  10 deg off its face, falling to 0 at 62 deg (`tag_sensor.view_full_angle` / `max_view_angle`); motion blur
+  drops whole frames: 1.0 per rad/s of yaw rate above 0.2 (max 0.45) plus 0.05 per m/s above 0.5, total
+  max 0.5 (`tag_sensor.blur_*`). View angle fitted to flights 030-034 + 040-043, blur to 030-034. Observations are the positional
   feed only, never ground truth.
 - **Kalman filter** (`env.kalman`, on by default; `env.kalman.enabled=False` trains on the raw
   fix): the observed position is the estimate of `drone_deployment_infra/core/positional_kalman_filter.py`,
@@ -263,7 +269,7 @@ grep -E "^\s*\[(ok|FAIL)|^== |zero |scripted " outputs/check_room.log
 python -u scripts/check_room_render.py > outputs/check_room_render.log 2>&1        # real localizer on sim renders
 python -u scripts/render_room_overview.py --out outputs/room_overview.png > outputs/room_overview.log 2>&1
 ```
-Pass: every line `[ok]` (50); `zero` 0% success, with landing / no-tag losses equal to -0.5 x
+Pass: every line `[ok]` (61); `zero` 0% success, with landing / no-tag losses equal to -0.5 x
 the off-spot / tag-less drone-steps. Render check: every view `[ok]`; a
 `[WARN real localizer: ambiguous pose flip]` line is a finding about `positional.py`, not a sim failure.
 Train (detached; central, ~27 s per iteration at 512 envs on the RTX 5080, 1500 iterations ~11 h):
@@ -298,7 +304,7 @@ and no no-tag loss (the policy isn't flying); the landing loss runs. It gets one
 random (`spot_count`). Observation 25 = 24 + taking-off flag. Success: landed within 0.3 m of its spot.
 ```bash
 python -u scripts/check_room_env.py --headless --task AS-Tello-Room-Single-v0 > outputs/check_room_single.log 2>&1
-grep -E "^\s*\[(ok|FAIL)|^== |zero " outputs/check_room_single.log    # pass: every line [ok] (21)
+grep -E "^\s*\[(ok|FAIL)|^== |zero " outputs/check_room_single.log    # pass: every line [ok] (24)
 setsid nohup python -u scripts/sb3/train.py --task AS-Tello-Room-Single-v0 --headless --num_envs 512 --max_iterations 1500 > outputs/train_room_single.log 2>&1 &
 python -u scripts/record_room.py --task AS-Tello-Room-Single-v0 --out outputs/videos/room_single.mp4 > outputs/record_room_single.log 2>&1
 ```

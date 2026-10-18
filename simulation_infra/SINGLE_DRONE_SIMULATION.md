@@ -11,10 +11,15 @@ Two Isaac Lab tasks fly simulated DJI Tellos in the real mapped room. In both, a
 | `AS-Tello-Room-Single-v0` | 1 | on the floor, then the SDK `takeoff` | land on one of the 4 spots (random) | **tuning rewards** (fast to learn, easy to read) |
 | `AS-Tello-Room-v0` | 4, one central controller | hovering (takeoff already done) | each lands on its own spot, no contact | the full formation |
 
-Both start inside a 2 m × 2 m box, 6–7 m from tag 10. The landing spots are on the floor
+Both start inside a 2 m × 2 m box, 6–7 m from tag 10 (the four drones at least 0.2 m apart,
+`spawn_min_separation`). Each drone faces tag 10 ±15°, or, 30% of the time
+(`spawn_search_prob`), starts turned 75–180° away with no tag in view and has to turn to find
+one (all the mapped tags are at the tag-10 end of the room). The landing spots are on the floor
 1 m in front of the tag-10 wall, 0.5 m apart. Each spot has a **waypoint 1.5 m above it**
-(radius 0.3 m). It counts only when the drone is slow: the Kalman filter's speed estimate
-under 0.3 m/s (`waypoint_max_speed`), so a drone can't register by flying through it.
+(radius 0.3 m). Entering it counts only at or below 0.3 m/s (`waypoint_max_speed`, the Kalman
+filter's speed estimate, judged once the filter's velocity is settled: `speed_trust_std`). Faster,
+the episode fails with -500 per 0.3 m/s over (0.6 m/s: -500, 0.9 m/s: -1000). Within 2 m of tag 10
+the drone earns +200 per m/s of speed it sheds, counted only for new lows so it can't be farmed.
 
 ---
 
@@ -64,6 +69,8 @@ The reward weights are in
 | `rew_closer_scale` | `100.0` | `closer_reward` | + per metre gained toward the **waypoint**. Only until the waypoint is reached, and never during takeoff or land |
 | `rew_away_ratio` | `0.25` | `closer_reward` | moving away costs this fraction of `rew_closer_scale` per metre (−25 per metre by default) |
 | `rew_waypoint` | `1000.0` | `waypoint_reward` | once, when the drone's published position first gets inside its waypoint (the same moment the land gate opens and the closer reward stops) |
+| `rew_fast_entry_per_mps` | `-1666.7` | `fast_entry_loss` | entering the waypoint above 0.3 m/s: per m/s over (0.6 m/s: -500); the episode ends |
+| `rew_slowdown` | `200.0` | `slowdown_reward` | per m/s of new low true speed within `slow_zone_radius` (2 m) of tag 10, until the waypoint |
 | `rew_time` | `-0.5` | `landing_loss` | every step until landed on the spot; ending early (crash, landing off the spot) pays the remaining steps |
 | `rew_no_fix` | `-0.5` | `no_tag_loss` | every step the drone flies with no tag fix |
 | `rew_violation` | `-100.0` | `crash_loss` | crash, wall, ceiling, flipping |
@@ -376,8 +383,12 @@ PPO stacks the last 8 steps. The numbers:
 
 Noise on the fixes:
 - the camera model: field of view, range, view angle, pixel size, dropout, 0.2 s video delay
-- motion blur: a whole frame is lost with probability 0.3 per m/s of (speed + angular rate)
-  above 0.2, capped at 0.6 (`tag_sensor.blur_*`), fitted to real flights 032-034
+- view angle: a tag in the frame decodes on 90% of frames when seen within 10 deg of face-on,
+  falling to 0 at 62 deg (`tag_sensor.view_full_angle`, `max_view_angle`)
+- motion blur: a whole frame is lost with probability 1.0 per rad/s of yaw rate above 0.2 rad/s
+  (at most 0.45) combined with 0.05 per m/s of speed above 0.5 m/s, at most 0.5 in total
+  (`tag_sensor.blur_*`). Turning, not straight flight, is what loses the tags. Fitted
+  to real flights (view angle: 030-034 and 040-043; blur: 030-034)
 - 3 cm noise per fix
 - 3 cm bias per drone
 - 0–15% link loss per drone

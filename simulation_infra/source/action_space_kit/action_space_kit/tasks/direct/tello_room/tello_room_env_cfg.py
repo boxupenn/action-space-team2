@@ -112,7 +112,7 @@ class TelloRoomEnvCfg(DirectMARLEnvCfg):
     spawn_box_center = (6.5, 0.0)  # [m] X, Y
     spawn_box_size = 2.0  # [m]
     spawn_range = (6.0, 7.0)  # [m] horizontal distance to tag 10
-    spawn_min_separation = 0.5  # [m]
+    spawn_min_separation = 0.2  # [m]
     spawn_height = (0.9, 1.4)  # [m] hovering after takeoff (start_on_floor = False)
     start_on_floor = False
     """True: every drone starts on the floor, motors off, and the episode opens with the SDK
@@ -123,6 +123,11 @@ class TelloRoomEnvCfg(DirectMARLEnvCfg):
     takeoff_height = (0.8, 1.0)  # [m] where the firmware's takeoff stops, per drone, per episode
     takeoff_speed = 0.5  # [m/s] firmware climb during takeoff
     spawn_yaw_noise = 15.0 * math.pi / 180.0  # [rad] around facing tag 10
+    spawn_search_prob = 0.3
+    """Per drone, per episode: chance it starts turned away from the tags (yaw spawn_search_yaw
+    off facing tag 10, either side), so no tag is in view and it must turn to find one. Every
+    mapped tag is on or near the tag-10 end of the room, within ~25 deg of tag 10 from the box."""
+    spawn_search_yaw = (75.0 * math.pi / 180.0, math.pi)  # [rad] |offset| from facing tag 10
 
     # -- goal: four landing spots on the floor 1 m in front of the tag-10 wall, 0.5 m apart
     spot_distance = 1.0  # [m] from the tag-10 plane
@@ -138,9 +143,16 @@ class TelloRoomEnvCfg(DirectMARLEnvCfg):
     waypoint_height = 1.5  # [m] above the landing spot
     waypoint_radius = 0.3  # [m]
     waypoint_max_speed = 0.3
-    """[m/s] the waypoint only counts when the drone is this slow (the Kalman filter's speed
+    """[m/s] entering the waypoint counts only at or below this speed (the Kalman filter's speed
     estimate, which the laptop has too; the true speed with env.kalman.enabled=False): flights
-    032-034 crossed the bubble at ~2 m/s and kept going."""
+    032-034 crossed the bubble at ~2 m/s and kept going. Faster: the episode fails
+    (``rew_fast_entry_per_mps``)."""
+    speed_trust_std = 0.35
+    """[m/s] the filter's speed counts only once its velocity std (sqrt of the covariance) is
+    below this: a filter restart (back from lost, outliers) sets velocity 0 with std 0.5, and
+    ~8 fixes (~0.6 s) bring it to ~0.3. Until then an entry is neither passed nor failed."""
+    slow_zone_radius = 2.0
+    """[m] horizontal distance to tag 10 inside which slowing down pays (``rew_slowdown``)."""
     success_radius = 0.3  # [m] true touchdown point within this of the spot: landed on it
     # success: all four landed on their spots
 
@@ -177,12 +189,19 @@ class TelloRoomEnvCfg(DirectMARLEnvCfg):
     min_height = 0.2
     max_tilt = 60.0 * math.pi / 180.0
     collision_distance = 0.25  # [m] centre to centre (props span ~0.18 m): ends the episode
+    start_contact_margin = 0.03
+    """[m] Drones may spawn closer than collision_distance (spawn_min_separation 0.2 m). Such a pair
+    collides only below its start distance minus this margin, so a start is never a collision."""
     separation_distance = 0.5  # [m] spots are this far apart; closer is penalized
 
     # -- rewards (per drone, per policy step)
     rew_closer_scale = 100.0  # per metre closer to the own waypoint (until reached)
     rew_away_ratio = 0.25  # moving away costs this fraction of rew_closer_scale per metre
-    rew_waypoint = 1000.0  # once, when the drone's published fix first gets inside its waypoint
+    rew_waypoint = 1000.0  # once, when the drone's published fix first gets inside its waypoint (slow enough)
+    rew_fast_entry_per_mps = -500.0 / 0.3  # entering the waypoint faster than waypoint_max_speed: per m/s
+    #                  over it (0.6 m/s: -500), and the episode ends (fails)
+    rew_slowdown = 200.0  # per m/s below the slowest speed so far inside slow_zone_radius of tag 10
+    #                  (true speed; until the waypoint): pays for braking, can't be farmed by re-speeding
     rew_time = -0.5  # every step a drone is not landed on its spot ("landing loss"); a drone
     #                  that ends the episode early (crash, landed off the spot) pays the rest
     rew_land = 100.0  # at touchdown (land is only sent after the waypoint, see land gate)

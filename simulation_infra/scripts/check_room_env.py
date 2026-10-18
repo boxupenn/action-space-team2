@@ -32,7 +32,7 @@ from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 parser.add_argument("--task", choices=["AS-Tello-Room-v0", "AS-Tello-Room-Single-v0"], default="AS-Tello-Room-v0")
-parser.add_argument("--test", choices=["geometry", "sensing", "commands", "motion", "baselines", "kalman", "central", "single", "all"],
+parser.add_argument("--test", choices=["geometry", "sensing", "commands", "motion", "baselines", "kalman", "central", "single", "search", "all"],
                     default="all")
 parser.add_argument("--num_envs", type=int, default=256)
 parser.add_argument("--episodes", type=int, default=256)
@@ -50,7 +50,7 @@ import torch  # noqa: E402
 import action_space_kit.tasks  # noqa: E402, F401
 from action_space_kit.control import load_motion_fit  # noqa: E402
 from action_space_kit.tasks.direct.tello_room.tello_room_env import _yaw_of  # noqa: E402
-from action_space_kit.tags.sensing import camera_axes, sighting  # noqa: E402
+from action_space_kit.tags.sensing import blur_loss, camera_axes, decode_rate, sighting  # noqa: E402
 from isaaclab.utils.math import matrix_from_quat  # noqa: E402
 from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry  # noqa: E402
 
@@ -116,7 +116,10 @@ def test_geometry(u) -> None:
     check(bool(((r >= cfg.spawn_range[0] - 1e-4) & (r <= cfg.spawn_range[1] + 1e-4)).all()),
           f"every start is {cfg.spawn_range[0]:.0f}-{cfg.spawn_range[1]:.0f} m from tag 10 (range {r.min():.2f}-{r.max():.2f} m)")
     sep = u._pairwise_distance(pos[..., :2].contiguous()).amin().item()
-    check(sep >= cfg.spawn_min_separation - 1e-4, f"starts are >= {cfg.spawn_min_separation} m apart (closest {sep:.2f} m)")
+    for _ in range(49):  # 50 resets of every env
+        fresh_start(u)
+        sep = min(sep, u._pairwise_distance(u._positions()[..., :2].contiguous()).amin().item())
+    check(sep >= cfg.spawn_min_separation - 1e-4, f"starts are >= {cfg.spawn_min_separation} m apart over 50 resets x {u.num_envs} envs (closest {sep:.2f} m)")
 
     spots = u._spots
     check(bool(torch.allclose(spots[..., 0], torch.full_like(spots[..., 0], cfg.spot_distance)))
@@ -167,15 +170,34 @@ def test_sensing(env, u) -> None:
     cam_pos = u._positions().reshape(-1, 3) + R @ u._cam_offset
     cam_rot = camera_axes(R, ts.camera_pitch)
     rates = {}
-    for v in (0.0, 1.0, 2.0, 5.0):
-        speed = torch.full((cam_pos.shape[0],), v, device=u.device)
-        rates[v] = np.mean([sighting(ts, cam_pos, cam_rot, u._tag_pos, u._tag_normal, u._tag_size,
-                                     blur_speed=speed)[1].float().mean().item() for _ in range(50)])
-    want = {v: rates[0.0] * (1 - min(ts.blur_max_loss, max(0.0, ts.blur_loss_per_mps * (v - ts.blur_free_speed))))
-            for v in rates}
-    check(all(abs(rates[v] - want[v]) < 0.03 for v in rates),
-          "motion blur drops whole frames: frames with a tag at blur speed "
-          + ", ".join(f"{v:.0f} m/s {rates[v]:.0%}" for v in rates) + f" (expected {', '.join(f'{want[v]:.0%}' for v in rates)})")
+    n = cam_pos.shape[0]
+    for v, w in ((0.0, 0.0), (2.0, 0.0), (0.0, 0.35), (0.0, 1.0), (1.0, 1.0)):
+        rates[(v, w)] = np.mean([sighting(ts, cam_pos, cam_rot, u._tag_pos, u._tag_normal, u._tag_size,
+                                          speed=torch.full((n,), v, device=u.device),
+                                          yaw_rate=torch.full((n,), w, device=u.device))[1].float().mean().item()
+                                 for _ in range(50)])
+    want = {k: rates[(0.0, 0.0)] * (1 - blur_loss(ts, torch.tensor(k[0]), torch.tensor(k[1])).item()) for k in rates}
+    check(all(abs(rates[k] - want[k]) < 0.03 for k in rates),
+          "motion blur drops whole frames, mostly when turning: frames with a tag at "
+          + ", ".join(f"{v:.0f} m/s + {w:.2f} rad/s {rates[(v, w)]:.0%}" for v, w in rates)
+          + f" (expected {', '.join(f'{want[k]:.0%}' for k in rates)})")
+
+    # view angle: tag 10 seen from 3 m at growing angles off its face
+    j10 = u._tag_ids.index(10)
+    got, exp = [], []
+    for deg in (0.0, 30.0, 45.0, 55.0, 65.0):
+        a = math.radians(deg)
+        cam = torch.tensor([[3.0 * math.cos(a), 3.0 * math.sin(a), u.cfg.tag10_height]], device=u.device).expand(4096, 3)
+        yaw = torch.full((4096,), math.atan2(-math.sin(a), -math.cos(a)), device=u.device)
+        c, s_, z, o = torch.cos(yaw), torch.sin(yaw), torch.zeros_like(yaw), torch.ones_like(yaw)
+        Rb = torch.stack([torch.stack([c, -s_, z], -1), torch.stack([s_, c, z], -1), torch.stack([z, z, o], -1)], -2)
+        m = sighting(ts, cam, camera_axes(Rb, ts.camera_pitch), u._tag_pos, u._tag_normal, u._tag_size)[2][:, j10]
+        got.append(m.float().mean().item())
+        exp.append(decode_rate(ts, torch.tensor(math.cos(a))).item() if a < ts.max_view_angle else 0.0)
+    check(all(abs(g - e) < 0.03 for g, e in zip(got, exp)) and got[0] > got[2] > got[3] and got[-1] == 0.0,
+          "tag 10 decodes less the further off its face: "
+          + ", ".join(f"{d:.0f} deg {g:.0%}" for d, g in zip((0, 30, 45, 55, 65), got))
+          + " (flights: 89% at 0-20, 77% at 20-35, 41% at 35-50, 16% at 50-60, 6% at 60-70)")
 
     # turn away from every tag: the feed stops and nothing takes over the sticks
     fresh_start(u)
@@ -292,6 +314,7 @@ def test_commands(env, u) -> None:
 
     # the waypoint counts only when slow: the filter's speed estimate under waypoint_max_speed
     registered, speeds = {}, []
+    fast_ok, n_fast = True, 0
     for limit in (0.0, u.cfg.waypoint_max_speed):  # limit 0: nothing is ever slow enough
         u.cfg.waypoint_max_speed = limit
         fresh_start(u)
@@ -305,6 +328,12 @@ def test_commands(env, u) -> None:
         for _ in range(int(2.0 / u.step_dt)):  # (auto_land: registered drones land, episodes end)
             env.step(sticks(u, (0, 0, 0, 0)))
             ever |= u._waypoint_event
+            if limit == 0.0 and u._fast_entry.any():  # too fast: -500 per 0.3 m/s over, episode over
+                ev = u._fast_entry.any(-1)
+                want = (u.cfg.rew_fast_entry_per_mps * u.est_speed * u._fast_entry.float()).sum(-1)[ev]
+                got = u.outcome_rew["fast_entry_loss"][ev]
+                fast_ok &= bool(torch.allclose(got, want, atol=1e-3)) and bool(u.outcome_fast_entry[ev].all())
+                n_fast += int(ev.sum())
             inside = torch.linalg.norm(u.pub_pos - (u._spots + u._wp_offset), dim=-1) < u.cfg.waypoint_radius
             seen |= inside & u.fresh & ~u.landing
             if limit > 0:
@@ -316,6 +345,25 @@ def test_commands(env, u) -> None:
           f"registers {registered[limit]:.0%} "
           f"with {limit} m/s, {registered[0.0]:.0%} with 0 (hover speed estimate median {sp.median():.2f}, "
           f"p90 {sp.quantile(0.9):.2f} m/s)")
+    u.cfg.waypoint_max_speed = limit
+    check(fast_ok and n_fast > 0, f"entering faster than waypoint_max_speed fails the episode and costs "
+          f"{-u.cfg.rew_fast_entry_per_mps * 0.3:.0f} per 0.3 m/s over ({n_fast} episodes checked)")
+
+    # braking within slow_zone_radius of tag 10 pays rew_slowdown per m/s of new low speed
+    fresh_start(u)
+    for i, drone in enumerate(u._drones):
+        pose = drone.data.root_state_w[:, :7].clone()
+        pose[:, :3] = u.scene.env_origins + torch.tensor([1.0, 0.9 - 0.6 * i, 1.0], device=u.device)  # in the zone, below the waypoints
+        vel = torch.zeros(u.num_envs, 6, device=u.device)
+        vel[:, 0] = 1.0  # 1 m/s away from the wall, sticks centred: the firmware brakes it
+        drone.write_root_pose_to_sim(pose, E)
+        drone.write_root_velocity_to_sim(vel, E)
+    for _ in range(int(2.0 / u.step_dt)):
+        env.step(sticks(u, (0, 0, 0, 0)))
+    paid = u._ep_rew["slowdown_reward"][~u.outcome_valid] / u.cfg.num_drones
+    check(bool((paid > 0.5 * u.cfg.rew_slowdown).all() & (paid <= 1.05 * u.cfg.rew_slowdown).all()),
+          f"braking from 1 m/s inside the slow zone pays rew_slowdown per m/s shed ({paid.mean():.0f} per drone, "
+          f"at most {u.cfg.rew_slowdown:.0f})")
 
     # two drones within collision_distance: each pays rew_collision (not the crash loss), episode ends
     if u.cfg.num_drones > 1:
@@ -433,7 +481,9 @@ def test_baselines(env, u, episodes: int) -> None:
             totals["no_tag"] += u.outcome_rew["no_tag_loss"][idx].sum().item()
             totals["crash"] += u.outcome_rew["crash_loss"][idx].sum().item()
             parts = sum(u.outcome_rew[k][idx] for k in u.REWARD_TERMS if k != "total")
-            totals["terms_err"] = max(totals.get("terms_err", 0.0), (parts - u.outcome_rew["total"][idx]).abs().max().item())
+            err = (parts - u.outcome_rew["total"][idx]).abs()
+            err = torch.where(torch.isfinite(err), err, torch.full_like(err, float("inf")))  # NaN: a failure, not 0
+            totals["terms_err"] = max(totals.get("terms_err", 0.0), err.max().item())
             totals["time"] += u.outcome_time[idx].sum().item()
             totals["off"] += off_steps[idx].sum().item()
             totals["blind"] += blind_steps[idx].sum().item()
@@ -514,6 +564,56 @@ def test_kalman(env, u) -> None:
           f"(noise unchanged, {n} drone-steps)")
 
 
+def test_search(env, u, prob: float, spawn_sep: float) -> None:
+    """Starts turned away from the tags (spawn_search_prob) and the 0.2 m spawn spacing."""
+    cfg = u.cfg
+    other_sep, cfg.spawn_min_separation = cfg.spawn_min_separation, spawn_sep
+    print("\n== search starts (turned away from the tags) and close spawns ==")
+    cfg.spawn_search_prob = prob
+    away, close, limit_ok = [], 0.0, True
+    for _ in range(20):
+        fresh_start(u)
+        pos = u._positions()
+        q = u._stack("root_quat_w")
+        yaw = torch.atan2(2 * (q[..., 0] * q[..., 3] + q[..., 1] * q[..., 2]), 1 - 2 * (q[..., 2] ** 2 + q[..., 3] ** 2))
+        off = torch.remainder(yaw - torch.atan2(-pos[..., 1], -pos[..., 0]) + math.pi, 2 * math.pi) - math.pi
+        away.append((off.abs() > cfg.spawn_search_yaw[0] - 1e-3).float().flatten())
+        if cfg.num_drones > 1:
+            pair = u._pairwise_distance(pos)
+            close = max(close, (pair < cfg.collision_distance).any().float().item())
+            want = torch.minimum(torch.full_like(pair, cfg.collision_distance), pair - cfg.start_contact_margin)
+            limit_ok &= bool(torch.allclose(u._pair_limit, want, atol=1e-4))
+    frac = torch.cat(away).mean().item()
+    check(abs(frac - prob) < 0.05, f"{frac:.0%} of drones start turned away from the tags (spawn_search_prob {prob:.0%}, "
+          f"yaw {math.degrees(cfg.spawn_search_yaw[0]):.0f}-{math.degrees(cfg.spawn_search_yaw[1]):.0f} deg off tag 10)")
+    if cfg.num_drones > 1:
+        check(close > 0 and limit_ok, "drones may spawn closer than collision_distance; each pair's collision limit is "
+              f"min({cfg.collision_distance}, start distance - {cfg.start_contact_margin}) m")
+        fresh_start(u)
+        u.step(sticks(u, (0, 0, 0, 0)))
+        check(not u._collision.any().item(), "no collision on the first step after a reset")
+        start = u._pairwise_distance(u._positions()).amin(dim=(-1, -2))
+        hit = torch.zeros(u.num_envs, dtype=torch.bool, device=u.device)
+        for _ in range(int(5.0 / u.step_dt)):
+            u.step(sticks(u, (0, 0, 0, 0)))
+            hit |= u._ep_collision
+        near = start < cfg.collision_distance
+        print(f"  zero sticks for 5 s: {hit[near].float().mean():.0%} of envs whose closest pair started < "
+              f"{cfg.collision_distance} m collide (hover drift); {hit[~near].float().mean():.0%} of the rest")
+
+    cfg.spawn_search_prob = 1.0
+    fresh_start(u)
+    for _ in range(int(4.0 / u.step_dt)):  # takeoff (floor starts) and hover, no yaw
+        u.step(sticks(u, (0, 0, 0, 0)))
+    blind = 1.0 - u.acquired.float().mean().item()
+    check(blind > 0.95, f"{blind:.0%} of drones turned away see no tag in 4 s without turning")
+    for _ in range(int(20.0 / u.step_dt)):  # rc yaw 40 ~ 24 deg/s: a full turn in 15 s
+        u.step(sticks(u, (0, 0, 0, 40)))
+    found = u.acquired.float().mean().item()
+    check(found > 0.9, f"{found:.0%} of them get a tag fix after turning (rc yaw 40 for 20 s)")
+    cfg.spawn_search_prob, cfg.spawn_min_separation = 0.0, other_sep
+
+
 def test_single(env, u) -> None:
     cfg = u.cfg
     print("\n== single drone from the floor (takeoff, then the sticks) ==")
@@ -579,7 +679,13 @@ def main():
     env = gym.make(args_cli.task, cfg=cfg)
     env.reset()
     u = env.unwrapped
+    # every other check assumes the drones start facing tag 10 and >= 0.5 m apart (zero sticks
+    # never collide); geometry checks the configured spacing, test_search the rest
+    search_prob, u.cfg.spawn_search_prob = u.cfg.spawn_search_prob, 0.0
+    spawn_sep = u.cfg.spawn_min_separation
     if cfg.num_drones == 1:
+        if args_cli.test in ("search", "all"):
+            test_search(env, u, search_prob, spawn_sep)
         if args_cli.test in ("single", "all"):
             test_single(env, u)
         if args_cli.test in ("kalman", "all"):
@@ -593,8 +699,11 @@ def main():
         return
     if args_cli.test in ("geometry", "all"):
         test_geometry(u)
+    u.cfg.spawn_min_separation = max(spawn_sep, 0.5)
     if args_cli.test in ("sensing", "all"):
         test_sensing(env, u)
+    if args_cli.test in ("search", "all"):
+        test_search(env, u, search_prob, spawn_sep)
     if args_cli.test in ("commands", "all"):
         test_commands(env, u)
     if args_cli.test in ("motion", "all"):
