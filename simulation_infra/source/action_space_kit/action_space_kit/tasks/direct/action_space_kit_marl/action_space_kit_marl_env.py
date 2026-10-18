@@ -6,8 +6,9 @@
 from __future__ import annotations
 
 import math
-import torch
 from collections.abc import Sequence
+
+import torch
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation
@@ -15,10 +16,12 @@ from isaaclab.envs import DirectMARLEnv
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils.math import sample_uniform
 
+from action_space_kit.rl.terminal_observation import TerminalObservationMixin
+
 from .action_space_kit_marl_env_cfg import ActionSpaceKitMarlEnvCfg
 
 
-class ActionSpaceKitMarlEnv(DirectMARLEnv):
+class ActionSpaceKitMarlEnv(TerminalObservationMixin, DirectMARLEnv):
     cfg: ActionSpaceKitMarlEnvCfg
 
     def __init__(self, cfg: ActionSpaceKitMarlEnvCfg, render_mode: str | None = None, **kwargs):

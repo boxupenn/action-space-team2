@@ -6,8 +6,8 @@ one rc packet):
   action    [right, forward, up, yaw_cw, land] in [-1, 1]: the sticks become integer rc inside
             the logged command envelope (``RcAction``: only values real drones were sent);
             land > land_threshold for land_confirm_steps sends the SDK ``land``: the firmware
-            descends and cuts the motors at touchdown (``auto_land``, the default: land is sent
-            on its own once the waypoint is reached, and the 5th output is ignored)
+            descends and cuts the motors at touchdown, after the estimated-state dwell gate
+            approves it (optional ``auto_land`` uses the same gate without a policy request)
             -> lost on the WiFi link with the episode's loss rate (the drone holds the last rc)
             -> lands 0-16 ms late in the step -> the motion-fitted Tello firmware model -> PhysX
   sensing   the frame captured now is checked against every mapped tag (``tags.sensing``);
@@ -18,7 +18,7 @@ one rc packet):
             flagged until the policy itself turns back to a tag (nothing takes over)
   noise     camera-model noise + per-fix noise + a per-drone bias on every fix; every drone
             has its own PID / flight-dynamics gains, rc->speed gains, mass and latency
-  waypoint  1.5 m above each landing spot, radius 0.3 m: until a drone's published fix is
+  waypoint  at tag-center height above each landing spot, radius 0.3 m: until its published fix is
             inside it, the drone is rewarded for closing on the waypoint; from then on only
             for landing near its spot, plus the penalties
   success   all four landed, each truly within ``success_radius`` of its spot
@@ -33,8 +33,9 @@ row = env * num_drones + drone.
 from __future__ import annotations
 
 import math
-import torch
 from collections.abc import Sequence
+
+import torch
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import RigidObject
@@ -45,6 +46,11 @@ from isaaclab.utils.math import matrix_from_quat, quat_from_euler_xyz
 
 from action_space_kit.assets import TELLO_CFG
 from action_space_kit.control import RcAction, TelloCascadeController, apply_motion_fit, load_motion_fit
+from action_space_kit.control.landing import update_landing_gate
+from action_space_kit.control.team_features import peer_features, predicted_separation_cost
+from action_space_kit.rl.rewards import potential_delta, precision_potential
+from action_space_kit.rl.start_curriculum import mix_starts, validate_start_mixture
+from action_space_kit.rl.terminal_observation import TerminalObservationMixin
 from action_space_kit.tags.kalman import KalmanCV
 from action_space_kit.tags.room_map import load_room_tags
 from action_space_kit.tags.sensing import camera_axes, sighting
@@ -62,7 +68,7 @@ def _yaw_of(quat: torch.Tensor) -> torch.Tensor:
     return torch.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
 
 
-class TelloRoomEnv(DirectMARLEnv):
+class TelloRoomEnv(TerminalObservationMixin, DirectMARLEnv):
     cfg: TelloRoomEnvCfg
 
     def __init__(self, cfg: TelloRoomEnvCfg, render_mode: str | None = None, **kwargs):
@@ -73,7 +79,10 @@ class TelloRoomEnv(DirectMARLEnv):
         cfg.sim.render_interval = cfg.decimation
         if cfg.use_motion_fit:
             apply_motion_fit(cfg.dynamics, load_motion_fit(cfg.rc.fit_path), cfg.sim.dt * cfg.decimation)
-        self.room_tags = load_room_tags(cfg.tag10_height)
+        self.room_tags = load_room_tags(cfg.tag10_height, cfg.room_map_path or None, cfg.room_tags_path or None)
+        if cfg.land_gate_enabled and not cfg.kalman.enabled:
+            raise ValueError("The landing gate requires Kalman velocity/covariance (env.kalman.enabled=True).")
+        validate_start_mixture(cfg)
         super().__init__(cfg, render_mode, **kwargs)
         E, D = self.num_envs, self.cfg.num_drones
         dev = self.device
@@ -108,6 +117,8 @@ class TelloRoomEnv(DirectMARLEnv):
         )
         self._spots = self._spot_table[:D].expand(E, D, 3).clone()
         self._wp_offset = torch.tensor([0.0, 0.0, self.cfg.waypoint_height], device=dev)
+        self._start_kind = torch.zeros(E, dtype=torch.long, device=dev)
+        self._start_positions = torch.zeros(E, D, 3, device=dev)
 
         self._actions = torch.zeros(E, D, 5, device=dev)
         self._prev_actions = torch.zeros(E, D, 5, device=dev)
@@ -144,6 +155,9 @@ class TelloRoomEnv(DirectMARLEnv):
         self.land_ok = torch.zeros(E, D, dtype=torch.bool, device=dev)  # touched down on the spot
         self.touchdown_err = torch.zeros(E, D, device=dev)
         self._land_votes = torch.zeros(E, D, dtype=torch.long, device=dev)
+        self.land_dwell = torch.zeros(E, D, device=dev)
+        self.land_ready = torch.zeros(E, D, dtype=torch.bool, device=dev)
+        self._prev_potential = torch.zeros(E, D, device=dev)
         self._land_event = torch.zeros(E, D, dtype=torch.bool, device=dev)  # land sent this step
         self._early_land = torch.zeros(E, D, dtype=torch.bool, device=dev)  # land asked for before the waypoint
         self._touchdown_event = torch.zeros(E, D, dtype=torch.bool, device=dev)
@@ -159,11 +173,14 @@ class TelloRoomEnv(DirectMARLEnv):
         self._collision = torch.zeros(E, D, dtype=torch.bool, device=dev)  # this step: too close to another drone
         # per pair: collision_distance, or less for a pair that spawned closer (start distance - start_contact_margin)
         self._pair_limit = torch.full((E, D, D), cfg.collision_distance, device=dev)
+        self._substep_collision = torch.zeros(E, D, dtype=torch.bool, device=dev)
         self._prev_dist = torch.zeros(E, D, device=dev)
         self._ep_collision = torch.zeros(E, dtype=torch.bool, device=dev)
         self._ep_crash = torch.zeros(E, dtype=torch.bool, device=dev)
         self._ep_fresh_steps = torch.zeros(E, device=dev)
         self._ep_losses = torch.zeros(E, device=dev)
+        self._ep_gate_ready = torch.zeros(E, device=dev)
+        self.outcome_gate_ready_frac = torch.zeros(E, device=dev)
         self._ep_min_sep = torch.full((E,), float("inf"), device=dev)
         # per-episode sums of reward terms, over the drones (logged to TensorBoard)
         self._ep_rew = {k: torch.zeros(E, device=dev) for k in self.REWARD_TERMS}
@@ -176,6 +193,7 @@ class TelloRoomEnv(DirectMARLEnv):
         self.outcome_land_ok = torch.zeros(E, device=dev)
         self.outcome_collision = torch.zeros(E, dtype=torch.bool, device=dev)
         self.outcome_crash = torch.zeros(E, dtype=torch.bool, device=dev)
+        self.outcome_timeout = torch.zeros(E, dtype=torch.bool, device=dev)
         self.outcome_time = torch.zeros(E, device=dev)
         self.outcome_fresh_frac = torch.zeros(E, device=dev)
         self.outcome_losses = torch.zeros(E, device=dev)
@@ -220,12 +238,14 @@ class TelloRoomEnv(DirectMARLEnv):
         "closer_reward",  # +10 per metre gained toward the own waypoint until reached, -5 per metre lost
         "waypoint_reward",  # +1000 once, on first getting inside the waypoint radius at <= 0.3 m/s
         "slowdown_reward",  # +200 per m/s of new low speed within 2 m of tag 10 (before the waypoint)
+        "settling_loss",
         "fast_entry_loss",  # entering the waypoint too fast: -500 per 0.3 m/s over; the episode fails
         "landing_loss",  # -0.5 per step not landed on the spot (+ the rest, if ended early)
         "no_tag_loss",  # -0.5 per step a flying drone has no AprilTag in view
         "crash_loss",  # -100 per crash / wall / leaving the room
         "collision_loss",  # -1000 per drone that came within collision_distance of another
         "separation_loss",  # closer than 0.5 m to another drone
+        "predictive_separation_loss",
         "action_rate_loss",  # jerky sticks
         "early_land_loss",  # -100 each time land is asked for before the waypoint (blocked)
         "land_reward",  # +100 at touchdown (only possible after the waypoint)
@@ -293,6 +313,7 @@ class TelloRoomEnv(DirectMARLEnv):
 
     def _pre_physics_step(self, actions: dict[str, torch.Tensor]) -> None:
         E, D = self.num_envs, self.cfg.num_drones
+        self._substep_collision.zero_()
         self._prev_actions = self._actions.clone()
         self._actions = torch.stack([actions[a] for a in self._agents], dim=1).clamp(-1.0, 1.0)
         rc = self.rc.to_rc(self._actions[..., :4].reshape(-1, 4)).view(E, D, 4)  # the policy always flies
@@ -301,14 +322,24 @@ class TelloRoomEnv(DirectMARLEnv):
         want &= ~self.taking_off  # the firmware is busy with takeoff
         self._land_votes = torch.where(want, self._land_votes + 1, torch.zeros_like(self._land_votes))
         asked = ~self.landing & (self._land_votes >= self.cfg.land_confirm_steps)
-        # land gate (the laptop applies it too): land goes out only once the drone's published
-        # fix has been inside its waypoint; before that the request is blocked and penalized
+        if self.cfg.land_gate_enabled:
+            self.land_dwell, self.land_ready = update_landing_gate(
+                self.cfg, self.pub_pos, self.kf.v, self.kf.a, self.kf.c, self._spots,
+                self.fix_age, self.acquired, self.lost, self.at_waypoint,
+                self.taking_off | self.landing | self.landed, self.land_dwell, self.step_dt, torch)
+            allowed = self.land_ready
+        else:  # exact replay of legacy checkpoints, never the new training default
+            allowed = self.at_waypoint
+        # Penalize requests before the observable waypoint milestone. After reaching it,
+        # the gate may still need a fresh/confident dwell; penalizing every blocked request
+        # there teaches the discrete head to stop asking instead of learning touchdown.
         self._early_land = asked & ~self.at_waypoint
-        self._land_votes = torch.where(self._early_land, torch.zeros_like(self._land_votes), self._land_votes)
-        self._land_event = asked & self.at_waypoint
+        self._ep_gate_ready += self.land_ready.float().mean(-1)
+        self._land_votes = torch.where(asked & ~allowed, torch.zeros_like(self._land_votes), self._land_votes)
+        self._land_event = asked & allowed
         if self.cfg.auto_land:  # land goes out on its own once inside the waypoint; the 5th output is unused
             self._early_land = torch.zeros_like(self._early_land)
-            self._land_event = ~self.landing & self.at_waypoint & ~self.taking_off
+            self._land_event = ~self.landing & allowed & ~self.taking_off
         self.landing |= self._land_event
         rc[self.landing | self.taking_off] = 0.0  # during land / takeoff the firmware ignores sticks
         self.last_rc = rc
@@ -336,6 +367,11 @@ class TelloRoomEnv(DirectMARLEnv):
         self._substep = 0
 
     def _apply_action(self) -> None:
+        if self.cfg.collision_substeps and self.cfg.num_drones > 1:
+            pair = self._pairwise_distance(self._positions())
+            both_down = self.landed.unsqueeze(-1) & self.landed.unsqueeze(-2)
+            self._substep_collision |= ((pair < self._pair_limit) & ~both_down).any(-1)
+            self._ep_min_sep = torch.minimum(self._ep_min_sep, pair.amin(dim=(-1, -2)))
         due = self._apply_at == self._substep
         if self._substep > 0 and due.any():
             self.controller._cmd[due] = self._due_cmd[due]
@@ -392,10 +428,13 @@ class TelloRoomEnv(DirectMARLEnv):
             # landed drones hold their last estimate (no odometry)
             self.kf.predict(dt, active=~self.lost & ~self.landed)
             self.kf.reset(self.lost & arrived)  # back from lost: restart from this fix
-            self.kf.update(noisy, mask=arrived)
+            accepted = self.kf.update(noisy, mask=arrived)
             self.pub_pos = torch.where(self.kf.ready.unsqueeze(-1), self.kf.p, self.pub_pos)
         else:
             self.pub_pos = self.raw_pos.clone()
+            accepted = arrived
+        if cfg.land_gate_enabled:
+            arrived = accepted  # rejected outliers must not refresh heading or fix age
         yaw_fix = self._yaw_buf[:, :, -1] + cfg.yaw_fix_noise * torch.randn(E, D, device=self.device)
         self.pub_yaw = torch.where(arrived, yaw_fix, self.pub_yaw)
         self.fresh = arrived
@@ -458,6 +497,8 @@ class TelloRoomEnv(DirectMARLEnv):
         pair = self._pairwise_distance(pos)
         both_down = self.landed.unsqueeze(-1) & self.landed.unsqueeze(-2)
         collision = ((pair < self._pair_limit) & ~both_down).any(dim=-1)
+        if cfg.collision_substeps:
+            collision |= self._substep_collision
         self._violation = crash | collision
         self._crash, self._collision = crash, collision
         self._ep_collision |= collision.any(dim=-1)
@@ -469,7 +510,7 @@ class TelloRoomEnv(DirectMARLEnv):
 
         spot_err = torch.where(self.landed, self.touchdown_err, err)
         success = self._all_event
-        done = self._violation.any(dim=-1) | self._fast_entry.any(dim=-1) | all_landed
+        done = self._violation.any(dim=-1) | (self._fast_entry.any(dim=-1) & cfg.terminate_fast_entry) | all_landed
         self._done_now = done
         time_out = self.episode_length_buf >= self.max_episode_length - 1
 
@@ -483,10 +524,12 @@ class TelloRoomEnv(DirectMARLEnv):
         self.outcome_land_ok = latch(self.land_ok.float().sum(-1), self.outcome_land_ok)
         self.outcome_collision = latch(self._ep_collision, self.outcome_collision)
         self.outcome_crash = latch(self._ep_crash, self.outcome_crash)
+        self.outcome_timeout = latch(time_out & ~done, self.outcome_timeout)
         self.outcome_fast_entry = latch(self._ep_fast_entry, self.outcome_fast_entry)
         self.outcome_time = latch(self.episode_length_buf.float() * self.step_dt, self.outcome_time)
         self.outcome_fresh_frac = latch(self._ep_fresh_steps / steps, self.outcome_fresh_frac)
         self.outcome_losses = latch(self._ep_losses, self.outcome_losses)
+        self.outcome_gate_ready_frac = latch(self._ep_gate_ready / steps, self.outcome_gate_ready_frac)
         self.outcome_spot_err = latch(spot_err.mean(-1), self.outcome_spot_err)
         self.outcome_min_sep = latch(self._ep_min_sep, self.outcome_min_sep)
         self._finished = finished
@@ -505,11 +548,18 @@ class TelloRoomEnv(DirectMARLEnv):
         gain = torch.where(gain > 0, gain, cfg.rew_away_ratio * gain)
         closer = cfg.rew_closer_scale * gain * flying * heading_in
         self._prev_dist = dist
+        if cfg.reward_version >= 2:
+            # Bounded state potential; landing advances toward a second potential level.
+            # Its discounted sum telescopes, so a closed flight loop cannot farm progress.
+            potential = self._potential(pos)
+            closer = potential_delta(self._prev_potential, potential, self._done_now.unsqueeze(-1),
+                                      cfg.reward_gamma, torch)
+            self._prev_potential = potential
         # braking near tag 10: pays for each new low of the true speed inside the slow zone
         speed = torch.linalg.norm(self._stack("root_lin_vel_w"), dim=-1)
         in_zone = (torch.linalg.norm(pos[..., :2], dim=-1) < cfg.slow_zone_radius) & (flying * heading_in).bool()
         best = torch.where(in_zone & torch.isinf(self._best_speed), speed, self._best_speed)  # entering: start here
-        slowdown = torch.where(in_zone, cfg.rew_slowdown * (best - speed).clamp(min=0.0), 0.0)  # best is inf outside
+        slowdown = cfg.rew_slowdown * torch.where(in_zone, (best - speed).clamp(min=0.0), 0.0)
         self._best_speed = torch.where(in_zone, torch.minimum(best, speed), self._best_speed)
         over = (self.est_speed - cfg.waypoint_max_speed).clamp(min=0.0)
 
@@ -522,19 +572,33 @@ class TelloRoomEnv(DirectMARLEnv):
         # so ending an episode early never beats flying it
         remaining = (self.max_episode_length - 1 - self.episode_length_buf).clamp(min=0).float()
         landing = landing + cfg.rew_time * not_done * (self._done_now.float() * remaining).unsqueeze(-1)
+        settling = torch.zeros_like(closer)
+        if cfg.reward_version >= 2:
+            xy_error = torch.linalg.norm((pos - self._spots)[..., :2], dim=-1)
+            settling = ((cfg.rew_settle_position * xy_error + cfg.rew_settle_speed * speed)
+                        * self.step_dt * self.at_waypoint.float() * flying * (~self.landing).float())
+        touchdown_rewarded = self._touchdown_event & (self.land_ok if cfg.reward_version >= 2 else True)
+        fast_entry_weight = cfg.rew_fast_entry_per_mps if cfg.reward_version == 1 else -5.0
+        predictive = torch.zeros_like(flying)
+        if cfg.rew_predictive_separation:
+            predictive = predicted_separation_cost(
+                pos, self._stack("root_lin_vel_w"), self.landed,
+                cfg.separation_lookahead_s, cfg.separation_prediction_margin, torch)
         terms = {
             "closer_reward": closer,
             "waypoint_reward": cfg.rew_waypoint * self._waypoint_event.float(),
             "slowdown_reward": slowdown,
-            "fast_entry_loss": cfg.rew_fast_entry_per_mps * over * self._fast_entry.float(),
+            "settling_loss": settling,
+            "fast_entry_loss": fast_entry_weight * over * self._fast_entry.float(),
             "landing_loss": landing,
             "no_tag_loss": cfg.rew_no_fix * (~self.fresh).float() * flying,
             "crash_loss": cfg.rew_violation * (self._crash & ~self._collision).float(),
             "collision_loss": cfg.rew_collision * self._collision.float(),
             "separation_loss": cfg.rew_scale_separation * sep * self.step_dt,
+            "predictive_separation_loss": cfg.rew_predictive_separation * predictive * self.step_dt,
             "action_rate_loss": cfg.rew_scale_action_rate * action_rate * self.step_dt,
             "early_land_loss": cfg.rew_early_land * self._early_land.float(),
-            "land_reward": cfg.rew_land * self._touchdown_event.float(),
+            "land_reward": cfg.rew_land * touchdown_rewarded.float(),
             "formation_reward": cfg.rew_all_landed * self._all_event.float().unsqueeze(-1).expand_as(flying),
         }
         reward = torch.nan_to_num(sum(terms.values()), nan=cfg.rew_violation)
@@ -544,6 +608,19 @@ class TelloRoomEnv(DirectMARLEnv):
             # rewards are computed after dones: latch this episode's totals now, the reset follows
             self.outcome_rew[key] = torch.where(self._finished, self._ep_rew[key], self.outcome_rew[key])
         return {agent: reward[:, i] for i, agent in enumerate(self._agents)}
+
+    def _potential(self, pos):
+        cfg = self.cfg
+        dist = torch.linalg.norm(pos - (self._spots + self._wp_offset), dim=-1)
+        approach = cfg.rew_potential_scale * torch.exp(-dist / 2.0)
+        peak = cfg.rew_potential_scale
+        if cfg.rew_precision_potential:
+            speed = torch.linalg.norm(self._stack("root_lin_vel_w")[..., :2], dim=-1)
+            approach += precision_potential(dist, speed, cfg.rew_precision_potential,
+                                            cfg.precision_position_scale, cfg.precision_speed_scale, torch)
+            peak += cfg.rew_precision_potential
+        descent = 1.0 + (1.0 - pos[..., 2] / cfg.waypoint_height).clamp(0.0, 1.0)
+        return torch.where(self.landing, peak * descent, approach)
 
     def _get_observations(self) -> dict[str, torch.Tensor]:
         """Each drone's block of the central observation (Sb3CentralVecEnv concatenates them)."""
@@ -577,6 +654,12 @@ class TelloRoomEnv(DirectMARLEnv):
             ] + ([self.taking_off.float().unsqueeze(-1)] if cfg.start_on_floor else []),
             dim=-1,
         )
+        if cfg.peer_observations:
+            if not cfg.kalman.enabled:
+                raise ValueError("Peer observations require estimated Kalman velocity and uncertainty")
+            block = torch.cat((block, peer_features(p, self.kf.v, self.pub_yaw, self.kf.a, self.kf.c, torch,
+                                                  sort_neighbors=cfg.peer_sort_by_distance,
+                                                  order_version=cfg.peer_order_version)), -1)
         block = torch.nan_to_num(block, nan=0.0, posinf=10.0, neginf=-10.0)
         return {agent: block[:, i] for i, agent in enumerate(self._agents)}
 
@@ -618,16 +701,30 @@ class TelloRoomEnv(DirectMARLEnv):
             return lo + (hi - lo) * torch.rand(*shape, device=dev)
 
         xy = self._sample_starts(n)
-        z = torch.full((n, D), cfg.rest_height, device=dev) if cfg.start_on_floor else U(*cfg.spawn_height, n, D)
+        floor_start = cfg.start_on_floor and cfg.takeoff_at_reset
+        z = torch.full((n, D), cfg.rest_height, device=dev) if floor_start else U(*cfg.spawn_height, n, D)
         start = torch.cat([xy, z.unsqueeze(-1)], -1)
-        self._pair_limit[env_ids] = torch.minimum(
-            torch.full_like(self._pair_limit[env_ids], cfg.collision_distance),
-            self._pairwise_distance(start) - cfg.start_contact_margin)
         if cfg.random_assignment:  # any drone may get any spot (D of the spot_count)
             order = torch.argsort(torch.rand(n, cfg.spot_count, device=dev), dim=-1)[:, :D]
         else:  # drone k-th from the left (smallest Y) takes spot k: no crossing paths
             order = torch.argsort(torch.argsort(xy[..., 1], dim=-1), dim=-1)
+        if cfg.fixed_spot_index >= 0:
+            if D != 1 or cfg.fixed_spot_index >= cfg.spot_count:
+                raise ValueError("fixed_spot_index requires one drone and an existing landing spot")
+            order[:] = cfg.fixed_spot_index
         self._spots[env_ids] = self._spot_table[order]
+        if cfg.spawn_near_target_radius > 0:
+            if D != 1:
+                raise ValueError("Near-target curriculum requires a single drone")
+            xy = self._spots[env_ids, :, :2] + U(-cfg.spawn_near_target_radius, cfg.spawn_near_target_radius, n, D, 2)
+            start = torch.cat([xy, z.unsqueeze(-1)], -1)
+        xy, z, takeoff, kind = mix_starts(cfg, xy, z, self._spots[env_ids], floor_start)
+        start = torch.cat([xy, z.unsqueeze(-1)], -1)
+        self._start_kind[env_ids] = kind
+        self._start_positions[env_ids] = start
+        self._pair_limit[env_ids] = torch.minimum(
+            torch.full_like(self._pair_limit[env_ids], cfg.collision_distance),
+            self._pairwise_distance(start) - cfg.start_contact_margin)
         # facing tag 10 +- spawn_yaw_noise, or (spawn_search_prob) turned away: no tag in view
         search = torch.rand(n, D, device=dev) < cfg.spawn_search_prob
         side = torch.where(torch.rand(n, D, device=dev) < 0.5, -1.0, 1.0)
@@ -664,6 +761,8 @@ class TelloRoomEnv(DirectMARLEnv):
         self.fresh[env_ids] = False
         self.acquired[env_ids] = False
         self.fix_age[env_ids] = 0.0
+        if cfg.reward_version >= 2:
+            self.height_meas[env_ids] = torch.round(z * 10.0) / 10.0
         self.lost[env_ids] = False
         self._link_loss[env_ids] = U(*cfg.link_loss_range, n, D)
         self._fix_bias[env_ids] = cfg.fix_bias * torch.randn(n, D, 3, device=dev)
@@ -672,31 +771,78 @@ class TelloRoomEnv(DirectMARLEnv):
         self._delivered[env_ids] = 0.0
 
         self._actions[env_ids] = 0.0
+        self._substep_collision[env_ids] = False
         self._prev_actions[env_ids] = 0.0
         self.last_rc[env_ids] = 0.0
         self.at_waypoint[env_ids] = False
         self.landing[env_ids] = False
-        self.taking_off[env_ids] = cfg.start_on_floor
+        self.taking_off[env_ids] = takeoff
         self._takeoff_z[env_ids] = U(*cfg.takeoff_height, n, D)
         self.landed[env_ids] = False
         self.land_ok[env_ids] = False
         self.touchdown_err[env_ids] = 0.0
         self._land_votes[env_ids] = 0
+        self.land_dwell[env_ids] = 0.0
+        self.land_ready[env_ids] = False
         self._early_land[env_ids] = False
         self._prev_dist[env_ids] = torch.linalg.norm(start - (self._spots[env_ids] + self._wp_offset), dim=-1)
+        self._prev_potential[env_ids] = cfg.rew_potential_scale * torch.exp(-self._prev_dist[env_ids] / 2.0)
+        if cfg.rew_precision_potential:
+            self._prev_potential[env_ids] += precision_potential(
+                self._prev_dist[env_ids], torch.zeros_like(self._prev_dist[env_ids]),
+                cfg.rew_precision_potential, cfg.precision_position_scale, cfg.precision_speed_scale, torch)
         self._ep_collision[env_ids] = False
         self._ep_crash[env_ids] = False
         self._ep_fast_entry[env_ids] = False
         self._best_speed[env_ids] = float("inf")
         self._ep_fresh_steps[env_ids] = 0.0
         self._ep_losses[env_ids] = 0.0
+        self._ep_gate_ready[env_ids] = 0.0
         self._ep_min_sep[env_ids] = float("inf")
 
     def _log_outcomes(self, env_ids: torch.Tensor) -> None:
         finished = env_ids[self.outcome_valid[env_ids]]
+        self.extras["episode_records"] = []
         if len(finished) == 0:
             self.extras["log"] = {}
             return
+        # Capture individual outcomes and assignments BEFORE the automatic reset.
+        fields = {"success_rate": "success", "fast_entry_rate": "fast_entry",
+                  "drones_reached_waypoint": "waypoints", "drones_landed": "landed",
+                  "drones_landed_on_spot": "land_ok", "collision_rate": "collision",
+                  "crash_rate": "crash", "timeout_rate": "timeout", "duration_s": "time", "tag_fix_frac": "fresh_frac",
+                  "tag_losses": "losses", "spot_err_m": "spot_err", "land_gate_ready_frac": "gate_ready_frac"}
+        if self.cfg.num_drones > 1:
+            fields["min_separation_m"] = "min_sep"
+        values = {key: getattr(self, "outcome_" + name)[finished].detach().cpu().tolist()
+                  for key, name in fields.items()}
+        spots = self._spots[finished].detach().cpu().tolist()
+        landed = self.landed[finished].detach().cpu().tolist()
+        ok = self.land_ok[finished].detach().cpu().tolist()
+        errors = self.touchdown_err[finished].detach().cpu().tolist()
+        start_kinds = self._start_kind[finished].detach().cpu().tolist()
+        starts = self._start_positions[finished].detach().cpu().tolist()
+        terminal = {}
+        if self.cfg.log_terminal_state:
+            terminal = {key: value[finished].detach().cpu().tolist() for key, value in {
+                "position": self._positions(), "velocity": self._stack("root_lin_vel_w"),
+                "estimated_position": self.pub_pos, "estimated_velocity": self.kf.v,
+                "fix_age": self.fix_age, "actions": self._actions,
+                "taking_off": self.taking_off, "takeoff_target_height": self._takeoff_z,
+                "landing": self.landing, "landed": self.landed,
+                "position_variance": self.kf.a, "velocity_variance": self.kf.c,
+            }.items()}
+        for j, env_id in enumerate(finished.cpu().tolist()):
+            metrics = {"Episode/" + key: float(value[j]) for key, value in values.items()}
+            self.extras["episode_records"].append({
+                "env_id": env_id, "metrics": metrics,
+                "start_kind": ("configured", "short_approach", "hover_landing")[start_kinds[j]],
+                "start_positions": starts[j],
+                **({"terminal_state": {key: value[j] for key, value in terminal.items()}} if terminal else {}),
+                "drones": [{"target_index": round(spot[1] / self.cfg.spot_spacing + (self.cfg.spot_count - 1) / 2),
+                            "target": spot, "landed": landed[j][d], "land_ok": ok[j][d],
+                            "touchdown_error_m": errors[j][d]} for d, spot in enumerate(spots[j])],
+            })
         self.extras["log"] = {
             "Episode/success_rate": self.outcome_success[finished].float().mean().item(),
             "Episode/fast_entry_rate": self.outcome_fast_entry[finished].float().mean().item(),
@@ -707,9 +853,11 @@ class TelloRoomEnv(DirectMARLEnv):
             "Episode/drones_landed_on_spot": self.outcome_land_ok[finished].mean().item(),
             "Episode/collision_rate": self.outcome_collision[finished].float().mean().item(),
             "Episode/crash_rate": self.outcome_crash[finished].float().mean().item(),
+            "Episode/timeout_rate": self.outcome_timeout[finished].float().mean().item(),
             "Episode/duration_s": self.outcome_time[finished].mean().item(),
             "Episode/tag_fix_frac": self.outcome_fresh_frac[finished].mean().item(),
             "Episode/tag_losses": self.outcome_losses[finished].mean().item(),
+            "Episode/land_gate_ready_frac": self.outcome_gate_ready_frac[finished].mean().item(),
             "Episode/spot_err_m": self.outcome_spot_err[finished].mean().item(),
             **({"Episode/min_separation_m": self.outcome_min_sep[finished].mean().item()} if self.cfg.num_drones > 1 else {}),
             # each reward term: average per drone, per episode (summed over the episode's steps)

@@ -11,8 +11,9 @@ dimensional so PPO trains in hackathon time.
 
 from __future__ import annotations
 
-import torch
 from collections.abc import Sequence
+
+import torch
 
 from isaaclab.sensors import TiledCamera
 from isaaclab.utils.math import quat_apply
@@ -91,3 +92,16 @@ class TelloDefendCameraEnv(TelloDefendEnv):
         ids = None if env_ids is None else torch.as_tensor(env_ids, device=self.device)
         for tracker in getattr(self, "_trackers", []):
             tracker.reset(ids)
+
+    def _get_terminal_observations(self):
+        # This task updates noisy trackers while observing. A terminal snapshot must not
+        # advance the surviving environments' trackers a second time or consume their RNG.
+        import copy
+        trackers = self._trackers
+        self._trackers = copy.deepcopy(trackers)
+        device = torch.device(self.device)
+        try:
+            with torch.random.fork_rng(devices=[device.index or 0] if device.type == "cuda" else []):
+                return self._get_observations()
+        finally:
+            self._trackers = trackers

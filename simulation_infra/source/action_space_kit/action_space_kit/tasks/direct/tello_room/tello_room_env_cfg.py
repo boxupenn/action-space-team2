@@ -15,8 +15,9 @@ data alone: no scripted search, no hold, no hand-written controller anywhere.
 
 from __future__ import annotations
 
-import gymnasium as gym
 import math
+
+import gymnasium as gym
 
 from isaaclab.envs import DirectMARLEnvCfg, ViewerCfg
 from isaaclab.scene import InteractiveSceneCfg
@@ -60,6 +61,11 @@ class TelloRoomEnvCfg(DirectMARLEnvCfg):
     the gaps between commands spread over ~58-90 ms like the real loop's."""
     episode_length_s = 75.0  # ~5.5 m at rc 25 (~0.18 m/s) is ~30 s, plus turns and searches
     debug_vis = False
+    peer_observations = False  # append estimated velocities, uncertainty and relative peer state
+    peer_sort_by_distance = False  # shared-policy experiments use nearest-first peer slots
+    peer_order_version = 2  # deterministic millimeter-distance keys; old snapshots restore version 1
+    log_terminal_state = False  # diagnostic records only; never changes observations or physics
+    collision_substeps = True  # detect proximity violations at every 2 ms physics step
 
     # the real Tello commands: the four rc channels [right, forward, up, yaw_cw] in [-1, 1] ->
     # integer rc -100..100 (the full SDK range), plus the SDK ``land`` command (5th output >
@@ -100,6 +106,8 @@ class TelloRoomEnvCfg(DirectMARLEnvCfg):
 
     # -- room (from drone_deployment_infra/config/map.yaml; only the floor is hand-measured)
     num_drones = NUM_DRONES
+    room_map_path = ""
+    room_tags_path = ""
     tag10_height = 1.22  # [m] centre of tag 10 above the floor: measured ~48 in (2026-10-14)
     wall_x = -0.10  # [m] tag-10 wall surface (tags 8/9 map ~8 cm behind tag 10)
     side_wall_y = 1.70  # [m] tag-5 wall surface
@@ -113,8 +121,17 @@ class TelloRoomEnvCfg(DirectMARLEnvCfg):
     spawn_box_size = 2.0  # [m]
     spawn_range = (6.0, 7.0)  # [m] horizontal distance to tag 10
     spawn_min_separation = 0.2  # [m]
+    spawn_near_target_radius = 0.0  # single-drone landing curriculum only; 0 uses the start box
+    # Optional training replay: remaining episodes use the configured start box unchanged.
+    # Full-room evaluation must set both fractions to zero.
+    spawn_short_fraction = 0.0
+    spawn_short_x_range = (1.5, 5.5)
+    spawn_short_y_radius = 0.4
+    spawn_hover_fraction = 0.0
+    spawn_hover_radius = 0.10
     spawn_height = (0.9, 1.4)  # [m] hovering after takeoff (start_on_floor = False)
     start_on_floor = False
+    takeoff_at_reset = True  # False: curriculum starts hovering, preserving the observation layout
     """True: every drone starts on the floor, motors off, and the episode opens with the SDK
     ``takeoff`` the flight engine sends before any rc: the firmware climbs to takeoff_height on
     its own (sticks ignored, like land), then the policy flies. The observation gains a
@@ -135,12 +152,13 @@ class TelloRoomEnvCfg(DirectMARLEnvCfg):
     spot_count = NUM_DRONES
     """Landing spots in the row; each drone gets a different one (num_drones <= spot_count)."""
     random_assignment = True
+    fixed_spot_index = -1  # single-drone evaluation only; -1 samples all pads
     """Which drone gets which spot: a random permutation every episode (paths may cross).
     False: the drone k-th from the left takes spot k."""
-    # -- waypoint: 1.5 m above each landing spot. Until a drone's published position is inside
+    # -- waypoint: aligned with tag 10's height above each landing spot. Until its estimate is inside
     # its radius, it is rewarded for closing on the waypoint (not the spot); from then on only
     # for landing (land is gated until then; landing on the spot: formation) on top of the penalties.
-    waypoint_height = 1.5  # [m] above the landing spot
+    waypoint_height = 1.22  # [m] align with measured tag-10 centre so its 571.5 mm square fits the camera
     waypoint_radius = 0.3  # [m]
     waypoint_max_speed = 0.3
     """[m/s] entering the waypoint counts only at or below this speed (the Kalman filter's speed
@@ -159,11 +177,20 @@ class TelloRoomEnvCfg(DirectMARLEnvCfg):
     # -- land: the SDK command; the firmware descends and stops the motors at touchdown
     land_threshold = 0.5  # 5th action above this ...
     land_confirm_steps = 3  # ... this many steps in a row (~0.2 s) sends land
-    auto_land = True
-    """Send ``land`` automatically the step after a drone's published fix enters its waypoint;
-    the policy's 5th output is then ignored (no early-land loss). False: the policy decides
-    (land_threshold / land_confirm_steps, gated on the waypoint). The laptop must do the same."""
+    auto_land = False
+    """True: request landing automatically when the current-state dwell gate passes.
+    False (default): require the policy's confirmed request AND the same gate.
+    Legacy replay may disable land_gate_enabled to recover historical behavior."""
     land_speed = 0.4  # [m/s] firmware descent during land
+    land_gate_enabled = True
+    land_max_xy_error = 0.15
+    land_max_horizontal_speed = 0.10
+    land_height_tolerance = 0.20
+    land_max_position_std = 0.12
+    land_max_velocity_std = 0.35
+    land_max_observation_age = 0.35  # includes the video pipeline's delay
+    land_dwell_s = 0.5
+    terminate_fast_entry = False  # allow braking/recovery; still log fast entries
     touchdown_height = 0.08  # [m] body centre below this: down, motors off
 
     # -- localization: positions come only from tag sightings (core/positional.py)
@@ -195,20 +222,31 @@ class TelloRoomEnvCfg(DirectMARLEnvCfg):
     separation_distance = 0.5  # [m] spots are this far apart; closer is penalized
 
     # -- rewards (per drone, per policy step)
-    rew_closer_scale = 100.0  # per metre closer to the own waypoint (until reached)
-    rew_away_ratio = 0.25  # moving away costs this fraction of rew_closer_scale per metre
-    rew_waypoint = 1000.0  # once, when the drone's published fix first gets inside its waypoint (slow enough)
+    reward_version = 2
+    reward_gamma = 0.995  # train.py verifies this equals PPO gamma
+    rew_potential_scale = 40.0
+    rew_precision_potential = 0.0  # opt-in; replaces milestone-triggered settling costs in new runs
+    precision_position_scale = 0.20
+    precision_speed_scale = 0.15
+    rew_settle_position = -2.0  # per metre per second after reaching the waypoint
+    rew_settle_speed = -1.0  # per m/s per second after reaching the waypoint
+    rew_closer_scale = 100.0  # legacy reward_version=1 only
+    rew_away_ratio = 1.0  # legacy only; version 2 uses discounted potential shaping
+    rew_waypoint = 25.0
     rew_fast_entry_per_mps = -500.0 / 0.3  # entering the waypoint faster than waypoint_max_speed: per m/s
     #                  over it (0.6 m/s: -500), and the episode ends (fails)
-    rew_slowdown = 200.0  # per m/s below the slowest speed so far inside slow_zone_radius of tag 10
+    rew_slowdown = 0.0  # version 2 uses continuous position/speed settling costs
     #                  (true speed; until the waypoint): pays for braking, can't be farmed by re-speeding
     rew_time = -0.5  # every step a drone is not landed on its spot ("landing loss"); a drone
     #                  that ends the episode early (crash, landed off the spot) pays the rest
-    rew_land = 100.0  # at touchdown (land is only sent after the waypoint, see land gate)
-    rew_early_land = -100.0  # each land asked for before the waypoint: blocked, and penalized
+    rew_land = 1000.0  # version 2: only an accurate touchdown earns this
+    rew_early_land = -5.0  # confirmed requests before the waypoint; later requests wait for the gate
     rew_all_landed = 200.0  # to every drone, when all four landed on their spots (success)
     rew_no_fix = -0.5  # every step a flying drone has no AprilTag in view
     rew_violation = -100.0  # crash, wall, ceiling, flipping, leaving the room ("crash loss")
     rew_collision = -1000.0  # to each drone closer than collision_distance to another ("collision loss")
     rew_scale_separation = -20.0  # per second, scaled by how far inside separation_distance
+    rew_predictive_separation = 0.0  # opt-in per-second cost for predicted close approaches
+    separation_lookahead_s = 1.5
+    separation_prediction_margin = 0.5
     rew_scale_action_rate = -0.05  # per second

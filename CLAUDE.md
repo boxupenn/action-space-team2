@@ -1,5 +1,19 @@
 # CLAUDE.md: install and run guide for AI agents
 
+> **Policy reliability updates (2026-10-14):** new room runs use `reward_version=2` and
+> `land_gate_enabled=True`, with policy-requested landing (`auto_land=False`). The gate
+> checks current estimated position, velocity, covariance, accepted-fix age and 0.5 s dwell.
+> New waypoint height is 1.22 m (measured tag center), improving tag visibility over the pads.
+> The older reward/auto-land descriptions below describe legacy checkpoints; use the updated
+> `simulation_infra/SINGLE_DRONE_SIMULATION.md` for current defaults and curriculum commands.
+> `sb3/play.py` restores saved config, seeds after PPO loading, and counts a fixed episode
+> quota per env. Save `--report outputs/<name>.json`; require `complete=true` and exact counts.
+> Resume requires matching VecNormalize stats. New runs snapshot assets, effective config,
+> source, and dependencies. A single-drone checkpoint cannot resume as a four-drone model.
+> Before long training, run `tests/test_policy_contract.py` and the single-drone environment
+> checks. Use `check_policy_pipeline.py` with a short two-second checkpoint to check inference
+> parity and all four controlled landing targets. No hardware commands are sent by these checks.
+
 > **Repo layout (moved 2026-10-07):** the Isaac Lab **simulation** now lives in
 > `simulation_infra/` — prefix the paths in the steps below (`setup.sh`, `source/`,
 > `scripts/`, `policies/`, `assets/`, `policy_maker.md`) with `simulation_infra/`
@@ -269,7 +283,7 @@ grep -E "^\s*\[(ok|FAIL)|^== |zero |scripted " outputs/check_room.log
 python -u scripts/check_room_render.py > outputs/check_room_render.log 2>&1        # real localizer on sim renders
 python -u scripts/render_room_overview.py --out outputs/room_overview.png > outputs/room_overview.log 2>&1
 ```
-Pass: every line `[ok]` (61); `zero` 0% success, with landing / no-tag losses equal to -0.5 x
+Pass: every line `[ok]` (66; the Peer task: 35); `zero` 0% success, with landing / no-tag losses equal to -0.5 x
 the off-spot / tag-less drone-steps. Render check: every view `[ok]`; a
 `[WARN real localizer: ambiguous pose flip]` line is a finding about `positional.py`, not a sim failure.
 Train (detached; central, ~27 s per iteration at 512 envs on the RTX 5080, 1500 iterations ~11 h):
@@ -304,7 +318,7 @@ and no no-tag loss (the policy isn't flying); the landing loss runs. It gets one
 random (`spot_count`). Observation 25 = 24 + taking-off flag. Success: landed within 0.3 m of its spot.
 ```bash
 python -u scripts/check_room_env.py --headless --task AS-Tello-Room-Single-v0 > outputs/check_room_single.log 2>&1
-grep -E "^\s*\[(ok|FAIL)|^== |zero " outputs/check_room_single.log    # pass: every line [ok] (24)
+grep -E "^\s*\[(ok|FAIL)|^== |zero " outputs/check_room_single.log    # pass: every line [ok] (36)
 setsid nohup python -u scripts/sb3/train.py --task AS-Tello-Room-Single-v0 --headless --num_envs 512 --max_iterations 1500 > outputs/train_room_single.log 2>&1 &
 python -u scripts/record_room.py --task AS-Tello-Room-Single-v0 --out outputs/videos/room_single.mp4 > outputs/record_room_single.log 2>&1
 ```

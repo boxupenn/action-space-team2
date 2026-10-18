@@ -31,8 +31,8 @@ import argparse
 from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-parser.add_argument("--task", choices=["AS-Tello-Room-v0", "AS-Tello-Room-Single-v0"], default="AS-Tello-Room-v0")
-parser.add_argument("--test", choices=["geometry", "sensing", "commands", "motion", "baselines", "kalman", "central", "single", "search", "all"],
+parser.add_argument("--task", choices=["AS-Tello-Room-v0", "AS-Tello-Room-Single-v0", "AS-Tello-Room-Team-v0", "AS-Tello-Room-Peer-v0"], default="AS-Tello-Room-v0")
+parser.add_argument("--test", choices=["geometry", "sensing", "commands", "motion", "baselines", "kalman", "central", "single", "team", "curriculum", "precision", "search", "all"],
                     default="all")
 parser.add_argument("--num_envs", type=int, default=256)
 parser.add_argument("--episodes", type=int, default=256)
@@ -43,15 +43,15 @@ simulation_app = app_launcher.app
 
 import math  # noqa: E402
 
+import action_space_kit.tasks  # noqa: E402, F401
 import gymnasium as gym  # noqa: E402
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
-
-import action_space_kit.tasks  # noqa: E402, F401
 from action_space_kit.control import load_motion_fit  # noqa: E402
 from action_space_kit.tasks.direct.tello_room.tello_room_env import _yaw_of  # noqa: E402
 from action_space_kit.tags.sensing import blur_loss, camera_axes, decode_rate, sighting  # noqa: E402
 from isaaclab.utils.math import matrix_from_quat  # noqa: E402
+
 from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry  # noqa: E402
 
 FAILURES: list[str] = []
@@ -226,6 +226,59 @@ def test_sensing(env, u) -> None:
 
 
 def test_commands(env, u) -> None:
+    if u.cfg.reward_version == 1:
+        test_commands_legacy(env, u)
+        return
+    print("\n== version 2 commands and rewards ==")
+    fresh_start(u)
+    finite, integer = True, True
+    for _ in range(40):
+        actions = {k: torch.randn(u.num_envs, 5, device=u.device).clamp(-1, 1) for k in u.cfg.possible_agents}
+        _, reward, _, _, _ = env.step(actions)
+        finite &= all(bool(torch.isfinite(r).all()) for r in reward.values())
+        finite &= all(bool(torch.isfinite(r).all()) for r in u._ep_rew.values())
+        integer &= bool(((u.last_rc == u.last_rc.round()) & (u.last_rc.abs() <= 100)).all())
+    check(finite, "all reward terms stay finite, including outside the slowdown zone")
+    check(integer, "all actions map to integer RC inside the configured range")
+    fresh_start(u)
+    for _ in range(u.cfg.land_confirm_steps):
+        env.step(sticks(u, (0, 0, 0, 0), land=True))
+    expected = u.cfg.rew_early_land * u.cfg.num_drones
+    check(bool(torch.allclose(u._ep_rew["early_land_loss"],
+                              torch.full_like(u._ep_rew["early_land_loss"], expected))),
+          "confirmed pre-waypoint land requests retain their penalty")
+    fresh_start(u)
+    u.at_waypoint[:] = True  # historical entry must NOT authorize land back at the start
+    for _ in range(10):
+        env.step(sticks(u, (0, 0, 0, 0), land=True))
+    check(not bool(u.landing.any()), "latched waypoint plus current off-target pose blocks landing")
+    check(bool((u._ep_rew["early_land_loss"] == 0).all()),
+          "post-waypoint requests can wait for the gate without repeated request penalties")
+    for auto in (False, True):
+        previous_auto = u.cfg.auto_land
+        u.cfg.auto_land = auto
+        fresh_start(u)
+        u.at_waypoint[:] = True
+        u.pub_pos[:] = u._spots + u._wp_offset
+        u.acquired[:] = u.fresh[:] = True
+        u.lost[:] = u.taking_off[:] = False
+        u.fix_age[:] = 0
+        u.kf.v[:] = 0
+        u.kf.a[:] = .005
+        u.kf.c[:] = .04
+        for i in range(int(math.ceil(u.cfg.land_dwell_s / u.step_dt))):
+            u._pre_physics_step(sticks(u, (0, 0, 0, 0), land=True))
+            if (i+1)*u.step_dt < u.cfg.land_dwell_s:
+                check(not bool(u.landing.any()), f"auto_land={auto}: no land before dwell, tick {i+1}")
+        # Confirmed requests can have had their vote counter reset while the gate was closed.
+        for _ in range(u.cfg.land_confirm_steps):
+            u._pre_physics_step(sticks(u, (0, 0, 0, 0), land=True))
+        check(bool(u.landing.all()), f"auto_land={auto}: current settled, confident pose permits landing")
+        u.cfg.auto_land = previous_auto
+    fresh_start(u)
+
+
+def test_commands_legacy(env, u) -> None:
     print("\n== commands (real Tello SDK: rc -100..100 per channel, land) ==")
     lo, hi = u.rc.lo.tolist(), u.rc.hi.tolist()
     print("  range: " + ", ".join(f"{ch} {int(a):+d}..{int(b):+d}" for ch, a, b in zip(("right", "forward", "up", "yaw"), lo, hi)))
@@ -481,7 +534,8 @@ def test_baselines(env, u, episodes: int) -> None:
             totals["no_tag"] += u.outcome_rew["no_tag_loss"][idx].sum().item()
             totals["crash"] += u.outcome_rew["crash_loss"][idx].sum().item()
             parts = sum(u.outcome_rew[k][idx] for k in u.REWARD_TERMS if k != "total")
-            err = (parts - u.outcome_rew["total"][idx]).abs()
+            # relative: float32 sums of ~15 terms over ~1000 steps drift ~1e-5 of the episode total
+            err = (parts - u.outcome_rew["total"][idx]).abs() / (u.outcome_rew["total"][idx].abs() + 1.0)
             err = torch.where(torch.isfinite(err), err, torch.full_like(err, float("inf")))  # NaN: a failure, not 0
             totals["terms_err"] = max(totals.get("terms_err", 0.0), err.max().item())
             totals["time"] += u.outcome_time[idx].sum().item()
@@ -493,8 +547,8 @@ def test_baselines(env, u, episodes: int) -> None:
     print(f"  zero     : success {m['success']:.0%}, time {m['time']:.1f} s, landing loss {m['landing']:.0f}, "
           f"no-tag loss {m['no_tag']:.0f}, crash loss {m['crash']:.0f}  ({done_count} episodes)")
     check(m["success"] == 0.0, f"zero sticks never succeed ({m['success']:.0%})")
-    check(totals.get("terms_err", 0.0) < 1e-2, f"the {len(u.REWARD_TERMS) - 1} logged reward terms add up to the total reward "
-          f"(worst episode mismatch {totals.get('terms_err', 0.0):.1e})")
+    check(totals.get("terms_err", 0.0) < 1e-4, f"the {len(u.REWARD_TERMS) - 1} logged reward terms add up to the total reward "
+          f"(worst episode mismatch {totals.get('terms_err', 0.0):.1e} of the episode total)")
     # counts are read after the auto-reset, so an episode's last step may differ by 1 per drone
     slack = 0.5 * u.cfg.num_drones + 1e-3
     check(abs(m["landing"] - u.cfg.rew_time * m["off"]) <= slack,
@@ -641,8 +695,9 @@ def test_single(env, u) -> None:
         obs = env.step(push)[0]["drone_0"]
     check(torch.allclose(obs[:, -1], u.taking_off[:, 0].float()), "the observation's last number is the taking-off flag")
     ep = u._ep_rew
-    check(ep["closer_reward"].abs().max().item() < 1e-6 and ep["no_tag_loss"].abs().max().item() < 1e-6,
-          "takeoff steps pay no closer reward and no no-tag loss (the firmware is flying)")
+    check((cfg.reward_version >= 2 or ep["closer_reward"].abs().max().item() < 1e-6)
+          and ep["no_tag_loss"].abs().max().item() < 1e-6,
+          "takeoff pays no no-tag loss (version 2 retains consistent potential shaping)")
     check(torch.allclose(ep["landing_loss"], torch.full_like(ep["landing_loss"], 5 * cfg.rew_time)),
           f"... but the landing loss runs ({ep['landing_loss'].mean():.1f} after 5 steps)")
     check(not u.landing.any().item(), "land asked for during takeoff is not sent")
@@ -673,6 +728,127 @@ def test_single(env, u) -> None:
     check(moved > 0.2, f"after takeoff the sticks fly it (rc forward 50 for 1.5 s: {moved:.2f} m toward tag 10)")
 
 
+def test_curriculum(env, u):
+    print("\n== mixed-start curriculum ==")
+    cfg = u.cfg
+    cfg.spawn_short_fraction, cfg.spawn_hover_fraction = 0.30, 0.15
+    try:
+        fresh_start(u)
+        pos, kinds = u._positions().clone(), u._start_kind.clone()
+        full, short, hover = kinds == 0, kinds == 1, kinds == 2
+        check(all(bool(mask.any()) for mask in (full, short, hover)), "all three start modes are sampled")
+        r = torch.linalg.norm(pos[full, :, :2], dim=-1)
+        check(bool(((r >= 6) & (r <= 7)).all()), "configured episodes retain the full 6-7 m start")
+        check(bool((u.taking_off[~hover]).all()) and not bool(u.taking_off[hover].any()),
+              "full and short approaches start with takeoff; hover replay starts airborne")
+        check(bool(((pos[hover, :, :2] - u._spots[hover, :, :2]).abs() <= .10001).all()),
+              "hover replay starts within 10 cm per axis of its own assigned pad")
+        check(bool(((pos[short, :, 0] >= 1.5) & (pos[short, :, 0] <= 5.5)).all()),
+              "short approaches cover the configured intermediate distances")
+        initial = u._start_positions.clone()
+        u.episode_length_buf[:] = u.max_episode_length - 2
+        obs, _, _, _, info = env.step(sticks(u, (0, 0, 0, 0)))
+        records = info["episode_records"]
+        names = ("configured", "short_approach", "hover_landing")
+        check(len(records) == u.num_envs and all(
+            row["start_kind"] == names[int(kinds[row["env_id"]])]
+            and np.allclose(row["start_positions"], initial[row["env_id"]].cpu().numpy())
+            for row in records), "terminal records retain the finished episode's start mode and pose")
+        check(obs["drone_0"].shape == (u.num_envs, 25), "mixed starts preserve the 25-number observation")
+    finally:
+        cfg.spawn_short_fraction = cfg.spawn_hover_fraction = 0.0
+        fresh_start(u)
+
+
+def test_precision(env, u):
+    print("\n== continuous precision shaping ==")
+    cfg = u.cfg
+    fields = {"rew_precision_potential": 80., "rew_settle_position": 0., "rew_settle_speed": 0.,
+              "spawn_short_fraction": .3, "spawn_hover_fraction": .15}
+    original = {key: getattr(cfg, key) for key in fields}
+    try:
+        for key, value in fields.items():
+            setattr(cfg, key, value)
+        fresh_start(u)
+        initial = u._potential(u._positions())
+        check(torch.allclose(u._prev_potential, initial, atol=1e-4),
+              "reset potential matches the actual state for all start modes")
+        u.at_waypoint[:] = True
+        check(torch.equal(initial, u._potential(u._positions())),
+              "latching the waypoint introduces no new precision cost")
+        finite = True
+        for _ in range(40):
+            obs, reward, _, _, _ = env.step(sticks(u, (0, 0, 0, 0)))
+            finite &= all(bool(torch.isfinite(v).all()) for v in (*obs.values(), *reward.values()))
+        check(finite, "precision shaping produces finite observations and rewards")
+        check(bool((u._ep_rew["settling_loss"] == 0).all()), "milestone-triggered settling costs are disabled")
+        ids = torch.arange(0, u.num_envs, 2, device=u.device)
+        u._reset_idx(ids)
+        check(torch.allclose(u._prev_potential[ids], u._potential(u._positions())[ids], atol=1e-4),
+              "partial resets initialize precision potential from reset pose and zero velocity")
+    finally:
+        for key, value in original.items():
+            setattr(cfg, key, value)
+        fresh_start(u)
+
+
+def test_team(env, u):
+    print("\n== simultaneous four-drone floor starts ==")
+    fresh_start(u)
+    check(u.cfg.num_drones == 4 and u.taking_off.all().item(), "all four drones begin takeoff together")
+    initial = u._positions().clone()
+    check(torch.allclose(initial[..., 2], torch.full_like(initial[..., 2], u.cfg.rest_height)),
+          "all drones start on the floor")
+    width = 48 if u.cfg.peer_observations else 25
+    check(all(value.shape == (u.num_envs, width) for value in u._get_observations().values()),
+          f"each drone has its expected {width}-feature observation")
+    ended = torch.zeros(u.num_envs, dtype=torch.bool, device=u.device)
+    for _ in range(int(5.0 / u.step_dt)):
+        env.step(sticks(u, (0, 0, 0, 0)))
+        ended |= u.outcome_valid
+    check(not u.taking_off.any().item() and not ended.any().item(),
+          "all four simultaneous takeoffs finish without an episode ending")
+    check((torch.linalg.norm(u._positions()[..., :2] - initial[..., :2], dim=-1) < .15).all().item(),
+          "simultaneous takeoff retains horizontal separation")
+    # Deliberately place one pair too close in room 0: collision termination must
+    # affect that whole room, but not neighboring vectorized simulation rooms.
+    pose = u._drones[1].data.root_state_w[:1, :7].clone()
+    pose[0, :3] = u._drones[0].data.root_pos_w[0] + torch.tensor([.20, 0., 0.], device=u.device)
+    u._drones[1].write_root_pose_to_sim(pose, env_ids=torch.tensor([0], device=u.device))
+    done, _ = u._get_dones()
+    check(all(value[0].item() for value in done.values()) and u.outcome_collision[0].item(),
+          "a pair inside 25 cm terminates the whole joint episode")
+    check(not u.outcome_collision[1:].any().item(), "collision is confined to its own simulation room")
+    fresh_start(u)
+    records = u.extras["episode_records"]
+    check(len(records) == 1 and abs(records[0]["metrics"]["Episode/min_separation_m"] - .20) < .001,
+          "the completed collision episode retains its actual minimum separation")
+    check(records[0]["metrics"]["Episode/timeout_rate"] == 0., "collision termination is not counted as a timeout")
+    u.episode_length_buf[:] = u.max_episode_length - 2
+    env.step(sticks(u, (0, 0, 0, 0)))
+    records = u.extras["episode_records"]
+    check(len(records) == u.num_envs and all(row["metrics"]["Episode/timeout_rate"] == 1. for row in records),
+          "every forced timeout is retained in the completed episode records")
+    fresh_start(u)
+    if u.cfg.collision_substeps:
+        # A pair passes inside the limit and separates before the next RC update.
+        # The per-physics-step detector must retain that violation and minimum.
+        pose = u._drones[1].data.root_state_w[:1, :7].clone()
+        original = pose.clone()
+        pose[0, :3] = u._drones[0].data.root_pos_w[0] + torch.tensor([.20, 0., 0.], device=u.device)
+        ids = torch.tensor([0], device=u.device)
+        u._drones[1].write_root_pose_to_sim(pose, env_ids=ids)
+        u._apply_action()
+        u._drones[1].write_root_pose_to_sim(original, env_ids=ids)
+        done, _ = u._get_dones()
+        check(all(value[0].item() for value in done.values()) and u.outcome_collision[0].item(),
+              "a collision between RC updates remains a joint failure after the pair separates")
+        check(abs(float(u.outcome_min_sep[0]) - .20) < .001,
+              "minimum separation includes physics substeps between RC updates")
+        fresh_start(u)
+        check(not u._substep_collision.any().item(), "substep collision state clears on reset")
+
+
 def main():
     cfg = load_cfg_from_registry(args_cli.task, "env_cfg_entry_point")
     cfg.scene.num_envs = args_cli.num_envs
@@ -683,11 +859,28 @@ def main():
     # never collide); geometry checks the configured spacing, test_search the rest
     search_prob, u.cfg.spawn_search_prob = u.cfg.spawn_search_prob, 0.0
     spawn_sep = u.cfg.spawn_min_separation
+    if args_cli.task in ("AS-Tello-Room-Team-v0", "AS-Tello-Room-Peer-v0"):
+        if args_cli.test in ("geometry", "all"):
+            test_geometry(u)
+        u.cfg.spawn_min_separation = max(spawn_sep, 0.5)
+        if args_cli.test in ("search", "all"):
+            test_search(env, u, search_prob, spawn_sep)
+        if args_cli.test in ("team", "all"):
+            test_team(env, u)
+        if args_cli.test in ("central", "all"):
+            test_central(env, u)
+        print("\n" + ("ALL CHECKS PASSED" if not FAILURES else f"{len(FAILURES)} CHECK(S) FAILED:\n  " + "\n  ".join(FAILURES)))
+        env.close()
+        return
     if cfg.num_drones == 1:
         if args_cli.test in ("search", "all"):
             test_search(env, u, search_prob, spawn_sep)
         if args_cli.test in ("single", "all"):
             test_single(env, u)
+        if args_cli.test in ("curriculum", "all"):
+            test_curriculum(env, u)
+        if args_cli.test in ("precision", "all"):
+            test_precision(env, u)
         if args_cli.test in ("kalman", "all"):
             test_kalman(env, u)
         if args_cli.test in ("baselines", "all"):
