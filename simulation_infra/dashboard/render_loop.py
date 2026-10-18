@@ -27,7 +27,7 @@ HERE = Path(__file__).resolve().parent
 SIM = HERE.parent
 SITE = HERE / "render_site"
 VIDEOS = SITE / "videos"
-TASKS = ("AS-Tello-Room-Single-v0", "AS-Tello-Room-v0")
+TASKS = ("AS-Tello-Room-Single-v0", "AS-Tello-Room-v0", "AS-Tello-Room-Peer-v0")
 
 ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 ap.add_argument("--poll", type=float, default=60.0, help="seconds between checks for a new checkpoint")
