@@ -16,7 +16,7 @@ view each pair from a few angles (30-50 deg off-axis views are the most accurate
 straight-on views of a far tag are ambiguous and get skipped).
 
   python map_tags.py --drone 4 --tags-list 10,1,2,3,4,8,9
-  python map_tags.py --drone 4 --tags-list 10,8,9 --tags tags.yaml --out map.yaml
+  python map_tags.py --drone 4 --tags-list 10,8,9          # writes config/map.yaml
 
 Output format = same as before (x right, y up, z out of the tag face; meters), so
 swarm_formation.py reads it directly. An existing map.yaml is backed up first.
@@ -33,6 +33,9 @@ import time
 import cv2
 import numpy as np
 import yaml
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "core"))
+from paths import CAMERA_DIR, DONGLES_PATH, MAP_PATH, TAGS_PATH, camera_file  # noqa: E402  (config/ lives in core)
 
 import swarm_formation as sf          # same connection / camera / tag-pose code
 
@@ -171,14 +174,13 @@ def save(builder, ids, path, sizes):
 
 
 def main():
-    here = os.path.dirname(os.path.abspath(__file__))
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--drone", type=int, required=True, help="drone number in dongles.json, e.g. 4")
     ap.add_argument("--tags-list", required=True, help="tag ids to map, e.g. 10,1,2,3,4,8,9")
-    ap.add_argument("--config", default=os.path.join(here, "dongles.json"))
-    ap.add_argument("--tags", default=os.path.join(here, "tags.yaml"), help="tag sizes (sizes_mm)")
-    ap.add_argument("--camera-dir", default=os.path.join(here, "camera"))
-    ap.add_argument("--out", default=os.path.join(here, "map.yaml"))
+    ap.add_argument("--config", default=str(DONGLES_PATH))
+    ap.add_argument("--tags", default=str(TAGS_PATH), help="tag sizes (sizes_mm)")
+    ap.add_argument("--camera-dir", default=str(CAMERA_DIR))
+    ap.add_argument("--out", default=str(MAP_PATH))
     args = ap.parse_args()
 
     ids = sorted({int(x) for x in args.tags_list.split(",") if x.strip()} | {TAG_ID})
@@ -194,7 +196,7 @@ def main():
     ent = next((e for e in data if int(e["number"]) == args.drone and e.get("ssid")), None)
     if ent is None:
         sys.exit(f"drone {args.drone} not in {args.config}")
-    K, D = sf.load_camera(os.path.join(args.camera_dir, f"tello_{args.drone}.yaml"))
+    K, D = sf.load_camera(str(camera_file(args.drone, args.camera_dir)))
     d = sf.Drone(args.drone, ent["iface"], ent["ssid"], K, D, False, {}, {}, None)   # fly=False
     print(f"MAPPING tags {ids} with drone {args.drone} (no flying). Origin = tag {TAG_ID}.")
     connect(d)

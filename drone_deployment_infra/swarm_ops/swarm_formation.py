@@ -22,8 +22,8 @@ Map check: whenever tag 10 and another tag are seen together, that tag's observe
 position is compared with the map; a tag that disagrees is switched off for the flight.
 
 DEFAULT IS DRY-RUN (no takeoff / no motion). --fly to fly.
-Needs next to this script: dongles.json, camera/tello_<n>.yaml; optional map.yaml +
-tags.yaml (without them: tag 10 only). Libs: numpy opencv-python pupil-apriltags av pyyaml
+Reads drone_deployment_infra/config/ via core/paths.py: dongles.json, camera/tello_<n>.yaml
+(default.yaml if uncalibrated), map.yaml + tags.yaml (--no-map: tag 10 only). Libs: numpy opencv-python pupil-apriltags av pyyaml
 
   python swarm_formation.py --only 3                 # dry-run
   python swarm_formation.py --only 1,3,5 --fly
@@ -47,6 +47,9 @@ from itertools import permutations
 import cv2
 import numpy as np
 import yaml
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "core"))
+from paths import CAMERA_DIR, DONGLES_PATH, MAP_PATH, TAGS_PATH, camera_file  # noqa: E402  (config/ lives in core)
 
 # ======================= SETTINGS =======================
 TAG_ID = 10
@@ -820,7 +823,7 @@ def load_drones(cfg, only, cam_dir, fly, tag_map, sizes, mapcheck):
     for e in entries:
         n = int(e["number"])
         try:
-            K, D = load_camera(os.path.join(cam_dir, f"tello_{n}.yaml"))
+            K, D = load_camera(str(camera_file(n, cam_dir)))
         except Exception as ex:
             bad.append(f"drone{n}: {ex}")
             continue
@@ -898,15 +901,11 @@ def vert_to(err_m):
 
 def main():
     global HEIGHT_OFFSET_M, ARC_RADIUS_M
-    here = os.path.dirname(os.path.abspath(__file__))
-    cam_default = os.path.join(here, "camera")
-    if not os.path.isdir(cam_default):
-        cam_default = os.path.join(here, "..", "config", "camera")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--config", default=os.path.join(here, "dongles.json"))
-    ap.add_argument("--camera-dir", default=cam_default)
-    ap.add_argument("--map", default=os.path.join(here, "map.yaml"))
-    ap.add_argument("--tags", default=os.path.join(here, "tags.yaml"))
+    ap.add_argument("--config", default=str(DONGLES_PATH))
+    ap.add_argument("--camera-dir", default=str(CAMERA_DIR))
+    ap.add_argument("--map", default=str(MAP_PATH))
+    ap.add_argument("--tags", default=str(TAGS_PATH))
     ap.add_argument("--no-map", action="store_true", help="use tag 10 only")
     ap.add_argument("--ignore-tags", default="", help="mapped tags to ignore, e.g. 6,7")
     ap.add_argument("--only", default="", help="e.g. 3 or 1,3,5")
@@ -945,6 +944,7 @@ def main():
             d.close()
         sys.exit("Preflight FAILED -> nothing takes off.")
 
+    here = os.path.dirname(os.path.abspath(__file__))
     os.makedirs(os.path.join(here, "logs"), exist_ok=True)
     logf = open(os.path.join(here, time.strftime("logs/formation_%Y%m%d_%H%M%S.csv")), "w", newline="")
     log = csv.writer(logf)

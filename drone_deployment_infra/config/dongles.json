@@ -14,8 +14,8 @@
       "number": 2,
       "iface": "wlx58d8125edaa6",
       "mac": "58:d8:12:5e:da:a6",
-      "drone": "",
-      "ssid": "",
+      "drone": "TELLO-2",
+      "ssid": "TELLO-2",
       "video_port": 17002,
       "note": ""
     },
@@ -50,8 +50,8 @@
       "number": 6,
       "iface": "wlx6c4cbce335cf",
       "mac": "6c:4c:bc:e3:35:cf",
-      "drone": "",
-      "ssid": "",
+      "drone": "TELLO-6",
+      "ssid": "TELLO-6",
       "video_port": 17006,
       "note": ""
     },
@@ -59,8 +59,8 @@
       "number": 7,
       "iface": "wlx6c4cbce344fc",
       "mac": "6c:4c:bc:e3:44:fc",
-      "drone": "",
-      "ssid": "",
+      "drone": "TELLO-7",
+      "ssid": "TELLO-7",
       "video_port": 17007,
       "note": ""
     },
@@ -68,8 +68,8 @@
       "number": 8,
       "iface": "wlx58d8125ec53b",
       "mac": "58:d8:12:5e:c5:3b",
-      "drone": "",
-      "ssid": "",
+      "drone": "TELLO-8",
+      "ssid": "TELLO-8",
       "video_port": 17008,
       "note": ""
     },

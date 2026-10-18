@@ -4,8 +4,9 @@
     python export_policy_pt.py --checkpoint RUN/model_N_steps.zip --out some_dir
 
 The output folder holds policy.pt plus the checkpoint's params/ and assets/ (manifest, room
-snapshot, motion fit), so swarm_policy.py --checkpoint <out>/policy.pt runs it with torch only:
-no stable-baselines3 and no custom policy classes on the laptop.
+snapshot, motion fit), so a laptop can run the policy with torch only: no stable-baselines3
+and no custom policy classes (load it with torch.jit.load; see core/room_policy.py for the
+observation and landing gate it expects).
 
 policy.pt maps a NORMALIZED frame-stacked history [N, obs_dim] to the deterministic action
 [N, act_dim], clipped to the action space exactly as PPO.predict does. The per-frame

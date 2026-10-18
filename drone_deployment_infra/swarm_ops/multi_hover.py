@@ -10,7 +10,7 @@ Safety:
 - Any takeoff failure, lost link, low battery or Ctrl+C -> land ALL.
 
 Usage:
-  python multi_hover.py --config dongles.json --only 1,3,4,5 --hover 10
+  python multi_hover.py --only 1,3,4,5 --hover 10      # dongles from config/dongles.json
 """
 import argparse
 import json
@@ -19,6 +19,10 @@ import subprocess
 import sys
 import threading
 import time
+import os
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "core"))
+from paths import DONGLES_PATH  # noqa: E402  (config/ lives in core)
 
 DRONE_ADDR = ("192.168.10.1", 8889)
 SO_BINDTODEVICE = getattr(socket, "SO_BINDTODEVICE", 25)
@@ -194,7 +198,7 @@ def land_all(drones):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", required=True, help="dongles JSON")
+    ap.add_argument("--config", default=str(DONGLES_PATH), help="dongles JSON (default config/dongles.json)")
     ap.add_argument("--only", default="", help="e.g. 1,3,4,5 (default: all with ssid)")
     ap.add_argument("--hover", type=float, default=10, help="hover seconds")
     args = ap.parse_args()
