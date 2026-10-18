@@ -68,7 +68,7 @@ from positional_kalman_filter import KalmanCfg, KalmanCV  # noqa: E402
 from room_policy import RoomPolicy, camera_pose_to_world  # noqa: E402
 from swarm_approach import Drone, iface_ip, parallel, preflight  # noqa: E402
 
-DEFAULT_CHECKPOINT = REPO / "simulation_infra/outputs/qualified_four_drone_policy_pt/policy.pt"
+DEFAULT_CHECKPOINT = REPO / "simulation_infra/policies/peer_qualified_84M/pt/policy.pt"
 DONGLES = DD_ROOT / "config" / "dongles.json"
 RECORDINGS = DD_ROOT / "recordings"
 
@@ -147,7 +147,8 @@ class PolicyDrone(Drone):
     """swarm_approach.Drone with the room localizer instead of the tag-10-only solver."""
 
     def __init__(self, name, num, iface, ssid, fly, cfg):
-        super().__init__(num, iface, ssid, None, None, fly)
+        # K, D, tag_map, sizes, det_opts feed swarm_approach's own tag-10 solver, replaced below
+        super().__init__(num, iface, ssid, None, None, fly, None, None, None)
         self.name = name
         self.cfg = cfg
         self.positioner = Positioner(f"tello_{num}")

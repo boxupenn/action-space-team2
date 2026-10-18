@@ -1,6 +1,6 @@
 """Export a room checkpoint (model.zip + VecNormalize) to a self-contained TorchScript folder.
 
-    python export_policy_pt.py                       # qualified 4-drone policy -> <its folder>_pt/
+    python export_policy_pt.py                       # qualified 4-drone policy -> <its folder>/pt/
     python export_policy_pt.py --checkpoint RUN/model_N_steps.zip --out some_dir
 
 The output folder holds policy.pt plus the checkpoint's params/ and assets/ (manifest, room
@@ -31,7 +31,7 @@ sys.path.insert(0, str(REPO / "drone_deployment_infra"))
 sys.path.insert(0, str(REPO / "drone_deployment_infra/core"))
 from room_policy import RoomPolicy  # noqa: E402
 
-DEFAULT_CHECKPOINT = REPO / "simulation_infra/outputs/qualified_four_drone_policy/model.zip"
+DEFAULT_CHECKPOINT = REPO / "simulation_infra/policies/peer_qualified_84M/model.zip"
 
 
 class Exported(torch.nn.Module):
@@ -60,10 +60,10 @@ class Exported(torch.nn.Module):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--checkpoint", default=str(DEFAULT_CHECKPOINT))
-    ap.add_argument("--out", help="output folder (default: <checkpoint folder>_pt)")
+    ap.add_argument("--out", help="output folder (default: <checkpoint folder>/pt)")
     args = ap.parse_args()
     ckpt = Path(args.checkpoint).resolve()
-    out = Path(args.out).resolve() if args.out else ckpt.parent.with_name(ckpt.parent.name + "_pt")
+    out = Path(args.out).resolve() if args.out else ckpt.parent / "pt"
 
     ref = RoomPolicy(ckpt)  # same loading + contract checks as deployment
     model, norm = ref.model, ref.normalizer
