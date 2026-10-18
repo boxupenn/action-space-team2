@@ -79,6 +79,10 @@ MAX_RC_YAW = 25
 DEADBAND_POS_M = 0.05
 DEADBAND_YAW_DEG = 3.0
 MIN_RC = 8
+MIN_RC_XY = 14               # near the slot: smaller horizontal rc doesn't move a Tello
+KI_POS = 15.0                # rc per (m * s): builds up if the drone stays off its slot
+I_ZONE_M = 0.5               # integral only active this close to the slot
+I_MAX_RC = 10                # integral contribution cap
 POSE_ALPHA = 0.35
 
 ALIGN_H_M = 0.15
@@ -110,6 +114,30 @@ MAX_SINGLE_ERR_PX = 3.0
 JOINT_MAX_RMS_PX = 3.0
 MAPCHECK_M = 0.15            # observed vs mapped tag position disagreement limit
 MAPCHECK_MIN_BAD = 5
+
+# --- --fast profile: overrides applied when --fast is given -------------------
+FAST = dict(                 # tuned from logs 2026-10-17 (normal mode: 52-70 s to formation)
+    TAKEOFF_STAGGER_S=0.2,   # was 0.5
+    START_HEIGHT_CM=155,     # was 170   formation settled at ~156 cm (tag 10 center)
+    LOOK_S=0.8,              # was 2.0   first look before turning
+    SEARCH_LOOK_S=0.4,       # was 0.8   pause after each search turn
+    SEARCH_STEP_DEG=30,      # was 20    camera sees ~54 deg, steps still overlap
+    SEARCH_YAW_RC=70,        # was 25    measured: rc 25 turned only ~10 deg/s
+    WAIT_ALL_S=0.0,          # was 6     approach as soon as localized (re-matched on join)
+    ALIGN_TIMEOUT_S=0.0,     # was 6     height is fixed while approaching instead
+    MAX_RC_XY=35,            # was 15    far: fast; near the slot speed = KP_POS*dist (unchanged)
+    MAX_RC_Z=50,             # was 20    measured: rc 20 climbed only ~7.5 cm/s
+    MAX_RC_YAW=60,           # was 25    big turns fast; small ones proportional (unchanged)
+    SETTLE_S=1.0,            # was 2
+)
+FLIP_CMD = "flip b"           # back flip = away from tag 10 and from the neighbours
+FLIP_MIN_BATTERY = 55        # Tello refuses flips below 50 %
+FLIP_GRACE_S = 3.0           # after a flip, losing the tags is expected (no freeze/land)
+FLIP_RETURN_TIMEOUT_S = 8.0  # next drone flips once this one is back in its slot (or after this)
+CAUTIOUS_RC_XY = 15          # after a tag loss while moving: this cap for SLOW_AFTER_LOSS_S
+SLOW_AFTER_LOSS_S = 3.0
+SPEED_BUBBLE_M = 0.20        # extra spacing around a drone moving at full fast speed
+TAKEOFF_STAGGER_S = 0.5
 
 MIN_BATTERY_FLY = 40
 LAND_BATTERY = 15
@@ -177,13 +205,18 @@ def face_tag_yaw(p):
     return math.degrees(math.atan2(-p[0], -p[2]))
 
 
-def control(p, psi, target, others):
-    """rc toward target, facing tag 10, with spacing. others: [(p, extra_radius)]."""
+def control(p, psi, target, others, cap=None, integ=None):
+    """rc toward target, facing tag 10, with spacing. others: [(p, extra_radius)].
+    cap: horizontal speed limit (default MAX_RC_XY). Near the target the speed is
+    KP_POS * distance, so precision close in does not depend on the cap."""
+    cap = MAX_RC_XY if cap is None else cap
     e = target - p
     e_yaw = wrap_deg(face_tag_yaw(p) - psi)
     if np.linalg.norm(e) < DEADBAND_POS_M:
         e = np.zeros(3)
     v = KP_POS * e
+    if integ is not None:
+        v = v + KI_POS * integ
     scale, rep = 1.0, np.zeros(3)
     for q, extra in others:
         dv = np.array([p[0] - q[0], 0.0, p[2] - q[2]])
@@ -202,14 +235,14 @@ def control(p, psi, target, others):
             v = v + inward * u
         v = v + 10.0 * u
     nxz = math.hypot(v[0], v[2])
-    if nxz > MAX_RC_XY:
-        v[0], v[2] = v[0] * MAX_RC_XY / nxz, v[2] * MAX_RC_XY / nxz
+    if nxz > cap:
+        v[0], v[2] = v[0] * cap / nxz, v[2] * cap / nxz
     v[1] = float(np.clip(v[1], -MAX_RC_Z, MAX_RC_Z))
     s, c = math.sin(math.radians(psi)), math.cos(math.radians(psi))
     fwd, right, up = v[0] * s + v[2] * c, v[0] * c - v[2] * s, -v[1]
     mag = math.hypot(fwd, right)
-    if 0.5 < mag < MIN_RC:                       # too small to move a Tello: scale up
-        fwd, right = fwd * MIN_RC / mag, right * MIN_RC / mag
+    if 0.5 < mag < MIN_RC_XY:                    # too small to move a Tello: scale up
+        fwd, right = fwd * MIN_RC_XY / mag, right * MIN_RC_XY / mag
     yaw = 0.0 if abs(e_yaw) < DEADBAND_YAW_DEG else float(np.clip(KP_YAW * e_yaw, -MAX_RC_YAW, MAX_RC_YAW))
     return tuple(int(round(x)) for x in (right, fwd, up, yaw)), float(np.linalg.norm(target - p)), e_yaw
 
@@ -566,6 +599,15 @@ class Drone:
         self.dry_noted = False
         self.last_status = 0.0
         self.last_err = (None, None)
+        self.slow_until = 0.0        # cautious speed after a tag loss
+        self.flipping = False
+        self.flip_done = False
+        self.flip_end = 0.0
+        self.grace_until = 0.0       # tag loss tolerated until this time (after a flip)
+        self.integ = np.zeros(3)     # integral of slot error (tag frame), near the slot
+        self.integ_slot = None
+        self.integ_t = None
+        self.last_rc = (0, 0, 0, 0)
 
     def _sock(self, port):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -581,7 +623,7 @@ class Drone:
         if cmd in NOFLY:
             return
         if self.fly:
-            if cmd in ("takeoff", "land", "emergency"):
+            if cmd in ("takeoff", "land", "emergency", FLIP_CMD):
                 return
             m = RC_RE.match(cmd)
             if m and all(abs(int(x)) <= 100 for x in m.groups()):
@@ -719,7 +761,7 @@ class Drone:
 
     def perception_loop(self):
         from pupil_apriltags import Detector
-        det = Detector(families="tag36h11", nthreads=1, quad_decimate=1.0, refine_edges=True,
+        det = Detector(families="tag36h11", nthreads=1, quad_decimate=2.0, refine_edges=True,
                        decode_sharpening=0.25)
         last = 0
         while not self.stop.is_set():
@@ -901,6 +943,7 @@ def vert_to(err_m):
 
 def main():
     global HEIGHT_OFFSET_M, ARC_RADIUS_M
+    g = globals()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=str(DONGLES_PATH))
     ap.add_argument("--camera-dir", default=str(CAMERA_DIR))
@@ -909,16 +952,24 @@ def main():
     ap.add_argument("--no-map", action="store_true", help="use tag 10 only")
     ap.add_argument("--ignore-tags", default="", help="mapped tags to ignore, e.g. 6,7")
     ap.add_argument("--only", default="", help="e.g. 3 or 1,3,5")
-    ap.add_argument("--start-height", type=int, default=START_HEIGHT_CM)
+    ap.add_argument("--start-height", type=int, default=None,
+                    help=f"climb to this after takeoff, cm (default {START_HEIGHT_CM}, fast 155)")
     ap.add_argument("--slot-offset", type=int, default=0, help="slot height vs tag 10 center, cm")
     ap.add_argument("--radius", type=float, default=ARC_RADIUS_M, help="slot distance from tag 10, m")
     ap.add_argument("--hold", type=float, default=5.0)
+    ap.add_argument("--fast", action="store_true", help="fast profile (see FAST in settings)")
+    ap.add_argument("--flip", action="store_true",
+                    help="once in formation, each drone does a back flip (one at a time), then holds")
     ap.add_argument("--fly", action="store_true", help="actually fly (default dry-run)")
     args = ap.parse_args()
     ARC_RADIUS_M = max(0.9, args.radius)
     HEIGHT_OFFSET_M = args.slot_offset / 100.0
+    if args.fast:
+        g.update(FAST)
+        print("FAST profile: " + ", ".join(f"{k}={v}" for k, v in FAST.items()))
     fly = args.fly
-    start_h = max(60, min(250, args.start_height))
+    start_h = max(60, min(250, args.start_height if args.start_height is not None
+                          else globals()["START_HEIGHT_CM"]))
     only = {int(x) for x in args.only.split(",") if x.strip()}
     print(f"MODE: {'FLY' if fly else 'DRY-RUN (no takeoff, no motion)'}")
 
@@ -961,19 +1012,28 @@ def main():
                 d.airborne = True
 
             def to(d):
-                time.sleep(0.5 * drones.index(d))
+                time.sleep(TAKEOFF_STAGGER_S * drones.index(d))
+                d.to_state = "pending"
+                ok = False
                 for _ in range(2):
                     if d.send("takeoff", 20) == "ok":
-                        return True
+                        ok = True
+                        break
                     time.sleep(1.0)
                     h = re.sub(r"[^0-9]", "", d.send("height?", 5))
                     if h and int(h) >= 3:
                         d.log(f"takeoff reply lost but airborne ({h} dm) -> ok")
-                        return True
-                return False
-            if not all(parallel(drones, to).values()):
-                print("A takeoff failed -> landing all")
-                return
+                        ok = True
+                        break
+                if d.to_state != True:
+                    d.to_state = ok
+            # each drone starts its mission the moment ITS takeoff is done (no waiting)
+            for d in drones:
+                d.to_state, d.h_ok_since = None, None
+                threading.Thread(target=to, args=(d,), daemon=True).start()
+        else:
+            for d in drones:
+                d.to_state = True
         t0 = time.time()
         for d in drones:
             d.sub_t, d.yaw_acc = t0, 0.0
@@ -996,7 +1056,9 @@ def main():
                     if e is None or now - o.seen_t > 15:
                         continue
                     age = now - o.seen_t
-                    out.append((e[0], 0.0 if age < FIX_FRESH_S else LOST_DRIFT_MPS * age))
+                    spd = math.hypot(o.last_rc[0], o.last_rc[1])
+                    fast_extra = SPEED_BUBBLE_M * min(1.0, max(0.0, (spd - CAUTIOUS_RC_XY) / 20.0))
+                    out.append((e[0], (0.0 if age < FIX_FRESH_S else LOST_DRIFT_MPS * age) + fast_extra))
                     if o.ref_id in tag_map:
                         cones.append((e[0], tag_map[o.ref_id][1], sizes[o.ref_id] / 2))
                 return out, cones
@@ -1006,17 +1068,43 @@ def main():
                     d.last_status = now
                     d.log(msg)
 
+            if any(d.to_state is False for d in drones):
+                print("A takeoff failed -> landing all")
+                return
             for d in active:
+                if d.to_state is not True:
+                    hh = d._stv("h")                      # airborne already? (status stream)
+                    if d.to_state == "pending" and hh is not None and hh >= 60:
+                        d.h_ok_since = d.h_ok_since or now
+                        if now - d.h_ok_since > 0.5:
+                            d.to_state = True
+                    if d.to_state is True:
+                        d.sub_t, d.yaw_acc = now, 0.0
+                        d.log("airborne -> climbing/searching now")
+                    else:
+                        cmds[d.num] = None                # still taking off: send nothing
+                        all_in = False
+                        continue
+                if d.flipping:                             # mid-flip: hands off
+                    cmds[d.num] = None
+                    all_in = False
+                    continue
                 if d.battery is not None and d.battery < LAND_BATTERY:
                     land_async(d, f"battery {d.battery}%", fly)
                 fx = d.has_fix(now)
                 if d.was_fix and not fx:
                     d.log(f"lost tags in {d.state}: {d.reason}")
+                    if d.state == "APPROACH":
+                        d.slow_until = now + SLOW_AFTER_LOSS_S
                 d.was_fix = fx
                 h = d.height_cm()
                 e = d.est(now)
 
                 # ---------- CLIMB ----------
+                if d.state == "CLIMB" and fx and args.fast:
+                    d.state, d.lock_t = "LOCKED", now
+                    first_lock_t = first_lock_t or now
+                    d.log(f"LOCALIZED during climb from tags {d.tags_now} (ref {d.ref_id})")
                 if d.state == "CLIMB":
                     all_in = False
                     c = 0 if h is None else int(np.clip(KP_HEIGHT * (start_h - h), -MAX_RC_Z, MAX_RC_Z))
@@ -1057,10 +1145,14 @@ def main():
                         continue
 
                 # ---------- no tag in view (after localizing) ----------
+                if not fx and now < d.grace_until:          # just flipped: hover, reacquire
+                    all_in = False
+                    cmds[d.num] = (0, 0, 0, 0)
+                    continue
                 if not fx:
                     all_in = False
                     d.lost_t = d.lost_t or now
-                    lost = now - d.seen_t
+                    lost = now - max(d.seen_t, d.flip_end + FLIP_GRACE_S if d.flip_end else 0)
                     p, psi, _ = e
                     yaw, c = 0, 0
                     if d.state in ("LOCKED", "FACE10"):            # in-place turning allowed
@@ -1120,7 +1212,21 @@ def main():
                     continue
                 target = slots[assign[d.num]]
                 others, cones = others_of(d)
-                rc, _, _ = control(p, psi, target, others)
+                cap = CAUTIOUS_RC_XY if now < d.slow_until else MAX_RC_XY
+                e_h = np.array([target[0] - p[0], 0.0, target[2] - p[2]])
+                dist_h = float(np.linalg.norm(e_h))
+                if d.integ_slot != assign[d.num] or dist_h > I_ZONE_M:
+                    d.integ, d.integ_t = np.zeros(3), None            # reset
+                    d.integ_slot = assign[d.num]
+                elif dist_h > DEADBAND_POS_M:
+                    dt_i = 0.0 if d.integ_t is None else min(0.2, now - d.integ_t)
+                    d.integ = d.integ + e_h * dt_i
+                    lim = I_MAX_RC / KI_POS
+                    n_i = float(np.linalg.norm(d.integ))
+                    if n_i > lim:
+                        d.integ *= lim / n_i
+                d.integ_t = now
+                rc, _, _ = control(p, psi, target, others, cap, d.integ)
                 pe = float(math.hypot(target[0] - p[0], target[2] - p[2]))   # horizontal only
                 push = cone_push(p, cones)                         # stay out of others' view
                 if np.linalg.norm(push) > 0:
@@ -1183,8 +1289,44 @@ def main():
                 ok = all_in and members and all(d.state == "HOLDING" for d in active)
                 settle_t = (settle_t or now) if ok else None
                 if settle_t and now - settle_t > SETTLE_S:
-                    phase, hold_t = "HOLD", now
-                    print(f">>> formation reached, holding {args.hold:.0f}s")
+                    if args.flip:
+                        phase = "FLIP"
+                        flip_queue = sorted(active, key=lambda x: assign.get(x.num, 0))  # left -> right
+                        flip_cur = None
+                        print(">>> formation reached -> flip wave")
+                    else:
+                        phase, hold_t = "HOLD", now
+                        print(f">>> formation reached, holding {args.hold:.0f}s")
+            elif phase == "FLIP":
+                if flip_cur is not None and not flip_cur.flipping:     # wait until it's back
+                    back = flip_cur.has_fix(now) and flip_cur.ref_id == TAG_ID and \
+                        flip_cur.last_err[0] is not None and flip_cur.last_err[0] < TOL_POS_M
+                    if back or now - flip_cur.flip_end > FLIP_RETURN_TIMEOUT_S or flip_cur.landing:
+                        flip_cur = None
+                if flip_cur is None:
+                    flip_queue = [x for x in flip_queue if not x.landed and not x.landing]
+                    if not flip_queue:
+                        phase, hold_t = "HOLD", now
+                        print(f">>> flips done, holding {args.hold:.0f}s")
+                    else:
+                        flip_cur = flip_queue.pop(0)
+                        if not fly:
+                            flip_cur.log("would FLIP (dry-run)")
+                            flip_cur.flip_end = now
+                        elif flip_cur.battery is not None and flip_cur.battery < FLIP_MIN_BATTERY:
+                            flip_cur.log(f"battery {flip_cur.battery}% < {FLIP_MIN_BATTERY}% -> skipping flip")
+                            flip_cur.flip_end = now - FLIP_RETURN_TIMEOUT_S
+                        else:
+                            def do_flip(x=flip_cur):
+                                x.flipping = True
+                                x.send_noreply("rc 0 0 0 0")
+                                time.sleep(0.2)
+                                r = x.send(FLIP_CMD, 10)
+                                x.flip_end = time.time()
+                                x.grace_until = x.flip_end + FLIP_GRACE_S
+                                x.flipping = False
+                                x.flip_done = r == "ok"
+                            threading.Thread(target=do_flip, daemon=True).start()
             elif now - hold_t > args.hold:
                 print(">>> hold done -> landing all")
                 return
@@ -1192,8 +1334,11 @@ def main():
             # ---- send + show ----
             for d in active:
                 rc = cmds.get(d.num, (0, 0, 0, 0))
-                if fly:
+                if rc is None:                            # taking off: don't interfere
+                    rc = (0, 0, 0, 0)
+                elif fly:
                     d.send_noreply("rc %d %d %d %d" % rc)
+                d.last_rc = rc
                 e = d.est(now)
                 h = d.height_cm()
                 p = e[0] if e else (np.nan,) * 3
