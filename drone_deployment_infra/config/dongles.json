@@ -77,8 +77,8 @@
       "number": 9,
       "iface": "wlx58d8125eda77",
       "mac": "58:d8:12:5e:da:77",
-      "drone": "",
-      "ssid": "",
+      "drone": "TELLO-9",
+      "ssid": "TELLO-9",
       "video_port": 17009,
       "note": ""
     }

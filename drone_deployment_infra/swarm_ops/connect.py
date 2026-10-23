@@ -79,7 +79,7 @@ def main():
     ap.add_argument("drones", nargs="*", type=int, help="drone numbers, e.g. 5 8")
     ap.add_argument("--all", action="store_true", help="every drone with an ssid in dongles.json")
     ap.add_argument("--down", action="store_true", help="disconnect instead")
-    ap.add_argument("--config", default=os.path.join(HERE, "dongles.json"))
+    ap.add_argument("--config", default=os.path.join(HERE, "..", "config", "dongles.json") if os.path.exists(os.path.join(HERE, "..", "config", "dongles.json")) else os.path.join(HERE, "dongles.json"))
     args = ap.parse_args()
 
     with open(args.config) as f:

@@ -91,3 +91,7 @@ outputs/
 # local Python venv (do not commit)
 .venv/
 **/.venv/
+*.bak_*
+*.bak
+drone_deployment_infra/swarm_ops/logs/
+__pycache__/

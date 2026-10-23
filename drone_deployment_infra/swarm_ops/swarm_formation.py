@@ -83,6 +83,10 @@ MIN_RC_XY = 14               # near the slot: smaller horizontal rc doesn't move
 KI_POS = 15.0                # rc per (m * s): builds up if the drone stays off its slot
 I_ZONE_M = 0.5               # integral only active this close to the slot
 I_MAX_RC = 10                # integral contribution cap
+# --- at the slot (FACE10/HOLDING): rest zones with hysteresis -> no hunting -----
+REST_POS_IN, REST_POS_OUT = 0.08, 0.15     # m   : rest inside IN, correct again beyond OUT
+REST_H_IN, REST_H_OUT = 0.06, 0.12         # m   (height)
+REST_YAW_IN, REST_YAW_OUT = 3.0, 7.0       # deg (facing tag 10)
 POSE_ALPHA = 0.35
 
 ALIGN_H_M = 0.15
@@ -605,6 +609,7 @@ class Drone:
         self.flip_end = 0.0
         self.grace_until = 0.0       # tag loss tolerated until this time (after a flip)
         self.integ = np.zeros(3)     # integral of slot error (tag frame), near the slot
+        self.rest_pos = self.rest_h = self.rest_yaw = False   # resting per axis at the slot
         self.integ_slot = None
         self.integ_t = None
         self.last_rc = (0, 0, 0, 0)
@@ -761,7 +766,7 @@ class Drone:
 
     def perception_loop(self):
         from pupil_apriltags import Detector
-        det = Detector(families="tag36h11", nthreads=1, quad_decimate=2.0, refine_edges=True,
+        det = Detector(families="tag36h11", nthreads=1, quad_decimate=1.0, refine_edges=True,
                        decode_sharpening=0.25)
         last = 0
         while not self.stop.is_set():
@@ -934,6 +939,21 @@ def face10_vertical(d, p, ty):
     if d.face_h is None or h is None:
         return 0
     return vert_to((d.face_h - h) / 100.0)
+
+
+def rest_gate(resting, err, r_in, r_out):
+    """Hysteresis: start resting when |err| < r_in, stop resting when |err| > r_out."""
+    a = abs(err)
+    return (a <= r_out) if resting else (a < r_in)
+
+
+def tag10_errors(d, p, psi, ty):
+    """At the slot, ALWAYS aim at tag 10: from the image when tag 10 is the reference,
+    else from the map pose (never toward a side tag). -> (yaw_err_deg, climb_m)"""
+    if d.ref_id == TAG_ID and d.ref_tcam is not None:
+        eb = math.degrees(math.atan2(d.ref_tcam[0], d.ref_tcam[2]))
+        return eb, HEIGHT_OFFSET_M - ty
+    return wrap_deg(face_tag_yaw(p) - psi), HEIGHT_OFFSET_M + float(p[1])
 
 
 def vert_to(err_m):
@@ -1253,16 +1273,24 @@ def main():
                               f"rc a{rc[0]:+d} b{rc[1]:+d} c{rc[2]:+d} d{rc[3]:+d}")
                 elif d.state == "FACE10":
                     all_in = False
-                    ey = eb if d.ref_id == TAG_ID else wrap_deg(face_tag_yaw(p) - psi)
+                    ey, _ = tag10_errors(d, p, psi, ty)
                     rc = (rc[0], rc[1], face10_vertical(d, p, ty), yaw_to(ey))
                     if d.ref_id == TAG_ID and abs(eb) < TOL_YAW_DEG:
                         d.state = "HOLDING"
+                        d.rest_pos = d.rest_h = d.rest_yaw = False
                         d.log(f"locked on tag 10 in slot s{assign[d.num]}")
                     elif now - d.face_t > 20:
                         land_async(d, "could not find tag 10 from its slot", fly)
-                else:                                              # HOLDING
-                    rc = (rc[0], rc[1], cz, yaw_to(eb))
-                    if pe > TOL_POS_M or abs(eb) > TOL_YAW_DEG or d.ref_id != TAG_ID:
+                else:                                              # HOLDING: calm, tag 10 only
+                    ey, up = tag10_errors(d, p, psi, ty)
+                    d.rest_pos = rest_gate(d.rest_pos, pe, REST_POS_IN, REST_POS_OUT)
+                    d.rest_h = rest_gate(d.rest_h, up, REST_H_IN, REST_H_OUT)
+                    d.rest_yaw = rest_gate(d.rest_yaw, ey, REST_YAW_IN, REST_YAW_OUT)
+                    if d.rest_pos:
+                        d.integ = np.zeros(3)
+                    rc = (0 if d.rest_pos else rc[0], 0 if d.rest_pos else rc[1],
+                          0 if d.rest_h else vert_to(up), 0 if d.rest_yaw else yaw_to(ey))
+                    if not (d.rest_pos and abs(ey) < REST_YAW_OUT):
                         all_in = False
                 cmds[d.num] = rc
 
@@ -1299,8 +1327,7 @@ def main():
                         print(f">>> formation reached, holding {args.hold:.0f}s")
             elif phase == "FLIP":
                 if flip_cur is not None and not flip_cur.flipping:     # wait until it's back
-                    back = flip_cur.has_fix(now) and flip_cur.ref_id == TAG_ID and \
-                        flip_cur.last_err[0] is not None and flip_cur.last_err[0] < TOL_POS_M
+                    back = flip_cur.has_fix(now) and flip_cur.ref_id == TAG_ID and flip_cur.rest_pos
                     if back or now - flip_cur.flip_end > FLIP_RETURN_TIMEOUT_S or flip_cur.landing:
                         flip_cur = None
                 if flip_cur is None:
