@@ -51,6 +51,10 @@ parser.add_argument("--lr", type=float, default=1e-3)
 parser.add_argument("--log_std", type=float, default=-1.0, help="Policy log std after cloning (-1.0 -> std 0.37).")
 parser.add_argument("--value_coef", type=float, default=0.5, help="Weight of the value-head loss in the joint BC loss.")
 parser.add_argument("--drop_tail", type=int, default=50, help="Trailing steps without a return bootstrap, dropped from the datasets.")
+parser.add_argument(
+    "--freeze_scaler", action="store_true", default=False,
+    help="Set the fitted preprocessors' sample count to 1e8 so PPO's running updates cannot drift them away from the BC statistics.",
+)
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--out", type=str, default="outputs/exports/bc_defend.pt")
 AppLauncher.add_app_launcher_args(parser)
@@ -207,6 +211,10 @@ def main():
                 v, _ = value.act({"observations": Xn[ho]}, role="value")
                 v_ev = 1.0 - (v - Rn[ho]).var().item() / max(Rn[ho].var().item(), 1e-8)  # explained variance
             policy.log_std_parameter.fill_(args_cli.log_std)
+            if args_cli.freeze_scaler:
+                for pp in (prep, vprep if fit_value else None):
+                    if pp is not None and hasattr(pp, "current_count"):
+                        pp.current_count.fill_(1.0e8)
         print(
             f"[bc] {uid}: policy mse {first:.4f} -> {last:.4f} (holdout {ho_mse:.4f}), direction cosine {cos:.3f} "
             f"(n={int(moving.sum())}), value explained var {v_ev:.3f}, returns mean {R.mean().item():.1f} "
