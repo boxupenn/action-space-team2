@@ -23,6 +23,13 @@ parser.add_argument("--ticks_per_capture", type=int, default=3, help="App ticks 
 parser.add_argument("--out", type=str, default="outputs/videos/defend_chase.mp4")
 parser.add_argument("--fps", type=int, default=20)
 parser.add_argument("--frame_dir", type=str, default="outputs/frames_clip")
+parser.add_argument("--pilot", type=str, default="chase", choices=["chase", "smart", "smart2", "zero", "policy"],
+                    help="Who flies the defenders: a scripted baseline, or 'policy' with --checkpoint.")
+parser.add_argument("--checkpoint", type=str, default=None, help="skrl checkpoint for --pilot policy (mean actions).")
+parser.add_argument("--algorithm", type=str, default="IPPO", choices=["IPPO", "MAPPO"])
+parser.add_argument("--set", nargs="*", default=[], metavar="FIELD=VALUE",
+                    help="env config overrides, e.g. respawn_waves=False capture_radius=1.0")
+parser.add_argument("--eye", type=float, nargs=3, default=(13.0, 13.0, 8.0), help="camera position")
 args, _ = parser.parse_known_args()
 
 import h5py  # noqa: E402, F401  Windows: load h5py's hdf5.dll before Kit's isaacsim.sensors.rtx loads an incompatible one
@@ -39,6 +46,7 @@ import gymnasium as gym  # noqa: E402
 import torch  # noqa: E402
 
 import action_space_kit.tasks  # noqa: F401, E402
+from action_space_kit.tasks.direct.tello_defend.chase import TEACHERS  # noqa: E402
 from isaaclab_tasks.utils import parse_env_cfg  # noqa: E402
 from omni.kit.viewport.utility import capture_viewport_to_file, get_active_viewport  # noqa: E402
 
@@ -48,11 +56,42 @@ for stale in os.listdir(args.frame_dir):
 
 env_cfg = parse_env_cfg("AS-Defend-v0", device="cuda:0", num_envs=1)
 env_cfg.seed = 42
+import ast  # noqa: E402
+
+for item in args.set:
+    key, value = item.split("=", 1)
+    try:
+        value = ast.literal_eval(value)
+    except (ValueError, SyntaxError):
+        pass
+    if not hasattr(env_cfg, key):
+        raise SystemExit(f"[clip] env config has no field {key!r}")
+    setattr(env_cfg, key, value)
+    print(f"[clip] override {key} = {value!r}", flush=True)
 # frame the protected site so interceptions are visible
-env_cfg.viewer.eye = (9.0, 9.0, 6.0)
+env_cfg.viewer.eye = tuple(args.eye)
 env_cfg.viewer.lookat = (0.0, 0.0, 1.0)
 
-env = gym.make("AS-Defend-v0", cfg=env_cfg).unwrapped
+gym_env = gym.make("AS-Defend-v0", cfg=env_cfg)
+env = gym_env.unwrapped
+
+policy = None
+if args.pilot == "policy":
+    if not args.checkpoint:
+        raise SystemExit("[clip] --pilot policy needs --checkpoint")
+    from skrl.utils.runner.torch import Runner  # noqa: E402
+    from isaaclab_rl.skrl import SkrlVecEnvWrapper  # noqa: E402
+    from isaaclab_tasks.utils import load_cfg_from_registry  # noqa: E402
+
+    agent_cfg = load_cfg_from_registry("AS-Defend-v0", f"skrl_{args.algorithm.lower()}_cfg_entry_point")
+    agent_cfg["agent"]["experiment"]["write_interval"] = 0
+    agent_cfg["agent"]["experiment"]["checkpoint_interval"] = 0
+    runner = Runner(SkrlVecEnvWrapper(gym_env, ml_framework="torch"), agent_cfg)
+    runner.agent.load(args.checkpoint)
+    runner.agent.set_running_mode("eval")
+    policy = runner.agent
+    print(f"[clip] policy loaded from {args.checkpoint}", flush=True)
+
 obs, _ = env.reset()
 
 viewport = get_active_viewport()
@@ -79,16 +118,15 @@ step = 0
 
 print(f"[clip] capturing {args.frames} frames", flush=True)
 while captured < args.frames:
-    # greedy pursuit: each defender flies at the nearest attacker
-    actions = {}
-    for agent in env.cfg.possible_agents:
-        rel = obs[agent][:, 9 : 9 + 3 * num_attackers].reshape(env.num_envs, num_attackers, 3)
-        alive = obs[agent][:, 9 + 6 * num_attackers : 9 + 7 * num_attackers] > 0.5  # skip downed attackers
-        distance = torch.where(alive, torch.linalg.norm(rel, dim=-1), torch.full_like(rel[..., 0], float("inf")))
-        target = rel[torch.arange(env.num_envs, device=env.device), distance.argmin(dim=-1)]
-        direction = target / torch.clamp(torch.linalg.norm(target, dim=-1, keepdim=True), min=1e-6)
-        direction = direction * alive.any(dim=-1, keepdim=True).float()
-        actions[agent] = torch.cat([direction, torch.zeros(env.num_envs, 1, device=env.device)], dim=-1)
+    if policy is not None:
+        with torch.inference_mode():
+            states = {agent: None for agent in env.cfg.possible_agents}
+            outputs = policy.act(obs, states, timestep=0, timesteps=0)
+            actions = {a: outputs[-1][a].get("mean_actions", outputs[0][a]) for a in env.cfg.possible_agents}
+    elif args.pilot == "zero":
+        actions = {a: torch.zeros(env.num_envs, 4, device=env.device) for a in env.cfg.possible_agents}
+    else:
+        actions = TEACHERS[args.pilot](env, obs)
 
     obs, _, _, _, _ = env.step(actions)
     env.sim.render()
