@@ -898,7 +898,7 @@ def draw_top(drones, slots, assign, tag_map, mapcheck, now):
         cv2.putText(img, str(tid) + ("" if mapcheck.trusted(tid) else " OFF"), (px(t)[0] + 6, px(t)[1] - 6),
                     0, 0.45, col, 1)
     for i, sp in enumerate(slots):
-        cv2.circle(img, px(sp), 6, (0, 200, 255), 1)
+        cv2.circle(img, px(sp), max(6, int(REST_POS_IN * S)), (0, 200, 255), 1)
         cv2.putText(img, f"s{i}", (px(sp)[0] + 8, px(sp)[1]), 0, 0.4, (0, 200, 255), 1)
     for d in drones:
         e = d.est(now)
@@ -965,6 +965,28 @@ def vert_to(err_m):
     return 0 if abs(err_m) < 0.05 else kick(np.clip(KP_POS * err_m, -MAX_RC_Z, MAX_RC_Z))
 
 
+def start_terminal_keys():
+    """Headless keys: 'q'+Enter -> land all, 'e'+Enter -> emergency. Returns a getter."""
+    import queue
+    qk = queue.Queue()
+
+    def reader():
+        for line in sys.stdin:
+            c = line.strip().lower()
+            if c in ("q", "land"):
+                qk.put(ord("q"))
+            elif c in ("e", "stop", "emergency"):
+                qk.put(ord(" "))
+    threading.Thread(target=reader, daemon=True).start()
+
+    def get():
+        try:
+            return qk.get_nowait()
+        except queue.Empty:
+            return 255
+    return get
+
+
 def main():
     global HEIGHT_OFFSET_M, ARC_RADIUS_M
     g = globals()
@@ -982,12 +1004,24 @@ def main():
     ap.add_argument("--radius", type=float, default=ARC_RADIUS_M, help="slot distance from tag 10, m")
     ap.add_argument("--hold", type=float, default=5.0)
     ap.add_argument("--fast", action="store_true", help="fast profile (see FAST in settings)")
+    ap.add_argument("--headless", action="store_true",
+                    help="no windows at all; terminal keys: q+Enter land all, e+Enter emergency")
+    ap.add_argument("--no-video", action="store_true",
+                    help="no per-drone camera windows (drones still stream for tag detection)")
+    ap.add_argument("--display-hz", type=float, default=10.0, help="window refresh rate")
+    ap.add_argument("--rest-radius", type=float, default=None,
+                    help="slot rest zone in m (default 0.08): inside it the drone stops correcting")
     ap.add_argument("--flip", action="store_true",
                     help="once in formation, each drone does a back flip (one at a time), then holds")
     ap.add_argument("--fly", action="store_true", help="actually fly (default dry-run)")
     args = ap.parse_args()
     ARC_RADIUS_M = max(0.9, args.radius)
     HEIGHT_OFFSET_M = args.slot_offset / 100.0
+    if args.rest_radius is not None:
+        r_in = max(0.05, min(0.30, args.rest_radius))
+        globals()["REST_POS_IN"], globals()["REST_POS_OUT"] = r_in, max(r_in + 0.05, 1.9 * r_in)
+        print(f"rest zone: hold inside {r_in * 100:.0f} cm, correct beyond "
+              f"{globals()['REST_POS_OUT'] * 100:.0f} cm")
     if args.fast:
         g.update(FAST)
         print("FAST profile: " + ", ".join(f"{k}={v}" for k, v in FAST.items()))
@@ -1066,6 +1100,10 @@ def main():
             d.sub_t, d.yaw_acc = t0, 0.0
 
         period = 1.0 / LOOP_HZ
+        last_show = 0.0
+        term_key = start_terminal_keys() if args.headless else None
+        if args.headless:
+            print(">>> HEADLESS: type  q + Enter = land all,  e + Enter = EMERGENCY,  Ctrl+C = land all")
         while True:
             t_loop = now = time.time()
             active = [d for d in drones if not d.landed and not d.landing]
@@ -1366,6 +1404,9 @@ def main():
                 return
 
             # ---- send + show ----
+            show_now = now - last_show >= 1.0 / max(1.0, args.display_hz)
+            if show_now:
+                last_show = now
             for d in active:
                 rc = cmds.get(d.num, (0, 0, 0, 0))
                 if rc is None:                            # taking off: don't interfere
@@ -1380,7 +1421,8 @@ def main():
                 log.writerow([f"{now:.3f}", d.num, d.state, d.has_fix(now), d.ref_id, d.tags_now,
                               *[f"{v:.3f}" for v in p], f"{e[1]:.1f}" if e else "",
                               "" if pe is None else f"{pe:.3f}", *rc, h, d.battery, d.reason])
-                img = (d.overlay if d.overlay is not None else np.zeros((RES[1], RES[0], 3), np.uint8)).copy()
+                img = None if args.headless else \
+                    (d.overlay if d.overlay is not None else np.zeros((RES[1], RES[0], 3), np.uint8)).copy()
                 lines = [f"{d.name} {d.state}" + (f"/{d.sub}" if d.state == "SEARCH" else "")
                          + (" HOLD" if phase == "HOLD" else "") + ("  [SEE]" if d.has_fix(now) else "  [LOST]")
                          + (f"  ref {d.ref_id}" if d.ref_id is not None else ""),
@@ -1392,12 +1434,14 @@ def main():
                                  f"{math.degrees(math.atan2(p[0], -p[2])):+.0f} deg, {-p[1] * 100:+.0f} cm")
                 if pe is not None:
                     lines.append(f"slot s{assign.get(d.num)}: {pe:.2f} m to go")
-                for i, s_ in enumerate(lines):
+                for i, s_ in (enumerate(lines) if img is not None else []):
                     cv2.putText(img, s_, (10, 30 + 30 * i), 0, 0.7, (0, 0, 0), 4)
                     cv2.putText(img, s_, (10, 30 + 30 * i), 0, 0.7, (0, 255, 255), 2)
-                cv2.imshow(d.name, cv2.resize(img, (480, 360)))
-            cv2.imshow("top view", draw_top(drones, slots, assign, tag_map, mapcheck, now))
-            k = cv2.waitKey(1) & 0xFF
+                if not args.no_video and not args.headless and show_now:
+                    cv2.imshow(d.name, cv2.resize(img, (480, 360)))
+            if show_now and not args.headless:
+                cv2.imshow("top view", draw_top(drones, slots, assign, tag_map, mapcheck, now))
+            k = term_key() if args.headless else cv2.waitKey(1) & 0xFF
             if k == ord("q"):
                 print("q -> landing all")
                 return
