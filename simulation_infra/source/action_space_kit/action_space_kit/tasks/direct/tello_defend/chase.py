@@ -70,3 +70,50 @@ def smart_actions(raw, obs: dict[str, torch.Tensor], v_max: float = 1.0) -> dict
         direction = direction * alive.any(dim=-1, keepdim=True).float()
         actions[a] = torch.cat([direction, torch.zeros(E, 1, device=dev)], dim=-1)
     return actions
+
+
+def smart2_actions(raw, obs: dict[str, torch.Tensor], v_max: float = 1.0) -> dict[str, torch.Tensor]:
+    """Like ``smart_actions`` but the assignment uses only what ONE defender observes, so a
+    per-agent policy can clone it: attackers are ranked by their azimuth around the protected
+    site (position relative to the site = rel_pos + own_rel_site, both in the observation) and
+    defender ``i`` takes the ``i``-th live attacker in that order. Both defenders see the same
+    attackers, so they compute the same ranking without knowing each other's position.
+    Defenders left over (3 defenders vs 2 attackers) are goalkeepers on the attacker nearest the
+    site. Lead pursuit as in ``smart_actions``."""
+    n, E, dev = raw.cfg.num_attackers, raw.num_envs, raw.device
+    agents = raw.cfg.possible_agents
+    rows = torch.arange(E, device=dev)
+    actions = {}
+    for i, a in enumerate(agents):
+        o = obs[a]
+        alive = o[:, 9 + 6 * n : 9 + 7 * n] > 0.5
+        rel = o[:, 9 : 9 + 3 * n].reshape(E, n, 3)
+        va = o[:, 9 + 3 * n : 9 + 6 * n].reshape(E, n, 3) + o[:, 3:6].unsqueeze(1)
+        site_rel = rel + o[:, 0:3].unsqueeze(1)  # attacker position relative to the site
+        az = torch.atan2(site_rel[..., 1], site_rel[..., 0])
+        az = torch.where(alive, az, torch.full_like(az, 10.0))  # dead attackers sort last
+        order = az.argsort(dim=-1)  # (E, n) attacker indices by azimuth, live ones first
+        n_alive = alive.sum(dim=-1)
+        rank = torch.clamp(torch.full((E,), i, device=dev, dtype=torch.long), max=(n_alive - 1).clamp(min=0))
+        target = order[rows, rank]
+        # defenders beyond the live attacker count are goalkeepers: go for the attacker nearest
+        # the site, i.e. the one whose interception is failing ("send another drone")
+        site_dist = torch.where(alive, site_rel[..., :2].norm(dim=-1), torch.full_like(az, 1.0e3))
+        target = torch.where(i >= n_alive, site_dist.argmin(dim=-1), target)
+        r = rel[rows, target]
+        v = va[rows, target]
+        qa = (v * v).sum(-1) - v_max**2
+        qb = 2.0 * (r * v).sum(-1)
+        qc = (r * r).sum(-1)
+        disc = qb * qb - 4.0 * qa * qc
+        t_pursuit = r.norm(dim=-1) / v_max
+        t_lead = (-qb - torch.sqrt(disc.clamp(min=0.0))) / (2.0 * qa.clamp(max=-1e-6))
+        t = torch.where((disc >= 0) & (t_lead > 0), t_lead, t_pursuit)
+        aim = r + v * t.unsqueeze(-1)
+        direction = aim / torch.clamp(aim.norm(dim=-1, keepdim=True), min=1e-6)
+        direction = direction * alive.any(dim=-1, keepdim=True).float()
+        actions[a] = torch.cat([direction, torch.zeros(E, 1, device=dev)], dim=-1)
+    return actions
+
+
+TEACHERS = {"chase": chase_actions, "smart": smart_actions, "smart2": smart2_actions}

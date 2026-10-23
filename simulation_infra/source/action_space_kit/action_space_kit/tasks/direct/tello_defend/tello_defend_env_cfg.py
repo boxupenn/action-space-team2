@@ -11,7 +11,7 @@ from isaaclab.utils import configclass
 
 from action_space_kit.control import TelloCommandCfg
 
-NUM_DEFENDERS = 2
+NUM_DEFENDERS = 3  # real-world spec (2026-10-23): 3 defenders vs 2 attackers
 NUM_ATTACKERS = 2
 
 # obs per defender: own pos rel. site (3) + own vel (3) + gravity (3)

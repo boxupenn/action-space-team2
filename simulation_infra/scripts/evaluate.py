@@ -28,7 +28,7 @@ parser.add_argument(
     "--baseline",
     type=str,
     default=None,
-    choices=["zero", "chase", "smart"],
+    choices=["zero", "chase", "smart", "smart2"],
     help="Evaluate a scripted baseline instead of a checkpoint: zero does nothing, chase pursues the nearest attacker, smart assigns targets one-to-one and leads them.",
 )
 parser.add_argument("--algorithm", type=str, default="IPPO", choices=["IPPO", "MAPPO"], help="Algorithm of the checkpoint.")
@@ -61,7 +61,7 @@ import gymnasium as gym
 import torch
 
 import action_space_kit.tasks  # noqa: F401
-from action_space_kit.tasks.direct.tello_defend.chase import chase_actions, smart_actions
+from action_space_kit.tasks.direct.tello_defend.chase import TEACHERS
 from isaaclab_tasks.utils import parse_env_cfg
 
 
@@ -152,10 +152,8 @@ def main():
                     a: outputs[0][a] if args_cli.stochastic else outputs[-1][a].get("mean_actions", outputs[0][a])
                     for a in raw.cfg.possible_agents
                 }
-        elif args_cli.baseline == "chase":
-            actions = chase_actions(raw, obs)
-        elif args_cli.baseline == "smart":
-            actions = smart_actions(raw, obs)
+        elif args_cli.baseline in TEACHERS:
+            actions = TEACHERS[args_cli.baseline](raw, obs)
         else:
             actions = {a: torch.zeros(raw.num_envs, 4, device=raw.device) for a in raw.cfg.possible_agents}
 

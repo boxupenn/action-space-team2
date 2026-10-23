@@ -39,7 +39,8 @@ parser.add_argument("--task", type=str, default="AS-Defend-v0")
 parser.add_argument("--algorithm", type=str, default="IPPO", choices=["IPPO", "MAPPO"])
 parser.add_argument("--num_envs", type=int, default=512)
 parser.add_argument("--steps", type=int, default=200, help="Env steps to collect (samples = steps * num_envs per agent).")
-parser.add_argument("--teacher", type=str, default="chase", choices=["chase", "smart"], help="Scripted teacher to clone.")
+parser.add_argument("--teacher", type=str, default="chase", choices=["chase", "smart", "smart2"], help="Scripted teacher to clone.")
+parser.add_argument("--dagger_rounds", type=int, default=0, help="DAgger rounds: roll out the student (mean actions), label with the teacher, aggregate, refit.")
 parser.add_argument("--noise", type=float, default=0.3, help="Std of the Gaussian noise added to the executed teacher action.")
 parser.add_argument(
     "--teacher_scale", type=float, default=1.0,
@@ -79,7 +80,7 @@ import torch
 from skrl.utils.runner.torch import Runner
 
 import action_space_kit.tasks  # noqa: F401
-from action_space_kit.tasks.direct.tello_defend.chase import chase_actions, smart_actions
+from action_space_kit.tasks.direct.tello_defend.chase import TEACHERS
 from isaaclab_rl.skrl import SkrlVecEnvWrapper
 from isaaclab_tasks.utils import load_cfg_from_registry, parse_env_cfg
 
@@ -132,97 +133,114 @@ def main():
     agent_cfg["agent"]["experiment"]["checkpoint_interval"] = 0
     agent = Runner(SkrlVecEnvWrapper(env, ml_framework="torch"), agent_cfg).agent
 
-    # ---- collect (obs, chase action, reward, done) per step ----------------------------------
-    obs, _ = raw.reset()
-    buffers = {uid: ([], [], []) for uid in raw.cfg.possible_agents}  # obs, teacher action, reward
-    dones = []
-    for _ in range(args_cli.steps):
-        teach = chase_actions if args_cli.teacher == "chase" else smart_actions
-        teacher = {uid: a * args_cli.teacher_scale for uid, a in teach(raw, obs).items()}
-        for uid in raw.cfg.possible_agents:
-            buffers[uid][0].append(obs[uid].clone())
-            buffers[uid][1].append(teacher[uid].clone())
-        executed = {
-            uid: (teacher[uid] + args_cli.noise * torch.randn_like(teacher[uid])).clamp(-1.0, 1.0)
-            for uid in raw.cfg.possible_agents
-        }
-        obs, rew, term, trunc, _ = raw.step(executed)
-        for uid in raw.cfg.possible_agents:
-            buffers[uid][2].append(rew[uid].clone().flatten())
-        a0 = raw.cfg.possible_agents[0]
-        dones.append((term[a0] | trunc[a0]).float().flatten())
-    print(f"[bc] collected {args_cli.steps * raw.num_envs} samples per agent ({args_cli.steps} steps x {raw.num_envs} envs)", flush=True)
-
-    # Monte Carlo returns along each env's trajectory; the last --drop_tail steps have no
-    # bootstrap and are dropped from every dataset (policy, value) to keep them aligned.
+    teach = TEACHERS[args_cli.teacher]
     gamma = float(agent_cfg["agent"]["discount_factor"])
     keep = args_cli.steps - args_cli.drop_tail
-    done_t = torch.stack(dones)  # (steps, envs)
+    data = {uid: {"X": [], "Y": [], "R": []} for uid in raw.cfg.possible_agents}
 
-    # ---- fit scaler + policy mean + value head per agent (shared trunk: one joint loss) ----
-    for uid in raw.cfg.possible_agents:
-        rew_t = torch.stack(buffers[uid][2])  # (steps, envs)
-        ret_t = torch.zeros_like(rew_t)
-        running = torch.zeros_like(rew_t[0])
-        for t in reversed(range(args_cli.steps)):
-            running = rew_t[t] + gamma * (1.0 - done_t[t]) * running
-            ret_t[t] = running
-        X = torch.cat(buffers[uid][0][:keep]); Y = torch.cat(buffers[uid][1][:keep])
-        R = ret_t[:keep].reshape(-1, 1)
-        n = len(X)
-        prep = agent._observation_preprocessor[uid]
-        if hasattr(prep, "running_mean"):
-            prep(X, train=True)  # one-shot running statistics over the whole dataset
-        Xn = prep(X)
-        fit_value = args_cli.value_coef > 0  # MAPPO's critic reads the global state, not the observation: policy-only there
-        vprep = agent._value_preprocessor[uid]
-        if fit_value and hasattr(vprep, "running_mean"):
-            vprep(R, train=True)
-        Rn = vprep(R)  # PPO regresses the value head onto preprocessed returns; mirror that
-        policy, value = agent.policies[uid], agent.values[uid]
-        params = list(policy.parameters())
-        if fit_value:
-            params += [p for p in value.parameters() if all(p is not q for q in policy.parameters())]
-        opt = torch.optim.Adam(params, lr=args_cli.lr)
-        holdout = max(1, n // 10)
-        tr = slice(holdout, n); ho = slice(0, holdout)
-        first = last = None
-        for epoch in range(args_cli.epochs):
-            perm = torch.randperm(n - holdout, device=Xn.device) + holdout
-            total = 0.0
-            for i in range(0, len(perm), args_cli.batch):
-                idx = perm[i : i + args_cli.batch]
-                _, out = policy.act({"observations": Xn[idx]}, role="policy")
-                loss_pi = torch.nn.functional.mse_loss(out["mean_actions"], Y[idx])
-                loss = loss_pi
-                if fit_value:
-                    v, _ = value.act({"observations": Xn[idx]}, role="value")
-                    loss = loss + args_cli.value_coef * torch.nn.functional.mse_loss(v, Rn[idx])
-                opt.zero_grad(); loss.backward(); opt.step()
-                total += loss_pi.item() * len(idx)
-            last = total / (n - holdout)
-            first = last if first is None else first
+    def student_actions(obs):
+        out = {}
         with torch.no_grad():
-            _, out = policy.act({"observations": Xn[ho]}, role="policy")
-            mean = out["mean_actions"]
-            ho_mse = torch.nn.functional.mse_loss(mean, Y[ho]).item()
-            moving = Y[ho][:, :3].norm(dim=-1) > 0.5 * args_cli.teacher_scale  # teacher is moving (an attacker is alive)
-            cos = torch.nn.functional.cosine_similarity(mean[moving, :3], Y[ho][moving, :3], dim=-1).mean().item()
-            v_ev = float("nan")
+            for uid in raw.cfg.possible_agents:
+                _, o = agent.policies[uid].act({"observations": agent._observation_preprocessor[uid](obs[uid])}, role="policy")
+                out[uid] = o["mean_actions"].clamp(-1.0, 1.0)
+        return out
+
+    def collect(driver: str):
+        """Roll out `driver` ('teacher' = teacher + noise, 'student' = policy mean) for --steps, label with the teacher."""
+        obs, _ = raw.reset()
+        buffers = {uid: ([], [], []) for uid in raw.cfg.possible_agents}
+        dones = []
+        for _ in range(args_cli.steps):
+            teacher = {uid: a * args_cli.teacher_scale for uid, a in teach(raw, obs).items()}
+            for uid in raw.cfg.possible_agents:
+                buffers[uid][0].append(obs[uid].clone())
+                buffers[uid][1].append(teacher[uid].clone())
+            if driver == "teacher":
+                executed = {uid: (teacher[uid] + args_cli.noise * torch.randn_like(teacher[uid])).clamp(-1.0, 1.0)
+                            for uid in raw.cfg.possible_agents}
+            else:
+                executed = student_actions(obs)
+            obs, rew, term, trunc, _ = raw.step(executed)
+            for uid in raw.cfg.possible_agents:
+                buffers[uid][2].append(rew[uid].clone().flatten())
+            a0 = raw.cfg.possible_agents[0]
+            dones.append((term[a0] | trunc[a0]).float().flatten())
+        done_t = torch.stack(dones)
+        for uid in raw.cfg.possible_agents:
+            rew_t = torch.stack(buffers[uid][2]); ret_t = torch.zeros_like(rew_t); running = torch.zeros_like(rew_t[0])
+            for t in reversed(range(args_cli.steps)):
+                running = rew_t[t] + gamma * (1.0 - done_t[t]) * running
+                ret_t[t] = running
+            data[uid]["X"].append(torch.cat(buffers[uid][0][:keep]))
+            data[uid]["Y"].append(torch.cat(buffers[uid][1][:keep]))
+            data[uid]["R"].append(ret_t[:keep].reshape(-1, 1))
+        print(f"[bc] collected {keep * raw.num_envs} samples per agent driven by the {driver}", flush=True)
+
+    def fit(tag: str):
+        for uid in raw.cfg.possible_agents:
+            X = torch.cat(data[uid]["X"]); Y = torch.cat(data[uid]["Y"]); R = torch.cat(data[uid]["R"])
+            n = len(X)
+            prep = agent._observation_preprocessor[uid]
+            if hasattr(prep, "running_mean"):
+                prep.running_mean.zero_(); prep.running_variance.fill_(1.0); prep.current_count.zero_()
+                prep(X, train=True)  # one-shot running statistics over the whole (aggregated) dataset
+            Xn = prep(X)
+            fit_value = args_cli.value_coef > 0  # MAPPO's critic reads the global state, not the observation: policy-only there
+            vprep = agent._value_preprocessor[uid]
+            if fit_value and hasattr(vprep, "running_mean"):
+                vprep.running_mean.zero_(); vprep.running_variance.fill_(1.0); vprep.current_count.zero_()
+                vprep(R, train=True)
+            Rn = vprep(R)
+            policy, value = agent.policies[uid], agent.values[uid]
+            params = list(policy.parameters())
             if fit_value:
-                v, _ = value.act({"observations": Xn[ho]}, role="value")
-                v_ev = 1.0 - (v - Rn[ho]).var().item() / max(Rn[ho].var().item(), 1e-8)  # explained variance
-            policy.log_std_parameter.fill_(args_cli.log_std)
-            if args_cli.freeze_scaler:
-                for pp in (prep, vprep if fit_value else None):
-                    if pp is not None and hasattr(pp, "current_count"):
-                        pp.current_count.fill_(1.0e8)
-        print(
-            f"[bc] {uid}: policy mse {first:.4f} -> {last:.4f} (holdout {ho_mse:.4f}), direction cosine {cos:.3f} "
-            f"(n={int(moving.sum())}), value explained var {v_ev:.3f}, returns mean {R.mean().item():.1f} "
-            f"std {R.std().item():.1f}, log_std set to {args_cli.log_std}",
-            flush=True,
-        )
+                params += [p for p in value.parameters() if all(p is not q for q in policy.parameters())]
+            opt = torch.optim.Adam(params, lr=args_cli.lr)
+            holdout = max(1, n // 10)
+            ho = slice(0, holdout)
+            first = last = None
+            for epoch in range(args_cli.epochs):
+                perm = torch.randperm(n - holdout, device=Xn.device) + holdout
+                total = 0.0
+                for i in range(0, len(perm), args_cli.batch):
+                    idx = perm[i : i + args_cli.batch]
+                    _, out = policy.act({"observations": Xn[idx]}, role="policy")
+                    loss_pi = torch.nn.functional.mse_loss(out["mean_actions"], Y[idx])
+                    loss = loss_pi
+                    if fit_value:
+                        v, _ = value.act({"observations": Xn[idx]}, role="value")
+                        loss = loss + args_cli.value_coef * torch.nn.functional.mse_loss(v, Rn[idx])
+                    opt.zero_grad(); loss.backward(); opt.step()
+                    total += loss_pi.item() * len(idx)
+                last = total / (n - holdout)
+                first = last if first is None else first
+            with torch.no_grad():
+                _, out = policy.act({"observations": Xn[ho]}, role="policy")
+                mean = out["mean_actions"]
+                ho_mse = torch.nn.functional.mse_loss(mean, Y[ho]).item()
+                moving = Y[ho][:, :3].norm(dim=-1) > 0.5 * args_cli.teacher_scale
+                cos = torch.nn.functional.cosine_similarity(mean[moving, :3], Y[ho][moving, :3], dim=-1).mean().item()
+                v_ev = float("nan")
+                if fit_value:
+                    v, _ = value.act({"observations": Xn[ho]}, role="value")
+                    v_ev = 1.0 - (v - Rn[ho]).var().item() / max(Rn[ho].var().item(), 1e-8)
+                policy.log_std_parameter.fill_(args_cli.log_std)
+                if args_cli.freeze_scaler:
+                    for pp in (prep, vprep if fit_value else None):
+                        if pp is not None and hasattr(pp, "current_count"):
+                            pp.current_count.fill_(1.0e8)
+            print(
+                f"[bc] {tag} {uid}: n={n} policy mse {first:.4f} -> {last:.4f} (holdout {ho_mse:.4f}), direction cosine {cos:.3f} "
+                f"(n={int(moving.sum())}), value explained var {v_ev:.3f}, log_std set to {args_cli.log_std}",
+                flush=True,
+            )
+
+    collect("teacher")
+    fit("round0")
+    for k in range(args_cli.dagger_rounds):
+        collect("student")
+        fit(f"dagger{k + 1}")
 
     os.makedirs(os.path.dirname(os.path.abspath(args_cli.out)), exist_ok=True)
     agent.save(args_cli.out)
