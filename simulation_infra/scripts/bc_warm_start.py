@@ -40,6 +40,11 @@ parser.add_argument("--algorithm", type=str, default="IPPO", choices=["IPPO", "M
 parser.add_argument("--num_envs", type=int, default=512)
 parser.add_argument("--steps", type=int, default=200, help="Env steps to collect (samples = steps * num_envs per agent).")
 parser.add_argument("--noise", type=float, default=0.3, help="Std of the Gaussian noise added to the executed teacher action.")
+parser.add_argument(
+    "--teacher_scale", type=float, default=1.0,
+    help="Scale of the chase unit vector (label and executed action). <1 keeps the cloned mean off the +-1 clip "
+    "boundary: skrl computes log_prob on the CLIPPED sample, so a mean sitting on the boundary gives PPO a biased gradient.",
+)
 parser.add_argument("--epochs", type=int, default=30)
 parser.add_argument("--batch", type=int, default=4096)
 parser.add_argument("--lr", type=float, default=1e-3)
@@ -127,7 +132,7 @@ def main():
     buffers = {uid: ([], [], []) for uid in raw.cfg.possible_agents}  # obs, teacher action, reward
     dones = []
     for _ in range(args_cli.steps):
-        teacher = chase_actions(raw, obs)
+        teacher = {uid: a * args_cli.teacher_scale for uid, a in chase_actions(raw, obs).items()}
         for uid in raw.cfg.possible_agents:
             buffers[uid][0].append(obs[uid].clone())
             buffers[uid][1].append(teacher[uid].clone())
@@ -191,7 +196,7 @@ def main():
             _, out = policy.act({"observations": Xn[ho]}, role="policy")
             mean = out["mean_actions"]
             ho_mse = torch.nn.functional.mse_loss(mean, Y[ho]).item()
-            moving = Y[ho][:, :3].norm(dim=-1) > 0.5  # teacher is moving (an attacker is alive)
+            moving = Y[ho][:, :3].norm(dim=-1) > 0.5 * args_cli.teacher_scale  # teacher is moving (an attacker is alive)
             cos = torch.nn.functional.cosine_similarity(mean[moving, :3], Y[ho][moving, :3], dim=-1).mean().item()
             v, _ = value.act({"observations": Xn[ho]}, role="value")
             v_ev = 1.0 - (v - Rn[ho]).var().item() / max(Rn[ho].var().item(), 1e-8)  # explained variance
