@@ -168,12 +168,15 @@ def main():
         if hasattr(prep, "running_mean"):
             prep(X, train=True)  # one-shot running statistics over the whole dataset
         Xn = prep(X)
+        fit_value = args_cli.value_coef > 0  # MAPPO's critic reads the global state, not the observation: policy-only there
         vprep = agent._value_preprocessor[uid]
-        if hasattr(vprep, "running_mean"):
+        if fit_value and hasattr(vprep, "running_mean"):
             vprep(R, train=True)
         Rn = vprep(R)  # PPO regresses the value head onto preprocessed returns; mirror that
         policy, value = agent.policies[uid], agent.values[uid]
-        params = list(policy.parameters()) + [p for p in value.parameters() if all(p is not q for q in policy.parameters())]
+        params = list(policy.parameters())
+        if fit_value:
+            params += [p for p in value.parameters() if all(p is not q for q in policy.parameters())]
         opt = torch.optim.Adam(params, lr=args_cli.lr)
         holdout = max(1, n // 10)
         tr = slice(holdout, n); ho = slice(0, holdout)
@@ -184,10 +187,11 @@ def main():
             for i in range(0, len(perm), args_cli.batch):
                 idx = perm[i : i + args_cli.batch]
                 _, out = policy.act({"observations": Xn[idx]}, role="policy")
-                v, _ = value.act({"observations": Xn[idx]}, role="value")
                 loss_pi = torch.nn.functional.mse_loss(out["mean_actions"], Y[idx])
-                loss_v = torch.nn.functional.mse_loss(v, Rn[idx])
-                loss = loss_pi + args_cli.value_coef * loss_v
+                loss = loss_pi
+                if fit_value:
+                    v, _ = value.act({"observations": Xn[idx]}, role="value")
+                    loss = loss + args_cli.value_coef * torch.nn.functional.mse_loss(v, Rn[idx])
                 opt.zero_grad(); loss.backward(); opt.step()
                 total += loss_pi.item() * len(idx)
             last = total / (n - holdout)
@@ -198,8 +202,10 @@ def main():
             ho_mse = torch.nn.functional.mse_loss(mean, Y[ho]).item()
             moving = Y[ho][:, :3].norm(dim=-1) > 0.5 * args_cli.teacher_scale  # teacher is moving (an attacker is alive)
             cos = torch.nn.functional.cosine_similarity(mean[moving, :3], Y[ho][moving, :3], dim=-1).mean().item()
-            v, _ = value.act({"observations": Xn[ho]}, role="value")
-            v_ev = 1.0 - (v - Rn[ho]).var().item() / max(Rn[ho].var().item(), 1e-8)  # explained variance
+            v_ev = float("nan")
+            if fit_value:
+                v, _ = value.act({"observations": Xn[ho]}, role="value")
+                v_ev = 1.0 - (v - Rn[ho]).var().item() / max(Rn[ho].var().item(), 1e-8)  # explained variance
             policy.log_std_parameter.fill_(args_cli.log_std)
         print(
             f"[bc] {uid}: policy mse {first:.4f} -> {last:.4f} (holdout {ho_mse:.4f}), direction cosine {cos:.3f} "
