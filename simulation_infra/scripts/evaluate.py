@@ -32,6 +32,7 @@ parser.add_argument(
     help="Evaluate a scripted baseline instead of a checkpoint: zero does nothing, chase pursues the nearest attacker.",
 )
 parser.add_argument("--algorithm", type=str, default="IPPO", choices=["IPPO", "MAPPO"], help="Algorithm of the checkpoint.")
+parser.add_argument("--stochastic", action="store_true", default=False, help="Sample actions like training does instead of using the mean.")
 parser.add_argument("--video", action="store_true", default=False, help="Record a video of the run.")
 parser.add_argument("--video_length", type=int, default=400, help="Video length in steps.")
 parser.add_argument("--video_dir", type=str, default="videos/evaluate", help="Where to write the video.")
@@ -135,6 +136,10 @@ def main():
     alive_prev = raw._attacker_alive.clone()
     step_in_episode = torch.zeros(raw.num_envs, device=raw.device)
     episode_intercept_times: list[list[float]] = [[] for _ in range(raw.num_envs)]
+    ep_return = {a: torch.zeros(raw.num_envs, device=raw.device) for a in raw.cfg.possible_agents}
+    returns: dict[str, list[float]] = {a: [] for a in raw.cfg.possible_agents}
+    episode_lengths: list[float] = []
+    action_norm_sum, action_steps = 0.0, 0
 
     while episodes < args_cli.episodes:
         if policy is not None:
@@ -144,15 +149,20 @@ def main():
                 states = {agent: None for agent in raw.cfg.possible_agents}
                 outputs = policy.act(obs, states, timestep=0, timesteps=0)
                 actions = {
-                    a: outputs[-1][a].get("mean_actions", outputs[0][a]) for a in raw.cfg.possible_agents
+                    a: outputs[0][a] if args_cli.stochastic else outputs[-1][a].get("mean_actions", outputs[0][a])
+                    for a in raw.cfg.possible_agents
                 }
         elif args_cli.baseline == "chase":
             actions = chase_actions(raw, obs)
         else:
             actions = {a: torch.zeros(raw.num_envs, 4, device=raw.device) for a in raw.cfg.possible_agents}
 
-        obs, _, terminated, truncated, _ = env.step(actions)
+        obs, rew, terminated, truncated, _ = env.step(actions)
         step_in_episode += 1
+        for a in raw.cfg.possible_agents:
+            ep_return[a] += rew[a].flatten()
+        action_norm_sum += sum(actions[a][:, :3].norm(dim=-1).mean().item() for a in raw.cfg.possible_agents) / len(raw.cfg.possible_agents)
+        action_steps += 1
 
         newly_down = alive_prev & ~raw._attacker_alive
         if newly_down.any():
@@ -170,6 +180,10 @@ def main():
             for row in finished.tolist():
                 intercept_times += episode_intercept_times[row]
                 episode_intercept_times[row] = []
+            for a in raw.cfg.possible_agents:
+                returns[a] += ep_return[a][finished].tolist()
+                ep_return[a][finished] = 0.0
+            episode_lengths += (step_in_episode[finished] * raw.step_dt).tolist()
             step_in_episode[finished] = 0.0
 
     label = args_cli.checkpoint or f"baseline:{args_cli.baseline or zero}"
@@ -177,6 +191,10 @@ def main():
     print("episodes:            %d" % episodes, flush=True)
     print("interception rate:   %.1f%% of attackers" % (100.0 * intercepted / max(attacker_slots, 1)), flush=True)
     print("breach rate:         %.1f%% of episodes" % (100.0 * breaches / max(episodes, 1)), flush=True)
+    for a in raw.cfg.possible_agents:
+        print("return %-11s %.1f (mean of %d episodes)" % (a + ":", sum(returns[a]) / max(len(returns[a]), 1), len(returns[a])), flush=True)
+    print("episode length:      %.1f s" % (sum(episode_lengths) / max(len(episode_lengths), 1)), flush=True)
+    print("mean |v cmd|:        %.2f" % (action_norm_sum / max(action_steps, 1)), flush=True)
     if intercept_times:
         mean_t = sum(intercept_times) / len(intercept_times)
         print("time to intercept:   %.1f s (mean of %d)" % (mean_t, len(intercept_times)), flush=True)
