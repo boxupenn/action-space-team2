@@ -39,6 +39,7 @@ parser.add_argument("--task", type=str, default="AS-Defend-v0")
 parser.add_argument("--algorithm", type=str, default="IPPO", choices=["IPPO", "MAPPO"])
 parser.add_argument("--num_envs", type=int, default=512)
 parser.add_argument("--steps", type=int, default=200, help="Env steps to collect (samples = steps * num_envs per agent).")
+parser.add_argument("--teacher", type=str, default="chase", choices=["chase", "smart"], help="Scripted teacher to clone.")
 parser.add_argument("--noise", type=float, default=0.3, help="Std of the Gaussian noise added to the executed teacher action.")
 parser.add_argument(
     "--teacher_scale", type=float, default=1.0,
@@ -78,7 +79,7 @@ import torch
 from skrl.utils.runner.torch import Runner
 
 import action_space_kit.tasks  # noqa: F401
-from action_space_kit.tasks.direct.tello_defend.chase import chase_actions
+from action_space_kit.tasks.direct.tello_defend.chase import chase_actions, smart_actions
 from isaaclab_rl.skrl import SkrlVecEnvWrapper
 from isaaclab_tasks.utils import load_cfg_from_registry, parse_env_cfg
 
@@ -136,7 +137,8 @@ def main():
     buffers = {uid: ([], [], []) for uid in raw.cfg.possible_agents}  # obs, teacher action, reward
     dones = []
     for _ in range(args_cli.steps):
-        teacher = {uid: a * args_cli.teacher_scale for uid, a in chase_actions(raw, obs).items()}
+        teach = chase_actions if args_cli.teacher == "chase" else smart_actions
+        teacher = {uid: a * args_cli.teacher_scale for uid, a in teach(raw, obs).items()}
         for uid in raw.cfg.possible_agents:
             buffers[uid][0].append(obs[uid].clone())
             buffers[uid][1].append(teacher[uid].clone())
