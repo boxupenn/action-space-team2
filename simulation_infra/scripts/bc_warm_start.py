@@ -14,8 +14,14 @@ the policy mean onto its actions first and hand the result to ``skrl/train.py --
 
 The checkpoint is a normal skrl IPPO save (policy, value, optimizer, preprocessors per agent):
 the observation scaler is fitted on the collected data, the policy mean on the chase actions,
-the value head is left untrained (PPO fits it in the first iterations) and the policy std is
-set to ``--log_std`` so exploration noise does not drown the cloned mean.
+the value head (shared trunk, ``models.separate: False``) on Monte Carlo returns of the noisy
+teacher rollouts through the value preprocessor, and the policy std is set to ``--log_std`` so
+exploration noise does not drown the cloned mean. Fitting the critic matters: with an untrained
+value head PPO's first updates push garbage gradients through the shared trunk and the cloned
+policy is destroyed within ~100 iterations (reward +132 -> -38 in the first attempt).
+
+Note: ``skrl/train.py --checkpoint`` runs are bit-identical across ``--seed`` values (verified
+2026-10-23 for any checkpoint), so vary ``--seed`` HERE to get different starting points.
 
 Data is collected DART-style: the executed action is chase + Gaussian noise (``--noise``), the
 label is the clean chase action, so the policy also sees states slightly off the teacher's path.
@@ -38,6 +44,8 @@ parser.add_argument("--epochs", type=int, default=30)
 parser.add_argument("--batch", type=int, default=4096)
 parser.add_argument("--lr", type=float, default=1e-3)
 parser.add_argument("--log_std", type=float, default=-1.0, help="Policy log std after cloning (-1.0 -> std 0.37).")
+parser.add_argument("--value_coef", type=float, default=0.5, help="Weight of the value-head loss in the joint BC loss.")
+parser.add_argument("--drop_tail", type=int, default=50, help="Trailing steps without a return bootstrap, dropped from the datasets.")
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--out", type=str, default="outputs/exports/bc_defend.pt")
 AppLauncher.add_app_launcher_args(parser)
@@ -114,9 +122,10 @@ def main():
     agent_cfg["agent"]["experiment"]["checkpoint_interval"] = 0
     agent = Runner(SkrlVecEnvWrapper(env, ml_framework="torch"), agent_cfg).agent
 
-    # ---- collect (obs, chase action) pairs -------------------------------------------------
+    # ---- collect (obs, chase action, reward, done) per step ----------------------------------
     obs, _ = raw.reset()
-    buffers = {uid: ([], []) for uid in raw.cfg.possible_agents}
+    buffers = {uid: ([], [], []) for uid in raw.cfg.possible_agents}  # obs, teacher action, reward
+    dones = []
     for _ in range(args_cli.steps):
         teacher = chase_actions(raw, obs)
         for uid in raw.cfg.possible_agents:
@@ -126,43 +135,71 @@ def main():
             uid: (teacher[uid] + args_cli.noise * torch.randn_like(teacher[uid])).clamp(-1.0, 1.0)
             for uid in raw.cfg.possible_agents
         }
-        obs, _, _, _, _ = raw.step(executed)
-    n = args_cli.steps * raw.num_envs
-    print(f"[bc] collected {n} samples per agent ({args_cli.steps} steps x {raw.num_envs} envs)", flush=True)
+        obs, rew, term, trunc, _ = raw.step(executed)
+        for uid in raw.cfg.possible_agents:
+            buffers[uid][2].append(rew[uid].clone().flatten())
+        a0 = raw.cfg.possible_agents[0]
+        dones.append((term[a0] | trunc[a0]).float().flatten())
+    print(f"[bc] collected {args_cli.steps * raw.num_envs} samples per agent ({args_cli.steps} steps x {raw.num_envs} envs)", flush=True)
 
-    # ---- fit scaler + policy mean per agent -------------------------------------------------
+    # Monte Carlo returns along each env's trajectory; the last --drop_tail steps have no
+    # bootstrap and are dropped from every dataset (policy, value) to keep them aligned.
+    gamma = float(agent_cfg["agent"]["discount_factor"])
+    keep = args_cli.steps - args_cli.drop_tail
+    done_t = torch.stack(dones)  # (steps, envs)
+
+    # ---- fit scaler + policy mean + value head per agent (shared trunk: one joint loss) ----
     for uid in raw.cfg.possible_agents:
-        X = torch.cat(buffers[uid][0]); Y = torch.cat(buffers[uid][1])
+        rew_t = torch.stack(buffers[uid][2])  # (steps, envs)
+        ret_t = torch.zeros_like(rew_t)
+        running = torch.zeros_like(rew_t[0])
+        for t in reversed(range(args_cli.steps)):
+            running = rew_t[t] + gamma * (1.0 - done_t[t]) * running
+            ret_t[t] = running
+        X = torch.cat(buffers[uid][0][:keep]); Y = torch.cat(buffers[uid][1][:keep])
+        R = ret_t[:keep].reshape(-1, 1)
+        n = len(X)
         prep = agent._observation_preprocessor[uid]
         if hasattr(prep, "running_mean"):
             prep(X, train=True)  # one-shot running statistics over the whole dataset
         Xn = prep(X)
-        policy = agent.policies[uid]
-        opt = torch.optim.Adam(policy.parameters(), lr=args_cli.lr)
+        vprep = agent._value_preprocessor[uid]
+        if hasattr(vprep, "running_mean"):
+            vprep(R, train=True)
+        Rn = vprep(R)  # PPO regresses the value head onto preprocessed returns; mirror that
+        policy, value = agent.policies[uid], agent.values[uid]
+        params = list(policy.parameters()) + [p for p in value.parameters() if all(p is not q for q in policy.parameters())]
+        opt = torch.optim.Adam(params, lr=args_cli.lr)
         holdout = max(1, n // 10)
-        Xtr, Ytr, Xho, Yho = Xn[holdout:], Y[holdout:], Xn[:holdout], Y[:holdout]
+        tr = slice(holdout, n); ho = slice(0, holdout)
         first = last = None
         for epoch in range(args_cli.epochs):
-            perm = torch.randperm(len(Xtr), device=Xtr.device)
+            perm = torch.randperm(n - holdout, device=Xn.device) + holdout
             total = 0.0
             for i in range(0, len(perm), args_cli.batch):
                 idx = perm[i : i + args_cli.batch]
-                _, out = policy.act({"observations": Xtr[idx]}, role="policy")
-                loss = torch.nn.functional.mse_loss(out["mean_actions"], Ytr[idx])
+                _, out = policy.act({"observations": Xn[idx]}, role="policy")
+                v, _ = value.act({"observations": Xn[idx]}, role="value")
+                loss_pi = torch.nn.functional.mse_loss(out["mean_actions"], Y[idx])
+                loss_v = torch.nn.functional.mse_loss(v, Rn[idx])
+                loss = loss_pi + args_cli.value_coef * loss_v
                 opt.zero_grad(); loss.backward(); opt.step()
-                total += loss.item() * len(idx)
-            last = total / len(Xtr)
+                total += loss_pi.item() * len(idx)
+            last = total / (n - holdout)
             first = last if first is None else first
         with torch.no_grad():
-            _, out = policy.act({"observations": Xho}, role="policy")
+            _, out = policy.act({"observations": Xn[ho]}, role="policy")
             mean = out["mean_actions"]
-            ho_mse = torch.nn.functional.mse_loss(mean, Yho).item()
-            moving = Yho[:, :3].norm(dim=-1) > 0.5  # teacher is moving (an attacker is alive)
-            cos = torch.nn.functional.cosine_similarity(mean[moving, :3], Yho[moving, :3], dim=-1).mean().item()
+            ho_mse = torch.nn.functional.mse_loss(mean, Y[ho]).item()
+            moving = Y[ho][:, :3].norm(dim=-1) > 0.5  # teacher is moving (an attacker is alive)
+            cos = torch.nn.functional.cosine_similarity(mean[moving, :3], Y[ho][moving, :3], dim=-1).mean().item()
+            v, _ = value.act({"observations": Xn[ho]}, role="value")
+            v_ev = 1.0 - (v - Rn[ho]).var().item() / max(Rn[ho].var().item(), 1e-8)  # explained variance
             policy.log_std_parameter.fill_(args_cli.log_std)
         print(
-            f"[bc] {uid}: train mse {first:.4f} -> {last:.4f}, holdout mse {ho_mse:.4f}, "
-            f"direction cosine {cos:.3f} (n={int(moving.sum())}), log_std set to {args_cli.log_std}",
+            f"[bc] {uid}: policy mse {first:.4f} -> {last:.4f} (holdout {ho_mse:.4f}), direction cosine {cos:.3f} "
+            f"(n={int(moving.sum())}), value explained var {v_ev:.3f}, returns mean {R.mean().item():.1f} "
+            f"std {R.std().item():.1f}, log_std set to {args_cli.log_std}",
             flush=True,
         )
 
