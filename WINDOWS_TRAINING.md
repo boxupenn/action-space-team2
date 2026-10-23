@@ -543,3 +543,27 @@ seed 42 的策略学到的是"守门"而不是追击：一架防守机停在基�
 
 结论：均值跑飞是所有 Defend 训练（IPPO、MAPPO、从零、BC 起点）的通病，tanh 能限住它，但 BC 起点仍先跌后慢升，所以跑飞是症状不是根因。
 MAPPO 不比 IPPO 好。下一组（12.7）拆开策略 / value 网络（`agent.models.separate=True`）并在 BC 阶段把 critic 一起拟合，另测冻结观测标准化器。
+
+### 12.7 实机规格落地：3 防守 vs 2 攻击，脚本教师 + DAgger 克隆（2026-10-23 19:40-19:47，远程）
+
+实机规格（19:40 公布）：**3 架 defender、2 架 attacker**，允许直接把 attacker 撞下来，要求"拦截失败就派新机继续"。
+对应改动（commit 039ac04）：`tello_defend_env_cfg.py` `NUM_DEFENDERS = 3`（观测维度不变 = 9 + 7×2 = 23；`target_mode="assigned"` 在 3 > 2 时自动退回 nearest）；捕获半径保持 0.35 m 当作撞击接触。
+
+**脚本教师**（`tasks/direct/tello_defend/chase.py`，`evaluate.py --baseline <name>`）：
+- `smart`：一对一分配（总距离最小的排列）+ 领先追击（解 |r + v_a t| = v_max t 的拦截点，v_max = 1 m/s；无解退回纯追击）。2v2 默认难度 **100% / 0%**（chase 88.8% / 22%）。但分配用到另一架防守机的距离，单机观测里没有，**克隆不出来**（离线 BC 只有 32-47%）。
+- `smart2`：分配只用自身观测：按攻击者绕基地的方位角排序，defender_i 取第 i 个；多出来的防守机当**守门员**，追离基地最近的攻击者（= "拦截失败就有新机顶上"）。两机看到的攻击者一样，排序一致，不需要通信。
+
+**DAgger**（`bc_warm_start.py --dagger_rounds K`）：round0 用教师 + 噪声采样；之后每轮用学生均值动作跑环境、教师标注、累加数据、重拟合标准化器和策略。
+0.35 m 捕获半径下纯离线 BC 的复合误差太大，DAgger 两轮后 holdout mse 从 0.0146 降到 0.0066，方向余弦从 0.974 到 **0.992**（54 万样本/机）。
+
+| 3v2，默认难度，200 回合 | waves 关：拦截 / 突破 / 每机回报 / 用时 | waves 开：拦截 / 突破 |
+|---|---|---|
+| zero | 6.2% / 100% / -12.6 | |
+| chase | 96.5% / 7.0% / +78.2 / 3.5 s | |
+| **smart2 教师** | **100% / 0%** / +83.1 / 3.7 s | 411% / 0.8% |
+| **DAgger 克隆（3 机各一网络，均值动作）** | **98.8% / 1.5%** / +85.3 / 3.9 s | 355% / 14.5% |
+| 同上，采样动作（std 0.37） | **100% / 0%** / +85.8 / 4.2 s | |
+
+检查点 `outputs/exports/v32_smart2_dagger.pt`（远程），标准 skrl IPPO 格式，`export_skrl_policy.py --agent defender_{0,1,2}` 逐机导出 TorchScript。
+正在跑 `--steps 800 --dagger_rounds 4` 版本以缩小 waves 开时与教师的差距（长回合、多波次下学生漂移）。
+部署仍需桥接层把世界系速度按 yaw 旋转再发 `rc`（11.1 节）。
