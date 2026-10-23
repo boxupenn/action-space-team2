@@ -12,6 +12,7 @@ import argparse
 import sys
 from pathlib import Path
 
+import h5py  # noqa: F401  Windows: load h5py's hdf5.dll before Kit's isaacsim.sensors.rtx loads an incompatible one
 from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description="Play a checkpoint of an RL agent from Stable-Baselines3.")

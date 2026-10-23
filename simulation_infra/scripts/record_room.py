@@ -58,6 +58,7 @@ parser.add_argument("--frame_dir", type=str, default="outputs/frames_room")
 parser.add_argument("--keep_frames", action="store_true")
 args, _ = parser.parse_known_args()
 
+import h5py  # noqa: E402, F401  Windows: load h5py's hdf5.dll before Kit's isaacsim.sensors.rtx loads an incompatible one
 from isaaclab.app import AppLauncher  # noqa: E402
 
 # Livestream mode keeps the viewport pipeline alive in headless mode; without it captures

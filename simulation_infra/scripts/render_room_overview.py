@@ -18,6 +18,7 @@ parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.R
 parser.add_argument("--out", default="outputs/room_overview.png")
 args, _ = parser.parse_known_args()
 
+import h5py  # noqa: E402, F401  Windows: load h5py's hdf5.dll before Kit's isaacsim.sensors.rtx loads an incompatible one
 from isaaclab.app import AppLauncher  # noqa: E402
 
 app_launcher = AppLauncher({"headless": True, "enable_cameras": True, "livestream": 1})

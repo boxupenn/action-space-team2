@@ -29,10 +29,11 @@ parser.add_argument("--legacy_geometry", action="store_true", help="Pre-it5 geom
 parser.add_argument("--set", nargs="*", default=[], help="Extra cfg overrides, key=python_literal.")
 parser.add_argument("--label", type=str, default="", help="Tag printed with each episode result.")
 parser.add_argument("--ticks_per_capture", type=int, default=3, help="App ticks after each capture.")
-parser.add_argument("--out", type=str, default="/mnt/data/isaac/videos/approach.mp4")
-parser.add_argument("--frame_dir", type=str, default="/mnt/data/isaac/tmp/approach_frames")
+parser.add_argument("--out", type=str, default="outputs/videos/approach.mp4")
+parser.add_argument("--frame_dir", type=str, default="outputs/frames_approach")
 args, _ = parser.parse_known_args()
 
+import h5py  # noqa: E402, F401  Windows: load h5py's hdf5.dll before Kit's isaacsim.sensors.rtx loads an incompatible one
 from isaaclab.app import AppLauncher  # noqa: E402
 
 # Livestream mode keeps the viewport pipeline alive in headless mode; without it captures
@@ -200,7 +201,12 @@ def main() -> int:
                     if os.path.exists(last):
                         break
                     u.sim.render()  # the viewport capture is async; let it land before copying
-                shutil.copyfile(last, os.path.join(args.frame_dir, f"frame_{frame:05d}.png"))
+                for _retry in range(50):  # Windows: the async PNG writer may still hold the file
+                    try:
+                        shutil.copyfile(last, os.path.join(args.frame_dir, f"frame_{frame:05d}.png"))
+                        break
+                    except PermissionError:
+                        u.sim.render()
                 frame += 1
         spans.append((first, frame - 1, steps, short))
 
@@ -214,7 +220,13 @@ def main() -> int:
     # overlay "attempt k/N", and the result over the held end frames
     from PIL import Image, ImageDraw, ImageFont
 
-    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 28)
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 28)
+    except OSError:  # Windows: no DejaVu; try Arial Bold, then Pillow's bundled font
+        try:
+            font = ImageFont.truetype("arialbd.ttf", 28)
+        except OSError:
+            font = ImageFont.load_default(size=28)
     hold = int(1.5 / u.step_dt)
     for k, (a, b, steps, short) in enumerate(spans):
         for i in range(a, b + 1):

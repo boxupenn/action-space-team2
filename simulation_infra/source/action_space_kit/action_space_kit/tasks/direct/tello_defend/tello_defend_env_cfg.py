@@ -83,3 +83,31 @@ class TelloDefendEnvCfg(DirectMARLEnvCfg):
     rew_scale_breach = -20.0  # an attacker reaching the site (shared)
     rew_scale_effort = -0.01
     rew_scale_alive = 0.1
+
+    # - shaping variants (WINDOWS_TRAINING.md section 10); the defaults reproduce the original reward
+    closing_mode = "distance"
+    """What ``rew_scale_closing`` pays for.
+
+    ``"distance"``: the per-step decrease of the distance to the target attacker. A stationary
+    defender earns it too, because the attacker flies towards the site on its own.
+    ``"own_motion"``: the defender's own velocity projected onto the direction to its target,
+    times step_dt (metres closed by its own motion), so only the defender moving at its target pays.
+    """
+    yaw_action = True
+    """Whether the defenders' fourth action channel (yaw rate) is applied.
+
+    ``False`` forces the yaw-rate command to zero (the action space stays 4-D, the channel is
+    ignored), so a defender keeps the heading it spawned with. It was the section 10 workaround
+    for the controller-frame bug (the world-frame force used to be applied in the body frame, so
+    a yawed drone's horizontal loop rotated with its heading); the controller now returns a
+    body-frame force and yaw no longer disturbs the velocity loop (section 11), so the default
+    ``True`` is the normal setting and ``False`` only reproduces the section 10 runs.
+    """
+    target_mode = "nearest"
+    """Which attacker the closing / proximity terms refer to.
+
+    ``"nearest"``: the nearest live attacker; both defenders may chase the same one.
+    ``"assigned"``: a one-to-one assignment, the permutation of attackers that minimises the summed
+    defender-to-attacker distance over live attackers, so the defenders split the attackers. A
+    defender whose assigned attacker is down falls back to the nearest live one.
+    """

@@ -20,11 +20,12 @@ parser = argparse.ArgumentParser(description="Record a defend-scenario clip.")
 parser.add_argument("--frames", type=int, default=150, help="Frames to capture.")
 parser.add_argument("--capture_every", type=int, default=2, help="Sim steps between captures.")
 parser.add_argument("--ticks_per_capture", type=int, default=3, help="App ticks after each capture.")
-parser.add_argument("--out", type=str, default="/mnt/data/isaac/videos/defend_chase.mp4")
+parser.add_argument("--out", type=str, default="outputs/videos/defend_chase.mp4")
 parser.add_argument("--fps", type=int, default=20)
-parser.add_argument("--frame_dir", type=str, default="/mnt/data/isaac/tmp/clip_frames")
+parser.add_argument("--frame_dir", type=str, default="outputs/frames_clip")
 args, _ = parser.parse_known_args()
 
+import h5py  # noqa: E402, F401  Windows: load h5py's hdf5.dll before Kit's isaacsim.sensors.rtx loads an incompatible one
 from isaaclab.app import AppLauncher  # noqa: E402
 
 # livestream mode is not optional here. In plain headless mode Isaac Lab sets
@@ -82,9 +83,11 @@ while captured < args.frames:
     actions = {}
     for agent in env.cfg.possible_agents:
         rel = obs[agent][:, 9 : 9 + 3 * num_attackers].reshape(env.num_envs, num_attackers, 3)
-        distance = torch.linalg.norm(rel, dim=-1)
+        alive = obs[agent][:, 9 + 6 * num_attackers : 9 + 7 * num_attackers] > 0.5  # skip downed attackers
+        distance = torch.where(alive, torch.linalg.norm(rel, dim=-1), torch.full_like(rel[..., 0], float("inf")))
         target = rel[torch.arange(env.num_envs, device=env.device), distance.argmin(dim=-1)]
         direction = target / torch.clamp(torch.linalg.norm(target, dim=-1, keepdim=True), min=1e-6)
+        direction = direction * alive.any(dim=-1, keepdim=True).float()
         actions[agent] = torch.cat([direction, torch.zeros(env.num_envs, 1, device=env.device)], dim=-1)
 
     obs, _, _, _, _ = env.step(actions)

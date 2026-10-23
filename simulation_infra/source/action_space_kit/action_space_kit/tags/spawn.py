@@ -78,7 +78,7 @@ def spawn_tag(stage, root: str, tag: Tag, board_thickness: float = 0.006) -> Non
     quad.CreateDoubleSidedAttr(False)
     st = UsdGeom.PrimvarsAPI(quad).CreatePrimvar("st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.vertex)
     st.Set(Vt.Vec2fArray([Gf.Vec2f(0, 0), Gf.Vec2f(1, 0), Gf.Vec2f(1, 1), Gf.Vec2f(0, 1)]))
-    mat = _preview_material(stage, f"{path}/face_mat", texture=str(texture_path(tag.tag_id)))
+    mat = _preview_material(stage, f"{path}/face_mat", texture=texture_path(tag.tag_id).as_posix())
     UsdShade.MaterialBindingAPI.Apply(quad.GetPrim()).Bind(mat)
 
     board = UsdGeom.Cube.Define(stage, f"{path}/board")

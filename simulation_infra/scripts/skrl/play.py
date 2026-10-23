@@ -15,6 +15,7 @@ a more user-friendly way.
 import argparse
 import sys
 
+import h5py  # noqa: F401  Windows: load h5py's hdf5.dll before Kit's isaacsim.sensors.rtx loads an incompatible one
 from isaaclab.app import AppLauncher
 
 # add argparse arguments
@@ -57,6 +58,7 @@ parser.add_argument(
     help="The RL algorithm used for training the skrl agent.",
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument("--steps", type=int, default=0, help="Stop after this many env steps (0 = run until the window closes).")
 
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -216,6 +218,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
     # reset environment
     obs, _ = env.reset()
     timestep = 0
+    ep_return = None  # running per-env return, summed over agents for multi-agent envs
+    finished_returns: list[float] = []
     # simulate environment
     while simulation_app.is_running():
         start_time = time.time()
@@ -237,18 +241,41 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
             else:
                 actions = outputs[-1].get("mean_actions", outputs[0])
             # env stepping
-            obs, _, _, _, _ = env.step(actions)
-        if args_cli.video:
-            timestep += 1
-            # exit the play loop after recording one video
-            if timestep == args_cli.video_length:
-                break
+            obs, rew, terminated, truncated, _ = env.step(actions)
+            # episode-return bookkeeping, printed when the run ends
+            if isinstance(rew, dict):
+                rew_sum = sum(r.reshape(-1).float() for r in rew.values())
+                done = torch.zeros_like(rew_sum, dtype=torch.bool)
+                for a in terminated:
+                    done |= terminated[a].reshape(-1) | truncated[a].reshape(-1)
+            else:
+                rew_sum = rew.reshape(-1).float()
+                done = (terminated | truncated).reshape(-1)
+            if ep_return is None:
+                ep_return = torch.zeros_like(rew_sum)
+            ep_return += rew_sum
+            if done.any():
+                finished_returns += ep_return[done].tolist()
+                ep_return[done] = 0.0
+        timestep += 1
+        # exit the play loop after recording one video, or after --steps steps (headless runs never
+        # close the window on their own)
+        if args_cli.video and timestep == args_cli.video_length:
+            break
+        if args_cli.steps and timestep >= args_cli.steps:
+            print(f"[play] stopping after {timestep} steps", flush=True)
+            break
 
         # time delay for real-time evaluation
         sleep_time = dt - (time.time() - start_time)
         if args_cli.real_time and sleep_time > 0:
             time.sleep(sleep_time)
 
+    if finished_returns:
+        print(f"[play] {len(finished_returns)} episodes finished: mean return {sum(finished_returns) / len(finished_returns):.2f}"
+              f" (min {min(finished_returns):.2f}, max {max(finished_returns):.2f})", flush=True)
+    else:
+        print("[play] no episode finished within the run", flush=True)
     # close the simulator
     env.close()
 

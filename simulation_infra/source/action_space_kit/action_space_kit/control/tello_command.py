@@ -13,6 +13,17 @@ four ``rc`` channels:
 The onboard firmware closes the attitude loop on the real drone, so the sim does the
 same here: the policy sets velocities, and this controller produces the wrench that
 tracks them, with first-order lag and acceleration limits to imitate Tello response.
+
+Frames: the velocity command and the velocity loop live in the WORLD frame (vx = world
+x, vy = world y), matching the world-frame observations and the scripted baselines of
+every task, so a policy needs no heading input. The returned force is rotated into the
+body frame because ``RigidObject.set_external_force_and_torque`` applies wrenches in the
+link frame by default (``is_global=False``); before this rotation a yawed drone's
+horizontal loop turned with its heading and inverted near 180 degrees (see
+WINDOWS_TRAINING.md section 11). Passing ``is_global=True`` instead is wrong here: Isaac
+Lab then rotates the torque too, and the levelling torque is a body-frame quantity. On
+hardware the bridge rotates the world-frame velocity by the drone's yaw before sending
+``rc`` (whose channels are body-relative).
 """
 
 from __future__ import annotations
@@ -50,11 +61,19 @@ class TelloCommandCfg:
     """Delay applied to commands, in control steps. Set >0 to model SDK latency."""
 
 
+def _rotate_inverse(quat: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
+    """Rotate world-frame vectors into the body frame of ``quat`` (w, x, y, z); (N, 4) and (N, 3)."""
+    w, xyz = quat[:, :1], quat[:, 1:]
+    t = 2.0 * torch.cross(xyz, vec, dim=-1)
+    return vec - w * t + torch.cross(xyz, t, dim=-1)
+
+
 class TelloVelocityController:
     """Turns [vx, vy, vz, yaw_rate] actions into body wrenches for a rigid body.
 
     Works on batched environments. Call :meth:`compute` each control step and pass the
-    returned force/torque to ``RigidObject.set_external_force_and_torque``.
+    returned force/torque to ``RigidObject.set_external_force_and_torque`` with the default
+    ``is_global=False``: both outputs are in the body (link) frame.
     """
 
     def __init__(self, cfg: TelloCommandCfg, num_envs: int, mass: float, inertia_zz: float, device: str):
@@ -97,15 +116,17 @@ class TelloVelocityController:
         self,
         actions: torch.Tensor,
         lin_vel_w: torch.Tensor,
+        quat_w: torch.Tensor,
         ang_vel_b: torch.Tensor,
         projected_gravity_b: torch.Tensor,
         dt: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return (force_w, torque_b), each shaped (num_envs, 1, 3).
+        """Return (force_b, torque_b), each shaped (num_envs, 1, 3), both in the body frame.
 
         Args:
             actions: policy output in [-1, 1], shape (num_envs, 4).
             lin_vel_w: current linear velocity in world frame, (num_envs, 3).
+            quat_w: current orientation in world frame as (w, x, y, z), (num_envs, 4).
             ang_vel_b: current angular velocity in body frame, (num_envs, 3).
             projected_gravity_b: gravity direction in body frame, (num_envs, 3).
             dt: control step in seconds.
@@ -134,6 +155,9 @@ class TelloVelocityController:
         accel = accel.clamp(-self.cfg.max_lin_accel, self.cfg.max_lin_accel)
         force_w = self.mass * accel
         force_w[:, 2] += self.mass * 9.81
+        # PhysX applies the wrench in the link frame: express the world-frame force there so
+        # the velocity loop stays in the world frame whatever the heading (module docstring).
+        force_b = _rotate_inverse(quat_w, force_w)
 
         # levelling loop: hold roll/pitch at zero, track the yaw rate command
         torque_b = torch.zeros_like(force_w)
@@ -142,4 +166,4 @@ class TelloVelocityController:
         torque_b[:, 2] = self.inertia_zz * (self._yaw_rate_cmd - ang_vel_b[:, 2]) / max(self.cfg.response_time, 1e-6)
         torque_b[:, :2] *= self.inertia_zz
 
-        return force_w.unsqueeze(1), torque_b.unsqueeze(1)
+        return force_b.unsqueeze(1), torque_b.unsqueeze(1)

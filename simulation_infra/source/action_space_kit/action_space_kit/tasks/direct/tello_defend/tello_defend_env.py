@@ -7,6 +7,7 @@ default and dive towards the protected site.
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Sequence
 
 import torch
@@ -50,6 +51,17 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
         self._attacker_speed = torch.zeros(self.num_envs, self.cfg.num_attackers, device=self.device)
         self._breached = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         self._prev_distance = torch.zeros(self.num_envs, self.cfg.num_defenders, device=self.device)
+        if self.cfg.closing_mode not in ("distance", "own_motion"):
+            raise ValueError(f"closing_mode must be 'distance' or 'own_motion', got {self.cfg.closing_mode!r}")
+        if self.cfg.target_mode not in ("nearest", "assigned"):
+            raise ValueError(f"target_mode must be 'nearest' or 'assigned', got {self.cfg.target_mode!r}")
+        # target_mode "assigned": every injective defender -> attacker map, (num_perms, num_defenders)
+        if self.cfg.num_defenders <= self.cfg.num_attackers:
+            perms = list(itertools.permutations(range(self.cfg.num_attackers), self.cfg.num_defenders))
+        else:  # more defenders than attackers: no one-to-one map exists, fall back to nearest
+            perms = []
+        self._target_perms = torch.tensor(perms, dtype=torch.long, device=self.device)
+        self._yaw_mask = torch.tensor([1.0, 1.0, 1.0, 0.0], device=self.device)
         # Episode outcome, latched in _get_dones before Isaac Lab resets the environment.
         # Reading _breached after env.step() is too late: the reset has already cleared it.
         self._episode_captures = torch.zeros(self.num_envs, device=self.device)
@@ -104,9 +116,13 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
 
     def _apply_action(self) -> None:
         for i, drone in enumerate(self._defenders):
+            actions = self._actions[f"defender_{i}"]
+            if not self.cfg.yaw_action:
+                actions = actions * self._yaw_mask
             force, torque = self._defender_ctl[i].compute(
-                actions=self._actions[f"defender_{i}"],
+                actions=actions,
                 lin_vel_w=drone.data.root_lin_vel_w,
+                quat_w=drone.data.root_quat_w,
                 ang_vel_b=drone.data.root_ang_vel_b,
                 projected_gravity_b=drone.data.projected_gravity_b,
                 dt=self.physics_dt,
@@ -118,6 +134,7 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
             force, torque = self._attacker_ctl[i].compute(
                 actions=attacker_actions[i],
                 lin_vel_w=drone.data.root_lin_vel_w,
+                quat_w=drone.data.root_quat_w,
                 ang_vel_b=drone.data.root_ang_vel_b,
                 projected_gravity_b=drone.data.projected_gravity_b,
                 dt=self.physics_dt,
@@ -204,17 +221,24 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
         cleared = captured.any(dim=-1) & ~self._attacker_alive.any(dim=-1)
         self._episode_captures += captured.float().sum(dim=-1)
 
+        # the attacker each defender's shaping terms refer to: distance and unit direction to it
+        target_dist, target_dir = self._select_targets(attacker_pos)
+        any_alive = self._attacker_alive.any(dim=-1)
+
         rewards = {}
         for i, drone in enumerate(self._defenders):
-            dist = torch.linalg.norm(attacker_pos - drone.data.root_pos_w.unsqueeze(1), dim=-1)
-            any_alive = self._attacker_alive.any(dim=-1)
-            dist = torch.where(self._attacker_alive, dist, torch.full_like(dist, float("inf")))
-            nearest = dist.min(dim=-1).values
+            nearest = target_dist[:, i]
             # With no live attacker left there is no distance to close. Carrying the
             # previous value keeps `closing` at zero instead of swinging to the clamp,
             # which otherwise punishes the defender for the capture it just made.
             nearest = torch.where(any_alive, nearest, self._prev_distance[:, i])
-            closing = self._prev_distance[:, i] - nearest
+            if self.cfg.closing_mode == "own_motion":
+                # metres closed by the defender's own motion this step; an attacker flying at a
+                # stationary defender pays nothing
+                closing = torch.sum(drone.data.root_lin_vel_w * target_dir[:, i], dim=-1) * self.step_dt
+                closing = closing * any_alive.float()
+            else:
+                closing = self._prev_distance[:, i] - nearest
             self._prev_distance[:, i] = nearest
             effort = torch.sum(torch.square(self._actions[f"defender_{i}"]), dim=-1)
             proximity = torch.exp(-nearest.clamp(min=0.0, max=self.cfg.spawn_radius * 2.0) / self.cfg.spawn_radius)
@@ -242,6 +266,33 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
             )
             rewards[f"defender_{i}"] = shaping + events
         return rewards
+
+    def _select_targets(self, attacker_pos: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pick each defender's target attacker for the shaping terms.
+
+        Returns the distance to it, (num_envs, num_defenders), ``inf`` where no attacker is
+        alive, and the unit direction from the defender to it, (num_envs, num_defenders, 3).
+        ``cfg.target_mode`` selects the nearest live attacker or a one-to-one assignment.
+        """
+        defender_pos = torch.stack([d.data.root_pos_w for d in self._defenders], dim=1)
+        rel = attacker_pos.unsqueeze(1) - defender_pos.unsqueeze(2)  # (envs, defenders, attackers, 3)
+        dist = torch.linalg.norm(rel, dim=-1)
+        dist = torch.where(self._attacker_alive.unsqueeze(1), dist, torch.full_like(dist, float("inf")))
+        nearest = dist.argmin(dim=-1)  # (envs, defenders)
+        if self.cfg.target_mode == "assigned" and len(self._target_perms):
+            # cheapest injective map; a downed attacker costs a lot so it is avoided when possible
+            cost_dist = torch.where(torch.isinf(dist), torch.full_like(dist, 1.0e3), dist)
+            rows = torch.arange(self.cfg.num_defenders, device=self.device).unsqueeze(0).expand_as(self._target_perms)
+            cost = cost_dist[:, rows, self._target_perms].sum(dim=-1)  # (envs, perms)
+            target = self._target_perms[cost.argmin(dim=-1)]  # (envs, defenders)
+            assigned_alive = self._attacker_alive.gather(1, target)
+            target = torch.where(assigned_alive, target, nearest)
+        else:
+            target = nearest
+        target_dist = dist.gather(2, target.unsqueeze(-1)).squeeze(-1)  # (envs, defenders)
+        target_rel = rel.gather(2, target[..., None, None].expand(-1, -1, 1, 3)).squeeze(2)
+        target_dir = target_rel / torch.clamp(torch.linalg.norm(target_rel, dim=-1, keepdim=True), min=1e-6)
+        return target_dist, target_dir
 
     def _get_dones(self) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         time_out = self.episode_length_buf >= self.max_episode_length - 1

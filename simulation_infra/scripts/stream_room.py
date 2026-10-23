@@ -27,6 +27,7 @@ parser.add_argument("--livestream", type=int, default=2, help="1: public-IP WebR
 parser.add_argument("--set", nargs="*", default=[], help="extra env cfg overrides, key=python_literal (dots for nesting)")
 args, _ = parser.parse_known_args()
 
+import h5py  # noqa: E402, F401  Windows: load h5py's hdf5.dll before Kit's isaacsim.sensors.rtx loads an incompatible one
 from isaaclab.app import AppLauncher  # noqa: E402
 
 app_launcher = AppLauncher({"headless": True, "livestream": args.livestream})

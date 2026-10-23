@@ -24,6 +24,7 @@ parser.add_argument("--out_dir", default="outputs/room_views")
 parser.add_argument("--drone", default="tello_3", help="camera calibration to use (config/camera/<drone>.yaml)")
 args, _ = parser.parse_known_args()
 
+import h5py  # noqa: E402, F401  Windows: load h5py's hdf5.dll before Kit's isaacsim.sensors.rtx loads an incompatible one
 from isaaclab.app import AppLauncher  # noqa: E402
 
 # livestream keeps the viewport pipeline alive headless (see record_approach.py)

@@ -59,14 +59,15 @@ class TelloHoverEnv(DirectRLEnv):
         self._actions = actions.clone().clamp(-1.0, 1.0)
 
     def _apply_action(self) -> None:
-        force_w, torque_b = self._controller.compute(
+        force_b, torque_b = self._controller.compute(
             actions=self._actions,
             lin_vel_w=self._robot.data.root_lin_vel_w,
+            quat_w=self._robot.data.root_quat_w,
             ang_vel_b=self._robot.data.root_ang_vel_b,
             projected_gravity_b=self._robot.data.projected_gravity_b,
             dt=self.physics_dt,
         )
-        self._robot.set_external_force_and_torque(forces=force_w, torques=torque_b, body_ids=[0])
+        self._robot.set_external_force_and_torque(forces=force_b, torques=torque_b, body_ids=[0])
 
     def _get_observations(self) -> dict:
         goal_error_w = self._goal_pos_w - self._robot.data.root_pos_w

@@ -14,6 +14,8 @@ cannot beat greedy pursuit is not yet worth flying.
 """
 
 import argparse
+import ast
+import re
 
 from isaaclab.app import AppLauncher
 
@@ -34,7 +36,19 @@ parser.add_argument("--video", action="store_true", default=False, help="Record 
 parser.add_argument("--video_length", type=int, default=400, help="Video length in steps.")
 parser.add_argument("--video_dir", type=str, default="videos/evaluate", help="Where to write the video.")
 AppLauncher.add_app_launcher_args(parser)
-args_cli = parser.parse_args()
+# extra `env.<field>=<python literal>` arguments override the env config (e.g. env.capture_radius=1.0);
+# `agent.<key>=<value>` ones override the skrl agent yaml the checkpoint was trained with (same paths as
+# train.py's Hydra overrides, e.g. agent.models.policy.output='tanh(ACTIONS)'), so the model is rebuilt to match
+args_cli, _overrides = parser.parse_known_args()
+env_overrides, agent_overrides = [], []
+for _arg in _overrides:
+    if re.fullmatch(r"env\.[A-Za-z_][A-Za-z0-9_.]*=.+", _arg):
+        env_overrides.append(_arg)
+    elif re.fullmatch(r"agent\.[A-Za-z_][A-Za-z0-9_.]*=.+", _arg):
+        agent_overrides.append(_arg)
+    else:
+        parser.error(f"unrecognized argument: {_arg}")
+
 args_cli.headless = True
 if args_cli.video:
     args_cli.enable_cameras = True  # rendering is needed to capture frames
@@ -55,15 +69,33 @@ def chase_actions(raw, obs):
     num_attackers = raw.cfg.num_attackers
     for agent in raw.cfg.possible_agents:
         rel = obs[agent][:, 9 : 9 + 3 * num_attackers].reshape(raw.num_envs, num_attackers, 3)
-        distance = torch.linalg.norm(rel, dim=-1)
+        # the env zeroes a downed attacker's relative position and clears its alive flag (the last
+        # num_attackers entries); without masking, argmin would "chase" the downed one and hover
+        alive = obs[agent][:, 9 + 6 * num_attackers : 9 + 7 * num_attackers] > 0.5
+        distance = torch.where(alive, torch.linalg.norm(rel, dim=-1), torch.full_like(rel[..., 0], float("inf")))
         target = rel[torch.arange(raw.num_envs, device=raw.device), distance.argmin(dim=-1)]
         direction = target / torch.clamp(torch.linalg.norm(target, dim=-1, keepdim=True), min=1e-6)
+        direction = direction * alive.any(dim=-1, keepdim=True).float()  # nothing alive: hold position
         actions[agent] = torch.cat([direction, torch.zeros(raw.num_envs, 1, device=raw.device)], dim=-1)
     return actions
 
 
 def main():
     env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs)
+    for _arg in env_overrides:
+        key, value = _arg[len("env."):].split("=", 1)
+        try:
+            value = ast.literal_eval(value)
+        except (ValueError, SyntaxError):
+            pass  # keep it as a string
+        target = env_cfg
+        parts = key.split(".")
+        for part in parts[:-1]:
+            target = getattr(target, part)
+        if not hasattr(target, parts[-1]):
+            raise SystemExit(f"[evaluate] env config has no field {key!r}")
+        setattr(target, parts[-1], value)
+        print(f"[evaluate] override env.{key} = {value!r}", flush=True)
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
     if args_cli.video:
         import os
@@ -88,6 +120,20 @@ def main():
 
         entry = f"skrl_{args_cli.algorithm.lower()}_cfg_entry_point"
         agent_cfg = load_cfg_from_registry(args_cli.task, entry)
+        for _arg in agent_overrides:
+            key, value = _arg[len("agent."):].split("=", 1)
+            try:
+                value = ast.literal_eval(value)
+            except (ValueError, SyntaxError):
+                pass  # keep it as a string
+            node = agent_cfg
+            parts = key.split(".")
+            for part in parts[:-1]:
+                node = node[part]
+            if parts[-1] not in node:
+                raise SystemExit(f"[evaluate] agent config has no key {key!r}")
+            node[parts[-1]] = value
+            print(f"[evaluate] override agent.{key} = {value!r}", flush=True)
         # the wrapper takes no algorithm argument; multi-agent envs stay multi-agent
         wrapped = SkrlVecEnvWrapper(env, ml_framework="torch")
         runner = Runner(wrapped, agent_cfg)
