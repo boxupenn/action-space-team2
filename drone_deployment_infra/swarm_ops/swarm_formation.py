@@ -40,6 +40,7 @@ import re
 import socket
 import subprocess
 import sys
+import termios
 import threading
 import time
 from itertools import permutations
@@ -339,7 +340,9 @@ def preflight(d, fly):
             resent = True
         time.sleep(0.1)
     if d.frames < 5:
-        d.log("FAIL: no video" if d.packets == 0 else f"FAIL: {d.packets} packets, {d.frames} frames")
+        d.log("FAIL: no video" if d.packets == 0 else
+              f"FAIL: {d.packets} packets ({d.packets / (time.time() - t0):.0f}/s, ~90/s is healthy), "
+              f"{d.frames} frames, {d.decode_errors} decode errors -> weak link? move closer, retry")
         return False
     if d.frame.shape[1::-1] != RES:
         d.log(f"FAIL: frame {d.frame.shape[1]}x{d.frame.shape[0]}, expected {RES}")
@@ -576,6 +579,7 @@ class Drone:
         self.lock = threading.Lock()
         self.stop = threading.Event()
         self.frame, self.frame_t, self.frame_id, self.frames, self.packets = None, 0.0, 0, 0, 0
+        self.decode_errors = 0
         self.overlay = None
         self.battery = None
         self.airborne = self.landed = self.landing = False
@@ -761,7 +765,7 @@ class Drone:
                         self.frame_id += 1
                         self.frames += 1
             except Exception:
-                pass
+                self.decode_errors += 1
         vs.close()
 
     def perception_loop(self):
@@ -1026,8 +1030,11 @@ def main():
     phase, settle_t, hold_t, first_lock_t = "RUN", None, None, None
     try:
         if fly:
-            if input("All PASS. Space clear, drones 1 m+ apart? Type FLY: ").strip() != "FLY":
-                sys.exit("Aborted, no takeoff.")
+            if sys.stdin.isatty():
+                termios.tcflush(sys.stdin, termios.TCIFLUSH)  # drop keys typed during preflight
+            answer = input("All PASS. Space clear, drones 1 m+ apart? Type FLY: ").strip()
+            if answer != "FLY":
+                sys.exit(f"Aborted, no takeoff (got {answer!r}).")
             for d in drones:
                 d.airborne = True
 

@@ -19,6 +19,8 @@ import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, "..", "core"))
+from paths import DONGLES_PATH  # noqa: E402  (config/ lives in core)
 
 
 def run(cmd, timeout=40):
@@ -79,7 +81,7 @@ def main():
     ap.add_argument("drones", nargs="*", type=int, help="drone numbers, e.g. 5 8")
     ap.add_argument("--all", action="store_true", help="every drone with an ssid in dongles.json")
     ap.add_argument("--down", action="store_true", help="disconnect instead")
-    ap.add_argument("--config", default=os.path.join(HERE, "..", "config", "dongles.json") if os.path.exists(os.path.join(HERE, "..", "config", "dongles.json")) else os.path.join(HERE, "dongles.json"))
+    ap.add_argument("--config", default=str(DONGLES_PATH))
     args = ap.parse_args()
 
     with open(args.config) as f:
