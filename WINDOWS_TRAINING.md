@@ -462,3 +462,30 @@ seed 42 的策略学到的是"守门"而不是追击：一架防守机停在基�
 - `tasks\direct\tello_defend\tello_defend_env.py`（防守 / 攻击两个循环）、`tasks\direct\tello_hover\tello_hover_env.py`：传 `quat_w=drone.data.root_quat_w`；`tello_defend_env_cfg.py`：`yaw_action` 的说明改成"第 10 节的绕行开关"。
 - `scripts\windows\bench.ps1`：`Family-DefendS10` 里 `$extra` 改名 `$extraArgs`。PowerShell 变量名不分大小写，原来那行等于把拆开的列表赋回 `[string]$Extra` 参数、重新拼成一个字符串，于是 `--seed N` 跟着 `agent.models.*` 一起被转给 `evaluate.py`（exit 2；第 10 节 `s10_c7_seed1` 的评估失败也是这个原因）。本节 std 0.37 三组的评估因此由 `outputs\s11\run_s11_evals.ps1` 补跑（同名日志，timeline 追加行）。
 - 测试 / 工具都在 `outputs\s11\`（不在仓库）：`yaw_test.py`、`quat_check.py`、`apply_fix.py`（打补丁用）、`run_s11.cmd`（6 次 bench 串行）、`run_s11_evals.ps1`、`tb_summary.py`（曲线首 / 末 / 末 1/4 / 最高）。日志 `outputs\bench\s11_*.log`、`outputs\s11\*.log`；checkpoint 由各训练日志里的 run 名指向（`logs\skrl\tello_defend\2026-10-17_{12-40-52,12-47-15,12-53-23,12-59-28,13-03-11,13-06-46}_ippo_torch_tello_defend_ippo`），导出 `outputs\exports\s11_{base,std037}_seed{1,2,3}.pt`。
+
+## 12. Defend 行为克隆热启动（2026-10-23，接第 11 节；训练机换到 Linux 盒子）
+
+训练从这一节起全部跑在远程 Linux 机 `<user>@<remote-linux-box>`（RTX 5080，驱动 580.178，`source ~/isaac/activate.sh`，仓库 `~/Action_Space` 分支 `bc-warm-start`）。
+它跑 Defend IPPO 300 轮只要 **61 秒**（本机 0.68 s/轮 ≈ 3.4 分钟），没有 Vulkan 问题，也没有别的 GPU 任务。代码同步：本机 `git bundle create` → scp → 远程 `git pull --ff-only /tmp/x.bundle main`。长任务放 tmux，日志在 `simulation_infra/outputs/<dir>/`。
+
+### 12.1 动机
+
+第 11 节 6 条曲线按 50 轮分段看：出击的 seed 1 在 150-200 轮已平台（146 → 95 → 118），不出击的种子 300 轮全程为负且无上升趋势。
+加轮数救不回不出击的种子，所以改走 chase 热启动：chase 在易设置下 100% / 0%，任务可解，缺的只是让网络一开始就"知道要追"。
+
+### 12.2 工具
+
+- `tasks/direct/tello_defend/chase.py`：`chase_actions` 从 evaluate.py 抽出来共用。
+- `scripts/bc_warm_start.py`：用 chase + 高斯噪声（DART，σ=0.3）跑 512 envs × 200 步采样，标签是干净的 chase 动作。拟合观测标准化器、策略均值，
+  以及 **value 头**（蒙特卡洛回报经 value 标准化器；`models.separate: False` 是共享主干，两头一起拟合），策略 log_std 置 -1.0（std 0.37）。
+  输出是标准 skrl IPPO 检查点，`skrl/train.py --checkpoint` 和 `evaluate.py --checkpoint` 直接可读。
+
+### 12.3 发现
+
+- **BC 检查点本身**（v1，只拟合策略；易设置、波次关、200 回合）：**96.2% 拦截 / 4.0% 突破**，用时 3.1 s。不做任何 RL 已超过第 11 节最好的 IPPO（79.2% / 39.0%）。
+- **v1 续训被 PPO 拆掉**：起点回报 +132（两机之和，任何纯 IPPO 都没到过的起点），之后单调下滑到 -38，300 轮后评估 19.5% / 93.5%（= zero）。
+  原因是 value 头没训练过（起始 value loss 1.1），共享主干让它的梯度直接搅坏策略。v2 在 BC 阶段同时拟合 value 头（见 12.4）。
+- **`train.py --checkpoint` 续训与 `--seed` 无关**：从任何检查点（BC 的、纯 IPPO 的、去掉 optimizer 状态的）续训，seed 1 和 2 的权重 hash、回报曲线逐位相同；
+  不带 checkpoint 时 seed 正常起效。原因未查。绕法：在 `bc_warm_start.py --seed` 上变化得到不同起点，每个起点续训一次即可。
+- 流水线脚本里 `set -f`（防 `[0.2,0.4]` 被 glob）会连 `ls logs/.../*ippo*` 一起关掉，取训练目录要用 `find`。
+- 默认难度基线（远程，波次关，200 回合）：chase **88.8% / 22.0%**，zero 4.0% / 99.5%。第 9 节在本机测的 86.5% / 26% 同一量级。
