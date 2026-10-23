@@ -102,7 +102,46 @@ Drones ~1.5 m apart.
 
 ---
 
-## 5. Map the tags (`map_tags.py`, no flying)
+## 5. Attack + defense, scripted policies (`swarm_policies.py`, umbrella)
+
+Runs one or more policies at once, each on its own drones: `--run <policy>:<drones>`,
+repeatable. **Without `--fly` it is a dry-run.** One FLY prompt for everyone,
+all-or-nothing preflight (formation drones included), `Ctrl+C` lands all.
+Policies live one per file in `policies/` (add one there and register it in `policies/__init__.py`).
+
+| Policy | What it does |
+|---|---|
+| `spin` | defense dummy: take off, hold the takeoff height, spin in place (`--yaw`, default 40) |
+| `levels` | lower-numbered half at 3 ft (91 cm), the rest at 6 ft (183 cm), hover |
+| `hover` | hold the takeoff height, or `--height <cm>` (40-250) |
+| `formation` | `swarm_formation.py` on those drones, as its own process |
+
+```
+python swarm_policies.py --run spin:6,7,9 --run formation:4,5           # dry-run
+python swarm_policies.py --run spin:6,7,9 --run formation:4,5 --fly     # defense spins, attack forms up
+python swarm_policies.py --run hover:4,5,6,7,9 --height 200 --fly --duration 60   # photo hover at 2 m
+python swarm_policies.py --run levels:4,5,6,7,9 --fly
+```
+
+**Options**
+| Flag | Meaning |
+|---|---|
+| `--run spin:6,7,9` | a policy and its drones (repeat per group; a drone in one group only) |
+| `--fly` | actually fly (without it: dry-run, 15 s) |
+| `--duration 60` | land all after this many s (default 20; with `formation`: until it lands) |
+| `--height 200` | `hover` height above the floor, cm |
+| `--yaw -60` | `spin` speed and direction (-100..100) |
+| `--formation-args "--fast --hold 15"` | passed to `swarm_formation.py` |
+
+With `formation`, its camera windows and keys (`q`, `SPACE`) still work, but its
+`--headless` terminal keys don't (its stdin is the umbrella): use `Ctrl+C` in the
+umbrella's terminal. Formation drones only avoid each other: keep the other groups out
+of the space in front of tag 10. Safety: a drone with no status stream for 3 s or
+battery < 15 % lands on its own; takeoff needs battery >= 40 %.
+
+---
+
+## 6. Map the tags (`map_tags.py`, no flying)
 
 Needed whenever tags are added or moved. Hold the drone (props off) so it sees
 tag 10 together with each other tag until all are green, then press `q` to save.
@@ -115,7 +154,7 @@ Check: dry-run shows no `MAP CHECK` warnings.
 
 ---
 
-## 6. Troubleshooting
+## 7. Troubleshooting
 
 | Symptom | Fix |
 |---|---|
