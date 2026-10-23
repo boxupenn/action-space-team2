@@ -564,6 +564,7 @@ MAPPO 不比 IPPO 好。下一组（12.7）拆开策略 / value 网络（`agent.
 | **DAgger 克隆（3 机各一网络，均值动作）** | **98.8% / 1.5%** / +85.3 / 3.9 s | 355% / 14.5% |
 | 同上，采样动作（std 0.37） | **100% / 0%** / +85.8 / 4.2 s | |
 
-检查点 `outputs/exports/v32_smart2_dagger.pt`（远程），标准 skrl IPPO 格式，`export_skrl_policy.py --agent defender_{0,1,2}` 逐机导出 TorchScript。
-正在跑 `--steps 800 --dagger_rounds 4` 版本以缩小 waves 开时与教师的差距（长回合、多波次下学生漂移）。
+| **DAgger 4 轮（`--steps 800 --dagger_rounds 4`，192 万样本/机，余弦 0.995）** | **100% / 0%** / +81.9 / 3.7 s；采样 99.8% / 0.5% | **404.7% / 1.2%**（≈ 教师） |
+
+4 轮版本已和教师持平，**仿真里的目标达成**。交付在 `simulation_infra/policies/defend_3v2_smart2_dagger4/`：skrl 检查点 `agent_skrl_ippo.pt` + 三机 TorchScript `defender_{0,1,2}.pt`（`export_skrl_policy.py --agent`）+ 克隆日志，README 里有评估命令。
 部署仍需桥接层把世界系速度按 yaw 旋转再发 `rc`（11.1 节）。
