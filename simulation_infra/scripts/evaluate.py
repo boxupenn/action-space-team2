@@ -60,24 +60,8 @@ import gymnasium as gym
 import torch
 
 import action_space_kit.tasks  # noqa: F401
+from action_space_kit.tasks.direct.tello_defend.chase import chase_actions
 from isaaclab_tasks.utils import parse_env_cfg
-
-
-def chase_actions(raw, obs):
-    """Head straight at the nearest tracked attacker -- the baseline to beat."""
-    actions = {}
-    num_attackers = raw.cfg.num_attackers
-    for agent in raw.cfg.possible_agents:
-        rel = obs[agent][:, 9 : 9 + 3 * num_attackers].reshape(raw.num_envs, num_attackers, 3)
-        # the env zeroes a downed attacker's relative position and clears its alive flag (the last
-        # num_attackers entries); without masking, argmin would "chase" the downed one and hover
-        alive = obs[agent][:, 9 + 6 * num_attackers : 9 + 7 * num_attackers] > 0.5
-        distance = torch.where(alive, torch.linalg.norm(rel, dim=-1), torch.full_like(rel[..., 0], float("inf")))
-        target = rel[torch.arange(raw.num_envs, device=raw.device), distance.argmin(dim=-1)]
-        direction = target / torch.clamp(torch.linalg.norm(target, dim=-1, keepdim=True), min=1e-6)
-        direction = direction * alive.any(dim=-1, keepdim=True).float()  # nothing alive: hold position
-        actions[agent] = torch.cat([direction, torch.zeros(raw.num_envs, 1, device=raw.device)], dim=-1)
-    return actions
 
 
 def main():
