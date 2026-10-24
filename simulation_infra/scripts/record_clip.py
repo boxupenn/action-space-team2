@@ -90,7 +90,10 @@ if args.pilot == "policy":
     agent_cfg["agent"]["experiment"]["checkpoint_interval"] = 0
     runner = Runner(SkrlVecEnvWrapper(gym_env, ml_framework="torch"), agent_cfg)
     runner.agent.load(args.checkpoint)
-    runner.agent.set_running_mode("eval")
+    if hasattr(runner.agent, "set_running_mode"):
+        runner.agent.set_running_mode("eval")
+    else:
+        runner.agent.enable_training_mode(False)
     policy = runner.agent
     print(f"[clip] policy loaded from {args.checkpoint}", flush=True)
 
