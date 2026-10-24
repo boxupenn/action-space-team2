@@ -6,6 +6,7 @@ Shared by ``scripts/evaluate.py`` (``--baseline chase``) and ``scripts/bc_warm_s
 """
 
 import math
+from typing import Tuple
 
 import torch
 
@@ -124,6 +125,35 @@ def assignment_from_obs(
     return my_target, ~assigned
 
 
+def assign_latched(o: torch.Tensor, i: int, n: int, prev: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Obs-only, teammate-free target assignment with a one-slot memory (the 23-dim kit layout).
+
+    Interceptor roles are handed out when the whole wave is visible (``n`` live attackers) or when
+    this defender holds no assignment: attackers ranked by azimuth around the site, defender ``i``
+    takes rank ``i``; ranks beyond the live count are goalkeepers. Once assigned, the target is
+    LATCHED (``prev``) until that attacker is down, so a teammate's ram does not re-shuffle a
+    pursuit in progress. ``prev`` is -1 when unassigned. Returns (target, goalkeeper, new_prev),
+    all (E,). TorchScript-compatible: the exported defender_i.pt runs it on the raw 23 numbers.
+    # ponytail: a frozen-but-flag-1 dead attacker (runner-dependent) is still chased; alive flag is the contract.
+    """
+    E = o.shape[0]
+    rows = torch.arange(E, device=o.device)
+    alive = o[:, 9 + 6 * n : 9 + 7 * n] > 0.5
+    rel = o[:, 9 : 9 + 3 * n].reshape(E, n, 3)
+    site_rel = rel + o[:, 0:3].unsqueeze(1)
+    az = torch.atan2(site_rel[..., 1], site_rel[..., 0])
+    az = torch.where(alive, az, torch.full_like(az, 10.0))  # dead attackers sort last
+    order = az.argsort(dim=-1)
+    n_alive = alive.sum(dim=-1)
+    fresh = (n_alive >= n) | (prev < 0)
+    rank = torch.full((E,), i, dtype=torch.long, device=o.device)
+    ranked = order[rows, torch.minimum(rank, (n_alive - 1).clamp(min=0))]
+    target = torch.where(fresh, ranked, prev)
+    assigned = torch.where(fresh, rank < n_alive, alive[rows, target.clamp(min=0)])
+    new_prev = torch.where(assigned, target, torch.full_like(target, -1))
+    return target.clamp(min=0), ~assigned, new_prev
+
+
 def smart2_actions(
     raw, obs: dict[str, torch.Tensor], v_max: float = 1.0, alert_frac: float = 0.6, aim_up: float = 0.15,
     standby_up: float = 0.5, standby_gain: float = 1.5, sep_radius: float = 0.8, sep_gain: float = 1.5,
@@ -154,6 +184,14 @@ def smart2_actions(
     cruise_bias = getattr(raw.cfg, "teacher_cruise_bias", 0.0)
     standby_up = getattr(raw.cfg, "teacher_standby_up", standby_up)
     standby_ring = getattr(raw.cfg, "teacher_standby_ring", 0.0)
+    obs_teammates = getattr(raw.cfg, "obs_teammates", True)
+    aim_up = getattr(raw.cfg, "teacher_aim_up", aim_up)
+    climb_slope = getattr(raw.cfg, "teacher_climb_slope", 0.0)
+    align_dist = getattr(raw.cfg, "teacher_align_dist", 0.0)
+    align_tol = getattr(raw.cfg, "teacher_align_tol", 0.05)
+    v_max = getattr(raw.cfg.command, "max_lin_speed", v_max)
+    home_xy = getattr(raw.cfg, "defender_spawn_xy", [])
+    home_z = getattr(raw.cfg, "defender_spawn_heights", [])
     site_z = raw.cfg.site_height * 0.5  # site centre height above the floor: own height = obs z + site_z
     actions = {}
     for i, a in enumerate(agents):
@@ -170,21 +208,21 @@ def smart2_actions(
         target = order[rows, rank]
         goalkeeper = i >= n_alive
         D = len(agents)
-        mate_block = o[:, 9 + 7 * n : 9 + 7 * n + 4 * (D - 1)].reshape(E, D - 1, 4) if D > 1 else None
-        if assign_mode == "time" and mate_block is not None:
-            base = 9 + 7 * n + 4 * (D - 1)
-            if getattr(raw.cfg, "obs_assignment", False) and o.shape[1] >= base + n + 1:
-                # the env already appended [one-hot target (n), goalkeeper (1)] computed by assignment_from_obs
-                my_target = o[:, base : base + n].argmax(dim=-1)
-                goalkeeper = o[:, base + n] > 0.5
-            else:
-                my_target, goalkeeper = assignment_from_obs(o, i, n, D, v_max)
+        mate_block = o[:, 9 + 7 * n : 9 + 7 * n + 4 * (D - 1)].reshape(E, D - 1, 4) if (D > 1 and obs_teammates) else None
+        base = 9 + 7 * n + (4 * (D - 1) if obs_teammates else 0)
+        if getattr(raw.cfg, "obs_assignment", False) and o.shape[1] >= base + n + 1:
+            # the env already appended [one-hot target (n), goalkeeper (1)] (assignment_from_obs or assign_latched)
+            my_target = o[:, base : base + n].argmax(dim=-1)
+            goalkeeper = o[:, base + n] > 0.5
+            target = torch.where(goalkeeper, target, my_target)
+        elif assign_mode == "time" and mate_block is not None:
+            my_target, goalkeeper = assignment_from_obs(o, i, n, D, v_max)
             target = torch.where(goalkeeper, target, my_target)
         # defenders without an assignment are goalkeepers: go for the attacker nearest the site,
         # i.e. the one whose interception is failing ("send another drone")
         site_dist = torch.where(alive, site_rel[..., :2].norm(dim=-1), torch.full_like(az, 1.0e3))
         target = torch.where(goalkeeper, site_dist.argmin(dim=-1), target)
-        alert = site_dist.min(dim=-1).values < alert_frac * raw.cfg.spawn_radius
+        alert = site_dist.min(dim=-1).values < getattr(raw.cfg, "teacher_alert_radius", alert_frac * raw.cfg.spawn_radius)
         standby = goalkeeper & ~alert
         mates = mate_block[..., :3] if mate_block is not None else None
         mates_active = mate_block[..., 3] > 0.5 if mate_block is not None else None  # inactive (rammed) teammates are ignored
@@ -203,11 +241,38 @@ def smart2_actions(
         if cruise_bias and i < 2:  # altitude layering while cruising: defender_0 low, defender_1 high; gone in the last metre
             fade = ((r.norm(dim=-1) - 1.0) / 1.0).clamp(0.0, 1.0)
             aim[:, 2] += (cruise_bias if i == 1 else -cruise_bias) * fade
+        if climb_slope > 0.0:
+            # Ram from ABOVE only (own props must never meet the attacker's frame from below). The terminal
+            # run has to be the plain straight lead-pursuit line (any vertical manoeuvre in the last metre
+            # misses the 3 cm box: a P-loop lags a descending attacker, a sliding aim point lags the 0.25 s
+            # response -> 39-83%). So while still BELOW the aim point, climb at least climb_slope x the
+            # horizontal distance (1 = 45 deg) -- the climb happens early, far out -- and once above it the
+            # straight line is a shallow descent onto the props.
+            hd = aim[:, :2].norm(dim=-1)
+            z = torch.where(aim[:, 2] > 0.0, torch.maximum(aim[:, 2], climb_slope * hd), aim[:, 2])
+            aim = torch.cat([aim[:, :2], z.unsqueeze(-1)], dim=-1)
         direction = aim / torch.clamp(aim.norm(dim=-1, keepdim=True), min=1e-6)
-        direction = direction * alive.any(dim=-1, keepdim=True).float()
+        if align_dist > 0.0:
+            # optional: creep (20%) while still more than align_tol below the attacker inside align_dist
+            below = (aim[:, 2] - aim_up) > align_tol
+            hd2 = aim[:, :2].norm(dim=-1)
+            slow = torch.where((hd2 < align_dist) & below, torch.full_like(hd2, 0.2), torch.ones_like(hd2))
+            direction = direction * slow.unsqueeze(-1)
+        if home_xy and i < len(home_xy):
+            # field cleared: fly back to this defender's own launch point (a per-index constant, so the
+            # clone can do it from its own observation alone); otherwise hold position
+            hz = (home_z[i] if home_z and i < len(home_z) else 1.5) - site_z
+            home = torch.tensor([home_xy[i][0], home_xy[i][1], hz], device=dev)
+            go_home = (-(o[:, 0:3] - home) * standby_gain).clamp(-1.0, 1.0)
+            direction = torch.where(alive.any(dim=-1, keepdim=True), direction, go_home)
+        else:
+            direction = direction * alive.any(dim=-1, keepdim=True).float()
         # standby: P-control to the point standby_up above the site (own position relative to the site is obs[0:3])
-        ring_angle = 2.0 * math.pi * i / len(agents)
-        standby_pt = torch.tensor([standby_ring * math.cos(ring_angle), standby_ring * math.sin(ring_angle), standby_up], device=dev)
+        if home_xy and i < len(home_xy):  # wait at my own launch point (in front of the site, where the attackers come from)
+            standby_pt = torch.tensor([home_xy[i][0], home_xy[i][1], standby_up], device=dev)
+        else:
+            ring_angle = 2.0 * math.pi * i / len(agents)
+            standby_pt = torch.tensor([standby_ring * math.cos(ring_angle), standby_ring * math.sin(ring_angle), standby_up], device=dev)
         hold = -(o[:, 0:3] - standby_pt) * standby_gain
         hold = hold.clamp(-1.0, 1.0)
         direction = torch.where(standby.unsqueeze(-1), hold, direction)

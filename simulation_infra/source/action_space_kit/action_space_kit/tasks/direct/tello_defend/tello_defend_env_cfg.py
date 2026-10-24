@@ -16,9 +16,11 @@ NUM_ATTACKERS = 2
 
 # obs per defender: own pos rel. site (3) + own vel (3) + gravity (3)
 #                 + per attacker (rel pos 3, rel vel 3, visible flag 1)
-OBS_ASSIGNMENT = True  # append the decentralised target assignment to the observation (see chase.assignment_from_obs)
-_OBS_DIM = 9 + 7 * NUM_ATTACKERS + 4 * (NUM_DEFENDERS - 1) + (NUM_ATTACKERS + 1 if OBS_ASSIGNMENT else 0)
-# 9 own + per attacker 7 + per teammate [rel xyz, active] + [one-hot assigned attacker, goalkeeper flag]
+OBS_TEAMMATES = True  # per teammate [rel xyz, active]; False = the kit's 23-dim layout the organisers' runner feeds (2026-10-24)
+OBS_ASSIGNMENT = True  # append the decentralised target assignment to the observation (chase.assign_latched / assignment_from_obs)
+_OBS_DIM = 9 + 7 * NUM_ATTACKERS + (4 * (NUM_DEFENDERS - 1) if OBS_TEAMMATES else 0) + (NUM_ATTACKERS + 1 if OBS_ASSIGNMENT else 0)
+# 9 own + per attacker 7 [+ per teammate [rel xyz, active]] + [one-hot assigned attacker, goalkeeper flag]
+# The exported defender_i.pt takes the 23 kit numbers and computes the 3 assignment features itself (export_skrl_policy.py --obs23).
 
 
 @configclass
@@ -47,23 +49,46 @@ class TelloDefendEnvCfg(DirectMARLEnvCfg):
     # scene: 1024 envs x 4 drones fits comfortably on a 24 GB GPU shared by several teams
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=1024, env_spacing=12.0, replicate_physics=True)
 
-    # Tello SDK velocity interface (shared by both sides)
-    command: TelloCommandCfg = TelloCommandCfg()
+    # Tello SDK velocity interface (shared by both sides). Real-Tello numbers (2026-10-24): full rc stick in
+    # normal mode is ~2 m/s (forum measurements; the 8 m/s spec is sport mode), tilt-limited acceleration
+    # ~3 m/s^2, ~0.25 s stick-to-velocity lag. Actions are fractions of max_lin_speed. Measure rc -> m/s on
+    # site and set env.command.max_lin_speed to it; the geometry only depends on the defender/attacker ratio.
+    command: TelloCommandCfg = TelloCommandCfg(max_lin_speed=2.0, max_lin_accel=3.0, response_time=0.25)
 
     # - scenario geometry
     num_defenders = NUM_DEFENDERS
     num_attackers = NUM_ATTACKERS
-    site_radius = 1.5  # [m] protected perimeter around the env origin
+    site_radius = 1.3  # [m] protected perimeter: the organisers' attackers hold on a 1.3 m arc in front of tag 10 (swarm_formation.py)
     site_height = 2.5  # [m] height of the protected cylinder
-    spawn_radius = 6.0  # [m] where attackers enter from
+    spawn_radius = 2.5  # [m] where attackers enter from (arena 2026-10-24: 2-3 m in front of tag 10)
+    spawn_radius_jitter = 0.5  # [m]
+    attacker_spawn_sector_deg = 60.0  # attackers enter within +-this azimuth of +x (the room side of the tag wall); 180 = full ring
+    attacker_spawn_z = [1.2, 1.8]  # [m] above the floor (formation flies at ~1.2-1.7 m)
     defender_radius = 2.5  # [m] where defenders start, around the site
-    capture_radius = 0.35  # [m] distance counting as an interception
+    capture_radius = 0.35  # [m] distance counting as an interception (sphere; used when capture_box is empty)
+    # Organisers' hit box (2026-10-24): a ram counts when |dx|, |dy|, |dz| between the two drones are all
+    # within these half-extents (metres). Set to [] to use the capture_radius sphere.
+    # ponytail: read as half-extents of "15 cm x 15 cm x 3 cm"; if they meant full extents, halve these.
+    capture_box = [0.15, 0.15, 0.03]
     obs_clip_pos = 12.0  # [m] relative positions are clipped to this before normalisation
     obs_clip_vel = 3.0  # [m/s] relative velocities are clipped to this
     trainable_attackers = False
 
     # - scripted attacker behaviour (curriculum stage 0 = straight dive)
-    attacker_speed = [0.4, 0.9]  # [m/s]
+    attacker_speed = [0.3, 0.7]  # [m/s]  swarm_formation --fast caps rc at 35 of a ~2 m/s stick
+    # After launch a real attacker takes off, climbs and searches for a tag before it moves: it hovers in
+    # place (visible, alive) for a time sampled from this range, seconds. [0, 0] = moves at once.
+    attacker_hover = [1.0, 4.0]
+    # Launch points relative to the site (metres, site frame): defenders one per index, attackers a list of
+    # candidate points each attacker picks from at random (+-spawn_xy_jitter). Empty attacker list = random
+    # ring at spawn_radius (the kit default). Fill both from the organisers' arena figure; the defender
+    # points are also where the teacher / clone flies back to once the field is cleared.
+    defender_spawn_xy = [[2.0, 0.0], [1.4, 1.4], [1.4, -1.4]]  # ponytail: placeholder, in front of the site at 0 / +-45 deg; fill from the arena figure
+    attacker_spawn_xy = []
+    spawn_xy_jitter = 0.2  # [m]
+    # Seconds between a cleared field and the next wave's first launch (respawn_waves only): the
+    # defenders fly home in the gap, so the clone learns the return.
+    wave_gap = 3.0
     # Staggered launches: attacker 0 enters at t=0, every further attacker after a delay sampled
     # uniformly from this range (seconds). A pending attacker is parked at its spawn point, is not
     # observable (alive flag 0) and cannot be captured or breach -- the arena case where the
@@ -96,18 +121,35 @@ class TelloDefendEnvCfg(DirectMARLEnvCfg):
     defender_spawn_even = True
     defender_spawn_jitter = 0.3  # [rad]
     # smart2 teacher knobs (chase.py reads them when present): teammate repulsion radius / gain
-    teacher_sep_radius = 1.0  # [m]  (sweep 2026-10-24 with index spawn heights: 100% / 0.1%, 0.1% near-misses, p5 sep 0.52 m)
+    teacher_sep_radius = 0.7  # [m]  arena sweep 2026-10-24 (box judging): 100% / 0%, near-misses 9%, covered by the runner guard
     teacher_sep_gain = 2.5
-    teacher_sep_vertical = 0.8  # share of the repulsion that goes vertical (lower index dives, higher climbs)
+    teacher_sep_vertical = 0.0  # vertical repulsion is a vertical manoeuvre: it misses the 3 cm box (99.3% -> 100% without)
     teacher_cruise_bias = 0.0  # [m] altitude offset while cruising; 0.2 tested slightly worse (100% / 0.1%, 0.5% near-misses) -> off
-    teacher_standby_up = 1.0  # [m] goalkeeper standby height above the site centre
-    teacher_standby_ring = 0.8  # [m] goalkeeper i holds at azimuth 2*pi*i/D on this ring around the site (two goalkeepers never share a point)
+    teacher_standby_up = 0.8  # [m] goalkeeper standby height above the site centre (~2.05 m: above the 1.2-1.8 m attackers)
+    teacher_standby_ring = 0.8  # [m] goalkeeper ring, used only when defender_spawn_xy is empty (else a goalkeeper waits at its own launch point)
     # smart2 target assignment: "azimuth" = defender i takes the i-th attacker by azimuth around the
     # site (ignores where the defenders are); "time" = every defender computes, from its own
     # observation (own + teammates' positions), the assignment that minimises the summed lead-pursuit
     # intercept time over the live attackers; the leftover defender is the goalkeeper. Same inputs ->
     # same answer on every drone, no communication.
     teacher_assign = "time"
+    # "latched" (2026-10-24, 23-dim runner): teammate-free. Attackers ranked by azimuth, defender i takes
+    # rank i when the whole wave is visible or when it holds no target; the target is then kept until that
+    # attacker is down (a teammate's ram does not re-shuffle a pursuit in progress); unassigned = goalkeeper.
+    # Goalkeepers engage once a live attacker is within teacher_alert_radius of the site.
+    teacher_alert_radius = 2.2  # [m]  goalkeepers engage inside this (spawn 2.5, arc 1.3)
+    teacher_aim_up = 0.02  # [m] aim offset above the attacker: inside the 3 cm box, but from above (props vs frame)
+    # Ram from above (2026-10-24, 15x15x3 cm box): while below the lead-pursuit aim point the defender climbs
+    # at least teacher_climb_slope x horizontal distance (1 = 45 deg), so it gets above early and the
+    # terminal run is the plain straight line, descending onto the props. 0 = plain lead pursuit.
+    # (Tried and rejected: a vertical P-loop lags a descending attacker, 72-83%; an aim point that slides
+    # down over the last 2 m lags the 0.25 s response, 39-50%. The last metre must be a straight line.)
+    teacher_climb_slope = 0.0
+    # Optional creep (20% speed) within teacher_align_dist while still > teacher_align_tol below the
+    # attacker; 0 = off (a 0.9 m/s attacker flies past a creeping defender).
+    teacher_align_dist = 0.0  # [m]
+    teacher_align_tol = 0.05  # [m]
+    obs_teammates = OBS_TEAMMATES
     # Append [one-hot of my assigned attacker (n), goalkeeper flag (1)] to the observation, computed
     # per defender from its own observation by chase.assignment_from_obs. The discrete allocation is
     # then an input, and the cloned network only has to learn the continuous pursuit (2026-10-24: the
@@ -116,7 +158,7 @@ class TelloDefendEnvCfg(DirectMARLEnvCfg):
     obs_assignment = OBS_ASSIGNMENT
     # Defenders start at index-specific heights (metres above the floor), as they will be placed and
     # launched on the real field; empty list = uniform 1-2 m (the kit's default).
-    defender_spawn_heights = [1.0, 1.5, 2.0]
+    defender_spawn_heights = [2.0, 2.2, 2.4]  # above the attackers (1.2-1.8 m) so the ram is a shallow descent; fence 2.2 m above tag 10
     """Launch a fresh wave when the field is cleared, instead of ending the episode.
 
     Ending on success truncates the value bootstrap, which makes a short successful

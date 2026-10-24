@@ -109,11 +109,47 @@ class SkrlPolicy(torch.nn.Module):
         return torch.clamp(self.squash(self.head(self.net(x))), -1.0, 1.0)
 
 
+def _load_chase():
+    """chase.py by path: importing the package needs a running Kit app, the module itself only torch."""
+    import importlib.util
+
+    path = ROOT / "source" / "action_space_kit" / "action_space_kit" / "tasks" / "direct" / "tello_defend" / "chase.py"
+    spec = importlib.util.spec_from_file_location("tello_defend_chase", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class Obs23Policy(torch.nn.Module):
+    """Defend policy on the kit's 23-dim observation: appends the latched target assignment
+    (chase.assign_latched, one-hot target + goalkeeper flag) for defender ``index`` and runs the
+    cloned 26-dim network. The latch lives in a buffer, so one loaded module = one drone, called
+    once per control tick with a (1, 23) batch; a different batch size runs un-latched."""
+
+    def __init__(self, policy: SkrlPolicy, index: int, num_attackers: int):
+        super().__init__()
+        self.policy = policy
+        self.index = index
+        self.n = num_attackers
+        self.register_buffer("prev", torch.full((1,), -1, dtype=torch.long))
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        E = obs.shape[0]
+        prev = self.prev if E == 1 else torch.full((E,), -1, dtype=torch.long, device=obs.device)
+        target, goalkeeper, new_prev = assign_latched(obs, self.index, self.n, prev)
+        if E == 1:
+            self.prev.copy_(new_prev)
+        onehot = torch.nn.functional.one_hot(target, self.n).float() * (~goalkeeper).float().unsqueeze(-1)
+        return self.policy(torch.cat([obs, onehot, goalkeeper.float().unsqueeze(-1)], dim=-1))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--checkpoint", required=True, help="skrl agent_*.pt / best_agent.pt, or an experiment dir name under logs/skrl.")
     parser.add_argument("--agent", type=str, default=None, help="Multi-agent checkpoints: which agent's policy to export (default: first).")
     parser.add_argument("--out", type=str, default=None, help="Output .pt (default: outputs/exports/<experiment>_<run>[_<agent>].pt).")
+    parser.add_argument("--obs23", action="store_true", default=False,
+                        help="Defend: wrap a 26-dim (23 + latched assignment) policy so the file takes the kit's 23 numbers (needs --agent defender_i).")
     args = parser.parse_args()
 
     ckpt = Path(args.checkpoint)
@@ -145,7 +181,18 @@ def main() -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     obs_dim, act_dim = model.mean.shape[0], model.head.out_features
     with torch.no_grad():
-        scripted = torch.jit.trace(model, torch.zeros(2, obs_dim))
+        if args.obs23:
+            m = re.fullmatch(r"defender_(\d+)", args.agent or "")
+            if not m:
+                raise SystemExit("--obs23 needs --agent defender_<i>")
+            n = (obs_dim - 1 - 9) // 8  # 26 = 9 + 7n + n + 1
+            if obs_dim != 9 + 8 * n + 1:
+                raise SystemExit(f"--obs23 expects a 9 + 8n + 1 = {9 + 8 * n + 1}-dim policy, got {obs_dim}")
+            globals()["assign_latched"] = _load_chase().assign_latched  # resolved by torch.jit.script from Obs23Policy.forward
+            scripted = torch.jit.script(Obs23Policy(model, int(m.group(1)), n))
+            obs_dim = 9 + 7 * n
+        else:
+            scripted = torch.jit.trace(model, torch.zeros(2, obs_dim))
     scripted.save(str(out))
     check = torch.jit.load(str(out))(torch.zeros(1, obs_dim))
     print(f"[export] checkpoint: {ckpt}\n[export] activation: {activation}, output squash: {squash or 'none'}, preprocessor: {'yes' if pre_sd is not None else 'none'}", flush=True)
