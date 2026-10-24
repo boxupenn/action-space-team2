@@ -408,9 +408,10 @@ class BusAttackers:
     LOW_CM = 30
     DOWN_STATES = ("LAND", "DONE", "EMERG")
 
-    def __init__(self, bus, names=None):
+    def __init__(self, bus, names=None, min_height_cm=None):
         self.bus = bus
         self.names = list(names or [])[:N_ATT]
+        self.min_height_cm = self.LOW_CM if min_height_cm is None else float(min_height_cm)
         self.hist = {}                                # name -> deque of (t, p_sim)
         self.flag = {}
 
@@ -437,7 +438,7 @@ class BusAttackers:
                         h.append((t, tag_to_sim(p)))
                 hc = data.get("height_cm")
                 st = str(data.get("state") or "").upper()
-                up = (age < self.STALE_S and p is not None and (hc is None or hc > self.LOW_CM)
+                up = (age < self.STALE_S and p is not None and (hc is None or hc > self.min_height_cm)
                       and not any(st.startswith(s) for s in self.DOWN_STATES))
             self.flag[n] = up
             if h:
@@ -705,7 +706,7 @@ class DefendPolicy(Policy):
                              f"{OBS_WIDTHS} for exactly {N_DEF} drones")
         if self.attackers is None:
             if self.cfg["attackers"] == "bus":
-                self.attackers = BusAttackers(self.bus, self.cfg.get("attacker_names") or None)
+                self.attackers = BusAttackers(self.bus, self.cfg.get("attacker_names") or None, self.cfg.get("attacker_min_height_cm"))
             elif self.cfg["attackers"] == "udp":
                 self.attackers = UdpAttackers(self.cfg["udp_port"])
             elif self.cfg["attackers"] == "telemetry":
@@ -821,6 +822,12 @@ class DefendPolicy(Policy):
                           or grounded(dr, now, self.low_since) or o is None or o[3] > MATE_INACTIVE_S)
             mates.append((j, self.last_p.get(n, own_p + np.array([OBS_CLIP_POS, 0.0, 0.0])), active))
         att_p, att_v, alive = self.attackers.state(now, [own_p] + [m[1] for m in mates if m[2]])
+        if not np.any(alive):
+            # round over (or not started): nobody to ram -> hold position, camera on the tags. The organisers
+            # reset both teams between rounds; the nets never saw an empty field.
+            rc = (0, 0, 0, face_yaw_rc(own_p, yaw, self.cfg["site"]))
+            self.publish_pose(d, est, rc)
+            return rc
         obs = build_obs(own_p, own_v, att_p, att_v, alive, self.cfg["site"], [m[1] for m in mates],
                         [m[2] for m in mates], i, self.cfg.get("alert_radius"), self.cfg.get("cover_m"), self.cfg.get("alert_force", 0.0))
         action = run_net(self.nets[i], obs)

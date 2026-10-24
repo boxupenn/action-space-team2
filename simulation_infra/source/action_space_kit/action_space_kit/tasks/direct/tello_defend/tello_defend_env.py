@@ -55,6 +55,7 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
         self._attacker_pending = torch.zeros(self.num_envs, self.cfg.num_attackers, device=self.device, dtype=torch.bool)
         self._launch_time = torch.zeros(self.num_envs, self.cfg.num_attackers, device=self.device)
         self._move_time = torch.zeros(self.num_envs, self.cfg.num_attackers, device=self.device)  # launch + hover (cfg.attacker_hover)
+        self._cruise_z = torch.zeros(self.num_envs, self.cfg.num_attackers, device=self.device)  # attacker cruise height above the floor
         self._wave_start = torch.zeros(self.num_envs, device=self.device)  # episode time when the current wave was spawned
         self._breached = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         self._prev_distance = torch.zeros(self.num_envs, self.cfg.num_defenders, device=self.device)
@@ -129,11 +130,13 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
         mat = lambda rgb, a=1.0: sim_utils.PreviewSurfaceCfg(diffuse_color=rgb, opacity=a)  # noqa: E731
         b = self.cfg.arena_bounds or [[0.4, 4.8], [-0.8, 2.6], [0.5, 2.25]]
         lx, ly = b[0][1] - b[0][0], b[1][1] - b[1][0]
+        tag = lambda rgb: sim_utils.CuboidCfg(size=(0.16, 0.16, 0.025), visual_material=mat(rgb))  # noqa: E731  team tag above the drone
         cfg = VisualizationMarkersCfg(prim_path="/Visuals/teams", markers={
-            "attacker": sim_utils.SphereCfg(radius=0.14, visual_material=mat((1.0, 0.1, 0.1), 0.45)),
-            "defender": sim_utils.SphereCfg(radius=0.14, visual_material=mat((0.15, 0.35, 1.0), 0.45)),
-            "down": sim_utils.SphereCfg(radius=0.14, visual_material=mat((0.45, 0.45, 0.45), 0.45)),
+            "attacker": tag((1.0, 0.1, 0.1)),
+            "defender": tag((0.15, 0.35, 1.0)),
+            "down": tag((0.45, 0.45, 0.45)),
             "arc": sim_utils.CuboidCfg(size=(0.07, 0.07, 0.02), visual_material=mat((1.0, 0.25, 0.25))),
+            "post": sim_utils.CylinderCfg(radius=0.012, height=self.cfg.site_height, visual_material=mat((1.0, 0.35, 0.35))),
             "launch": sim_utils.CuboidCfg(size=(0.3, 0.3, 0.02), visual_material=mat((0.15, 0.35, 1.0))),
             "edge_x": sim_utils.CuboidCfg(size=(lx, 0.04, 0.02), visual_material=mat((0.2, 0.2, 0.2))),
             "edge_y": sim_utils.CuboidCfg(size=(0.04, ly, 0.02), visual_material=mat((0.2, 0.2, 0.2))),
@@ -142,9 +145,13 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
         self._team_markers = VisualizationMarkers(cfg)
         names = list(cfg.markers)
         pts, idx = [], []  # static markers in the env-local frame
-        for k in range(36):
-            a = 2.0 * math.pi * k / 36
-            pts.append([self.cfg.site_radius * math.cos(a), self.cfg.site_radius * math.sin(a), 0.01]); idx.append(names.index("arc"))
+        for k in range(48):  # the breach cylinder: a ring on the floor, one at its top, posts between them
+            a = 2.0 * math.pi * k / 48
+            for z in (0.01, self.cfg.site_height):
+                pts.append([self.cfg.site_radius * math.cos(a), self.cfg.site_radius * math.sin(a), z]); idx.append(names.index("arc"))
+        for k in range(8):
+            a = 2.0 * math.pi * k / 8
+            pts.append([self.cfg.site_radius * math.cos(a), self.cfg.site_radius * math.sin(a), self.cfg.site_height / 2]); idx.append(names.index("post"))
         for xy in self.cfg.defender_spawn_xy:
             pts.append([xy[0], xy[1], 0.01]); idx.append(names.index("launch"))
         cx, cy = (b[0][0] + b[0][1]) / 2, (b[1][0] + b[1][1]) / 2
@@ -210,14 +217,23 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
                 direction = direction / torch.clamp(torch.linalg.norm(direction, dim=-1, keepdim=True), min=1e-6)
             speed = (self._attacker_speed[:, i] / self.cfg.command.max_lin_speed).unsqueeze(-1)
             t_wave = self.episode_length_buf.float() * self.step_dt - self._wave_start
-            speed = speed * (t_wave >= self._move_time[:, i]).float().unsqueeze(-1)  # still hovering after launch
+            z = drone.data.root_pos_w[:, 2] - self.scene.env_origins[:, 2]
+            at_cruise = z >= self._cruise_z[:, i] - 0.05
+            launched = t_wave >= self._launch_time[:, i]
+            moving = self._attacker_alive[:, i] & at_cruise & (t_wave >= self._move_time[:, i])
             action = torch.cat([direction * speed, torch.zeros(self.num_envs, 1, device=self.device)], dim=-1)
-            # a downed attacker stops moving
-            action = action * self._attacker_alive[:, i].unsqueeze(-1).float()
+            action = action * moving.unsqueeze(-1).float()  # hovering / climbing / downed: no horizontal motion
+            # take-off: climb at attacker_climb_speed until the cruise height (then the controller holds)
+            climb = (launched & ~at_cruise & ~self._downed(i)).float() * self.cfg.attacker_climb_speed / self.cfg.command.max_lin_speed
+            action[:, 2] = torch.where(climb > 0, climb, action[:, 2])
             actions.append(action.clamp(-1.0, 1.0))
         return actions
 
     # -- MDP --------------------------------------------------------------------
+
+    def _downed(self, i: int) -> torch.Tensor:
+        """Attacker i was captured (not alive and not waiting to launch)."""
+        return ~self._attacker_alive[:, i] & ~self._attacker_pending[:, i]
 
     def _attacker_states(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Return attacker positions and velocities, shaped (num_envs, num_attackers, 3)."""
@@ -289,7 +305,9 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
         if not self._attacker_pending.any():
             return
         t = (self.episode_length_buf.float() * self.step_dt).unsqueeze(-1) - self._wave_start.unsqueeze(-1)
-        launch = self._attacker_pending & (t >= self._launch_time)
+        z = torch.stack([d.data.root_pos_w[:, 2] for d in self._attackers], dim=1) - self.scene.env_origins[:, 2:3]
+        visible = z >= self.cfg.attacker_visible_z if self.cfg.takeoff_z > 0.0 else torch.ones_like(self._attacker_pending)
+        launch = self._attacker_pending & (t >= self._launch_time) & visible
         self._attacker_alive |= launch
         self._attacker_pending &= ~launch
 
@@ -443,6 +461,8 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
         delay[:, 0] = 0.0  # the first attacker always enters at once
         delay += self.cfg.wave_gap  # the defenders fly home in the gap
         self._launch_time[env_ids] = delay
+        if self.cfg.takeoff_z > 0.0:
+            delay = delay + 1.0  # never launched already: it has to climb into view first (see _launch_pending)
         self._move_time[env_ids] = delay + sample_uniform(
             self.cfg.attacker_hover[0], self.cfg.attacker_hover[1], (num, self.cfg.num_attackers), self.device
         )
@@ -480,7 +500,9 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
                 xy = torch.where(short.unsqueeze(-1), torch.stack([x_out, xy[:, 1]], dim=-1), xy)
             self._spawn_angle[env_ids, i] = angle
             state[:, :2] = origins[:, :2] + xy
-            state[:, 2] = origins[:, 2] + sample_uniform(self.cfg.attacker_spawn_z[0], self.cfg.attacker_spawn_z[1], (num,), self.device)
+            cruise = sample_uniform(self.cfg.attacker_spawn_z[0], self.cfg.attacker_spawn_z[1], (num,), self.device)
+            self._cruise_z[env_ids, i] = cruise
+            state[:, 2] = origins[:, 2] + (self.cfg.takeoff_z if self.cfg.takeoff_z > 0.0 else cruise)
             state[:, 7:] = 0.0
             drone.write_root_pose_to_sim(state[:, :7], env_ids)
             drone.write_root_velocity_to_sim(state[:, 7:], env_ids)
@@ -515,7 +537,9 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
                 state[:, 0] = origins[:, 0] + self.cfg.defender_radius * torch.cos(angle)
                 state[:, 1] = origins[:, 1] + self.cfg.defender_radius * torch.sin(angle)
             heights = self.cfg.defender_spawn_heights
-            if heights and i < len(heights):
+            if self.cfg.takeoff_z > 0.0:
+                state[:, 2] = origins[:, 2] + self.cfg.takeoff_z + sample_uniform(-0.05, 0.05, (num,), self.device)
+            elif heights and i < len(heights):
                 state[:, 2] = origins[:, 2] + heights[i] + sample_uniform(-0.1, 0.1, (num,), self.device)
             else:
                 state[:, 2] = origins[:, 2] + sample_uniform(1.0, 2.0, (num,), self.device)
@@ -531,6 +555,8 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
         )
         delay[:, 0] = 0.0  # the first attacker always enters at once
         self._launch_time[env_ids] = delay
+        if self.cfg.takeoff_z > 0.0:
+            delay = delay + 1.0  # pending until it climbs into view (see _launch_pending)
         self._move_time[env_ids] = delay + sample_uniform(
             self.cfg.attacker_hover[0], self.cfg.attacker_hover[1], (num, self.cfg.num_attackers), self.device
         )
@@ -563,9 +589,11 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
         origins = self.scene.env_origins
         static = (origins.unsqueeze(1) + self._static_pts.unsqueeze(0)).reshape(-1, 3)
         static_idx = self._static_idx.repeat(E)
+        lift = torch.tensor([0.0, 0.0, 0.2], device=self.device)  # the tag floats above the drone, the model stays visible
         att_pos, _ = self._attacker_states()
+        att_pos = att_pos + lift
         att_idx = torch.where(self._attacker_alive, names.index("attacker"), names.index("down")).reshape(-1)
-        def_pos = torch.stack([d.data.root_pos_w for d in self._defenders], dim=1)
+        def_pos = torch.stack([d.data.root_pos_w for d in self._defenders], dim=1) + lift
         def_idx = torch.where(self._spent, names.index("down"), names.index("defender")).reshape(-1)
         self._team_markers.visualize(
             translations=torch.cat([static, att_pos.reshape(-1, 3), def_pos.reshape(-1, 3)]),

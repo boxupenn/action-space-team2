@@ -289,7 +289,10 @@ def smart2_actions(
             hz = (home_z[i] if home_z and i < len(home_z) else 1.5) - site_z
             home = torch.tensor([home_xy[i][0], home_xy[i][1], hz], device=dev)
             go_home = (-(o[:, 0:3] - home) * standby_gain).clamp(-1.0, 1.0)
-            direction = torch.where(alive.any(dim=-1, keepdim=True), direction, go_home)
+            # still taking off (below the height attackers become visible at): climb to the launch point first,
+            # never engage from below. Obs-only (own height), so the clone does the same.
+            low = (o[:, 2] + site_z) < getattr(raw.cfg, "attacker_visible_z", 0.0)
+            direction = torch.where(alive.any(dim=-1, keepdim=True) & ~low.unsqueeze(-1), direction, go_home)
         else:
             direction = direction * alive.any(dim=-1, keepdim=True).float()
         # standby: P-control to the point standby_up above the site (own position relative to the site is obs[0:3])

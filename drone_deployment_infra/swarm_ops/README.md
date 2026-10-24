@@ -155,8 +155,8 @@ python swarm_policies.py --run defend:4,5,6 --run formation:7,9 --fly --duration
 python -m pytest test_defend.py -q                                                    # 23 checks: frames / rc / obs / assignment / bus / nets
 ```
 Launch spots (tag frame x right, z out of the wall; altitude above the floor): `defender_0` (0.2, 2.0) at 1.9 m,
-`defender_1` (1.6, 1.6) at 2.05 m, `defender_2` (-0.4, 1.6) at 2.2 m, all **facing tag 10**; the policy flies back
-there when the field is cleared and `defender_2` (goalkeeper) waits there. Take off is the umbrella's (`takeoff` ->
+`defender_1` (1.6, 1.6) at 2.05 m, `defender_2` (-0.4, 1.6) at 2.2 m, all **facing tag 10**; `defender_2` (goalkeeper) waits there, and with
+no attacker in the air every defender holds position (rounds are reset by hand). Take off is the umbrella's (`takeoff` ->
 ~1 m); the policy climbs to its height by itself (the nets command world-frame velocities; 1.0 = full stick).
 Needs on the laptop: `torch` for the `.pt` files **or nothing extra** (each `defender_i.npz` is the same net in numpy,
 used when torch is missing), the localizer package `pip install -e ../cal_and_map` (the one `map_tags.py`/`05_map.py`

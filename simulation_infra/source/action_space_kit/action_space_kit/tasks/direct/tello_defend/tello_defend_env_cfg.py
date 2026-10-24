@@ -60,8 +60,8 @@ class TelloDefendEnvCfg(DirectMARLEnvCfg):
     num_attackers = NUM_ATTACKERS
     site_radius = 1.3  # [m] protected perimeter: the organisers' attackers hold on a 1.3 m arc in front of tag 10 (swarm_formation.py)
     site_height = 2.5  # [m] height of the protected cylinder
-    spawn_radius = 2.5  # [m] where attackers enter from (arena 2026-10-24: 2-3 m in front of tag 10)
-    spawn_radius_jitter = 0.5  # [m]
+    spawn_radius = 4.0  # [m] where attackers take off: the far side of the room (user 2026-10-24: 3-5 m from the tag-10 wall, not 2-3 m)
+    spawn_radius_jitter = 0.8  # [m]  (3.2-4.8 m; the room box ends at x 4.8)
     attacker_spawn_sector_deg = 60.0  # attackers enter within +-this azimuth of +x (the room side of the tag wall); 180 = full ring
     attacker_spawn_z = [1.2, 1.8]  # [m] above the floor (formation flies at ~1.2-1.7 m)
     defender_radius = 2.5  # [m] where defenders start, around the site
@@ -79,6 +79,14 @@ class TelloDefendEnvCfg(DirectMARLEnvCfg):
     # After launch a real attacker takes off, climbs and searches for a tag before it moves: it hovers in
     # place (visible, alive) for a time sampled from this range, seconds. [0, 0] = moves at once.
     attacker_hover = [1.0, 4.0]
+    # Take-off (2026-10-24 afternoon): everybody starts on the floor at takeoff_z. An attacker climbs at
+    # attacker_climb_speed to its cruise height (attacker_spawn_z) and is invisible / uncapturable until it is
+    # above attacker_visible_z (the runner ignores bus attackers below attacker_min_height_cm); it moves off once
+    # at cruise height and past its hover time. Defenders climb to their launch heights by themselves (the
+    # teacher's go-home rule). takeoff_z 0 = everybody starts airborne at its height (the earlier behaviour).
+    takeoff_z = 0.3  # [m]
+    attacker_climb_speed = 0.5  # [m/s]
+    attacker_visible_z = 1.0  # [m]
     # Launch points relative to the site (metres, site frame): defenders one per index, attackers a list of
     # candidate points each attacker picks from at random (+-spawn_xy_jitter). Empty attacker list = random
     # ring at spawn_radius (the kit default). Fill both from the organisers' arena figure; the defender
@@ -112,7 +120,8 @@ class TelloDefendEnvCfg(DirectMARLEnvCfg):
     rew_scale_proximity = 2.0  # continuous pull towards the nearest attacker
     rew_scale_capture = 30.0  # intercepting one
     rew_scale_cleared = 30.0  # bonus for downing the last attacker of a wave
-    respawn_waves = True
+    respawn_waves = False  # arena 2026-10-24: a cleared field ends the round, everybody re-appears at its launch spot
+    # (takes off again); nobody flies back. True = the kit's endless waves (defenders stay airborne).
     # Ramming rule (real spec 2026-10-23): an interception is a physical collision and the
     # defender that makes it is out too. True: that defender's commands are zeroed for the rest
     # of the wave and it cannot capture again (reset on a new wave / episode).

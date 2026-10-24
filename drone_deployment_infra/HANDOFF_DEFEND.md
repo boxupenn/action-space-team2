@@ -39,7 +39,8 @@ python swarm_policies.py --run defend:4,5,6 --run formation:7,9 --fly --duration
   it sees on the bus) and the `rc` it would send. **All three must show a `p=` before `--fly`**;
   a defender with no fix hovers (`rc 0 0 0 0`) and lands after 6 s.
 - Place the defenders at the launch spots in `config/defend.yaml` (tag-10 frame x, z; altitude
-  ~1.9-2.2 m), **facing tag 10**: that is where the policy waits and returns to.
+  ~1.9-2.2 m), **facing tag 10**: that is where the goalkeeper waits. With no attacker in the air a defender
+  holds position; reset both teams between rounds as usual.
 - If your attackers are not `drone7`/`drone9`, set `attacker_names` in `config/defend.yaml`, or leave
   it empty: the first two `formation/` topics on the bus are taken.
 - Our defenders publish `defend/drone<N>` (same fields as `formation/`) on the bus every tick.
