@@ -74,6 +74,10 @@ class TelloDefendEnvCfg(DirectMARLEnvCfg):
     rew_scale_capture = 30.0  # intercepting one
     rew_scale_cleared = 30.0  # bonus for downing the last attacker of a wave
     respawn_waves = True
+    # Ramming rule (real spec 2026-10-23): an interception is a physical collision and the
+    # defender that makes it is out too. True: that defender's commands are zeroed for the rest
+    # of the wave and it cannot capture again (reset on a new wave / episode).
+    defender_spent_on_capture = True
     """Launch a fresh wave when the field is cleared, instead of ending the episode.
 
     Ending on success truncates the value bootstrap, which makes a short successful

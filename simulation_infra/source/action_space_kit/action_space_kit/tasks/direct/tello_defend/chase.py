@@ -72,14 +72,20 @@ def smart_actions(raw, obs: dict[str, torch.Tensor], v_max: float = 1.0) -> dict
     return actions
 
 
-def smart2_actions(raw, obs: dict[str, torch.Tensor], v_max: float = 1.0) -> dict[str, torch.Tensor]:
+def smart2_actions(
+    raw, obs: dict[str, torch.Tensor], v_max: float = 1.0, alert_frac: float = 0.6, aim_up: float = 0.15,
+    standby_up: float = 0.5, standby_gain: float = 1.5,
+) -> dict[str, torch.Tensor]:
     """Like ``smart_actions`` but the assignment uses only what ONE defender observes, so a
     per-agent policy can clone it: attackers are ranked by their azimuth around the protected
     site (position relative to the site = rel_pos + own_rel_site, both in the observation) and
     defender ``i`` takes the ``i``-th live attacker in that order. Both defenders see the same
     attackers, so they compute the same ranking without knowing each other's position.
-    Defenders left over (3 defenders vs 2 attackers) are goalkeepers on the attacker nearest the
-    site. Lead pursuit as in ``smart_actions``."""
+    Defenders left over (3 defenders vs 2 attackers) are goalkeepers: they hold a standby point
+    ``standby_up`` above the site and only engage (the attacker nearest the site) once some live
+    attacker is within ``alert_frac`` x spawn_radius of the site -- the "send another drone when an
+    interception fails" rule. Lead pursuit as in ``smart_actions``, aiming ``aim_up`` metres above
+    the attacker: a ram from above hits the props and stays out of its downwash."""
     n, E, dev = raw.cfg.num_attackers, raw.num_envs, raw.device
     agents = raw.cfg.possible_agents
     rows = torch.arange(E, device=dev)
@@ -99,7 +105,10 @@ def smart2_actions(raw, obs: dict[str, torch.Tensor], v_max: float = 1.0) -> dic
         # defenders beyond the live attacker count are goalkeepers: go for the attacker nearest
         # the site, i.e. the one whose interception is failing ("send another drone")
         site_dist = torch.where(alive, site_rel[..., :2].norm(dim=-1), torch.full_like(az, 1.0e3))
-        target = torch.where(i >= n_alive, site_dist.argmin(dim=-1), target)
+        goalkeeper = i >= n_alive
+        target = torch.where(goalkeeper, site_dist.argmin(dim=-1), target)
+        alert = site_dist.min(dim=-1).values < alert_frac * raw.cfg.spawn_radius
+        standby = goalkeeper & ~alert
         r = rel[rows, target]
         v = va[rows, target]
         qa = (v * v).sum(-1) - v_max**2
@@ -110,8 +119,13 @@ def smart2_actions(raw, obs: dict[str, torch.Tensor], v_max: float = 1.0) -> dic
         t_lead = (-qb - torch.sqrt(disc.clamp(min=0.0))) / (2.0 * qa.clamp(max=-1e-6))
         t = torch.where((disc >= 0) & (t_lead > 0), t_lead, t_pursuit)
         aim = r + v * t.unsqueeze(-1)
+        aim[:, 2] += aim_up
         direction = aim / torch.clamp(aim.norm(dim=-1, keepdim=True), min=1e-6)
         direction = direction * alive.any(dim=-1, keepdim=True).float()
+        # standby: P-control to the point standby_up above the site (own position relative to the site is obs[0:3])
+        hold = -(o[:, 0:3] - torch.tensor([0.0, 0.0, standby_up], device=dev)) * standby_gain
+        hold = hold.clamp(-1.0, 1.0)
+        direction = torch.where(standby.unsqueeze(-1), hold, direction)
         actions[a] = torch.cat([direction, torch.zeros(E, 1, device=dev)], dim=-1)
     return actions
 

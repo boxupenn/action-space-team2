@@ -51,6 +51,9 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
         self._attacker_speed = torch.zeros(self.num_envs, self.cfg.num_attackers, device=self.device)
         self._breached = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         self._prev_distance = torch.zeros(self.num_envs, self.cfg.num_defenders, device=self.device)
+        # defenders that already rammed an attacker this wave (ramming rule, cfg.defender_spent_on_capture)
+        self._spent = torch.zeros(self.num_envs, self.cfg.num_defenders, device=self.device, dtype=torch.bool)
+        self._episode_credit = torch.zeros(self.num_envs, self.cfg.num_defenders, device=self.device)
         if self.cfg.closing_mode not in ("distance", "own_motion"):
             raise ValueError(f"closing_mode must be 'distance' or 'own_motion', got {self.cfg.closing_mode!r}")
         if self.cfg.target_mode not in ("nearest", "assigned"):
@@ -67,6 +70,7 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
         self._episode_captures = torch.zeros(self.num_envs, device=self.device)
         self.outcome_breached = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         self.outcome_captures = torch.zeros(self.num_envs, device=self.device)
+        self.outcome_credit = torch.zeros(self.num_envs, self.cfg.num_defenders, device=self.device)  # captures per defender
         self.outcome_valid = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
 
     # -- scene ------------------------------------------------------------------
@@ -119,6 +123,8 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
             actions = self._actions[f"defender_{i}"]
             if not self.cfg.yaw_action:
                 actions = actions * self._yaw_mask
+            if self.cfg.defender_spent_on_capture:
+                actions = actions * (~self._spent[:, i]).float().unsqueeze(-1)  # a spent defender just hovers
             force, torque = self._defender_ctl[i].compute(
                 actions=actions,
                 lin_vel_w=drone.data.root_lin_vel_w,
@@ -208,9 +214,14 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
         for i, drone in enumerate(self._defenders):
             dist = torch.linalg.norm(attacker_pos - drone.data.root_pos_w.unsqueeze(1), dim=-1)
             hit = (dist < self.cfg.capture_radius) & self._attacker_alive
+            if self.cfg.defender_spent_on_capture:
+                hit &= ~self._spent[:, i].unsqueeze(-1)
             captured |= hit
             defender_credit[:, i] = hit.float().sum(dim=-1)
         self._attacker_alive &= ~captured
+        if self.cfg.defender_spent_on_capture:
+            self._spent |= defender_credit > 0
+        self._episode_credit += defender_credit
 
         # breach: a live attacker inside the protected cylinder
         radial = torch.linalg.norm(attacker_pos[:, :, :2] - site[:, :2].unsqueeze(1), dim=-1)
@@ -308,6 +319,7 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
         self.outcome_valid = finished
         self.outcome_breached = torch.where(finished, self._breached, self.outcome_breached)
         self.outcome_captures = torch.where(finished, self._episode_captures, self.outcome_captures)
+        self.outcome_credit = torch.where(finished.unsqueeze(-1), self._episode_credit, self.outcome_credit)
         terminated = {agent: done for agent in self.cfg.possible_agents}
         time_outs = {agent: time_out for agent in self.cfg.possible_agents}
         return terminated, time_outs
@@ -333,6 +345,7 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
             self.cfg.attacker_speed[0], self.cfg.attacker_speed[1], (num, self.cfg.num_attackers), self.device
         )
         self._prev_distance[env_ids] = self.cfg.spawn_radius
+        self._spent[env_ids] = False
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
         if env_ids is None:
@@ -371,6 +384,8 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
         )
         self._breached[env_ids] = False
         self._episode_captures[env_ids] = 0.0
+        self._episode_credit[env_ids] = 0.0
+        self._spent[env_ids] = False
         for agent in self.cfg.possible_agents:
             self._actions[agent][env_ids] = 0.0
         self._prev_distance[env_ids] = self.cfg.spawn_radius
