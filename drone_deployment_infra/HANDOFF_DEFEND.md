@@ -45,7 +45,7 @@ python swarm_policies.py --run defend:4,5,6 --run formation:7,9 --fly --duration
   it empty: the first two `formation/` topics on the bus are taken.
 - Our defenders publish `defend/drone<N>` (same fields as `formation/`) on the bus every tick.
 - After your umbrella's `takeoff` (~1 m) each defender first climbs to its launch height
-  (`launch_height_cm` in `defend.yaml`: 190 / 205 / 220 cm, above the attackers) with its camera on the
+  (`launch_height_cm` in `defend.yaml`: 145 / 150 / 155 cm) with its camera on the
   tags, then the net flies it; it commands full stick (`speed_cap: 1.0`, ~2 m/s) on the rams.
 
 ## Behaviour

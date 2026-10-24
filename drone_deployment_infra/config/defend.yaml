@@ -15,8 +15,8 @@ fence:                                # tag-frame box the defenders may not leav
   y: [-1.0, 1.0]                      # y is up: floor 1.25 m below tag 10; 1.0 above = 2.25 m altitude
   z: [0.3, 6.3]                       # the room is 6.6 m deep
 height_cm: [50, 225]                  # tof range: no more down below / up above these
-launch_height_cm: [190, 205, 220]     # after the umbrella's takeoff each defender climbs here (camera on the tags) before
-                                      # the net takes over: the sim launch heights, above the 1.2-1.7 m attackers
+launch_height_cm: [145, 150, 155]     # after the umbrella's takeoff (~1 m) each defender climbs here (camera on the tags) before
+                                      # the net takes over. 1.5 m per the user (sim trained from 1.9-2.2 m; the net climbs on its own if needed)
 # Launch spots = the three crosses of the arena figure (tag frame x, z; altitude): defender_0 (1.0, 1.37) 1.9 m,
 # defender_1 (1.52, 0.50) 2.05 m, defender_2 (0.33, 0.99) 2.2 m, next to the base (goalkeeper when idle). The sim's
 # defender_spawn_xy / heights. Attackers take off at the far end of the room (4.4-6.3 m from the wall).
