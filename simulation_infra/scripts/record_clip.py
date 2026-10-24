@@ -30,6 +30,7 @@ parser.add_argument("--algorithm", type=str, default="IPPO", choices=["IPPO", "M
 parser.add_argument("--set", nargs="*", default=[], metavar="FIELD=VALUE",
                     help="env config overrides, e.g. respawn_waves=False capture_radius=1.0")
 parser.add_argument("--eye", type=float, nargs=3, default=(13.0, 13.0, 8.0), help="camera position")
+parser.add_argument("--lookat", type=float, nargs=3, default=(0.0, 0.0, 1.0), help="camera target")
 args, _ = parser.parse_known_args()
 
 if sys.platform == "win32":
@@ -72,7 +73,7 @@ for item in args.set:
     print(f"[clip] override {key} = {value!r}", flush=True)
 # frame the protected site so interceptions are visible
 env_cfg.viewer.eye = tuple(args.eye)
-env_cfg.viewer.lookat = (0.0, 0.0, 1.0)
+env_cfg.viewer.lookat = tuple(args.lookat)
 
 gym_env = gym.make("AS-Defend-v0", cfg=env_cfg)
 env = gym_env.unwrapped
@@ -118,6 +119,9 @@ def capture(index: int) -> str:
     path = os.path.join(args.frame_dir, f"frame_{index:05d}.png")
     # wait_for_result is a coroutine, so there is nothing useful to call synchronously;
     # ticking the app is what actually flushes the capture to disk
+    draw = getattr(env, "draw_markers", None)
+    if draw is not None:
+        draw()
     capture_viewport_to_file(viewport, path)
     tick(args.ticks_per_capture)
     return path

@@ -16,7 +16,7 @@ import torch
 import isaaclab.sim as sim_utils
 from isaaclab.assets import RigidObject
 from isaaclab.envs import DirectMARLEnv
-from isaaclab.markers import CUBOID_MARKER_CFG, VisualizationMarkers
+from isaaclab.markers import CUBOID_MARKER_CFG, VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils.math import sample_uniform
 
@@ -123,6 +123,39 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
         marker_cfg.markers["cuboid"].size = (self.cfg.site_radius, self.cfg.site_radius, 0.05)
         marker_cfg.prim_path = "/Visuals/site"
         self._site_markers = VisualizationMarkers(marker_cfg)
+        self._team_markers = None  # built on the first debug-vis callback (video clips): teams, arc, launch spots, room
+
+    def _build_team_markers(self):
+        mat = lambda rgb, a=1.0: sim_utils.PreviewSurfaceCfg(diffuse_color=rgb, opacity=a)  # noqa: E731
+        b = self.cfg.arena_bounds or [[0.4, 4.8], [-0.8, 2.6], [0.5, 2.25]]
+        lx, ly = b[0][1] - b[0][0], b[1][1] - b[1][0]
+        cfg = VisualizationMarkersCfg(prim_path="/Visuals/teams", markers={
+            "attacker": sim_utils.SphereCfg(radius=0.14, visual_material=mat((1.0, 0.1, 0.1), 0.45)),
+            "defender": sim_utils.SphereCfg(radius=0.14, visual_material=mat((0.15, 0.35, 1.0), 0.45)),
+            "down": sim_utils.SphereCfg(radius=0.14, visual_material=mat((0.45, 0.45, 0.45), 0.45)),
+            "arc": sim_utils.CuboidCfg(size=(0.07, 0.07, 0.02), visual_material=mat((1.0, 0.25, 0.25))),
+            "launch": sim_utils.CuboidCfg(size=(0.3, 0.3, 0.02), visual_material=mat((0.15, 0.35, 1.0))),
+            "edge_x": sim_utils.CuboidCfg(size=(lx, 0.04, 0.02), visual_material=mat((0.2, 0.2, 0.2))),
+            "edge_y": sim_utils.CuboidCfg(size=(0.04, ly, 0.02), visual_material=mat((0.2, 0.2, 0.2))),
+            "wall": sim_utils.CuboidCfg(size=(0.05, ly, 2.5), visual_material=mat((0.55, 0.55, 0.5), 0.6)),
+        })
+        self._team_markers = VisualizationMarkers(cfg)
+        names = list(cfg.markers)
+        pts, idx = [], []  # static markers in the env-local frame
+        for k in range(36):
+            a = 2.0 * math.pi * k / 36
+            pts.append([self.cfg.site_radius * math.cos(a), self.cfg.site_radius * math.sin(a), 0.01]); idx.append(names.index("arc"))
+        for xy in self.cfg.defender_spawn_xy:
+            pts.append([xy[0], xy[1], 0.01]); idx.append(names.index("launch"))
+        cx, cy = (b[0][0] + b[0][1]) / 2, (b[1][0] + b[1][1]) / 2
+        for y in (b[1][0], b[1][1]):
+            pts.append([cx, y, 0.01]); idx.append(names.index("edge_x"))
+        for x in (b[0][0], b[0][1]):
+            pts.append([x, cy, 0.01]); idx.append(names.index("edge_y"))
+        pts.append([0.0, cy, 1.25]); idx.append(names.index("wall"))
+        self._static_pts = torch.tensor(pts, device=self.device)
+        self._static_idx = torch.tensor(idx, device=self.device)
+        self._team_names = names
 
     def _setup_extra_sensors(self) -> None:
         """Hook for subclasses to add sensors. Called before the scene is cloned."""
@@ -516,5 +549,25 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
         self._prev_distance[env_ids] = self.cfg.spawn_radius
 
     def _debug_vis_callback(self, event):
+        self.draw_markers()
+
+    def draw_markers(self):
+        """Site, teams (attackers red, defenders blue, down grey), arc, launch spots and room; called per
+        captured frame by scripts/record_clip.py (the env has no _set_debug_vis_impl, so no Kit callback)."""
         site = self.scene.env_origins.clone()
         self._site_markers.visualize(site)
+        if self._team_markers is None:
+            self._build_team_markers()
+        E, n, D = self.num_envs, self.cfg.num_attackers, self.cfg.num_defenders
+        names = self._team_names
+        origins = self.scene.env_origins
+        static = (origins.unsqueeze(1) + self._static_pts.unsqueeze(0)).reshape(-1, 3)
+        static_idx = self._static_idx.repeat(E)
+        att_pos, _ = self._attacker_states()
+        att_idx = torch.where(self._attacker_alive, names.index("attacker"), names.index("down")).reshape(-1)
+        def_pos = torch.stack([d.data.root_pos_w for d in self._defenders], dim=1)
+        def_idx = torch.where(self._spent, names.index("down"), names.index("defender")).reshape(-1)
+        self._team_markers.visualize(
+            translations=torch.cat([static, att_pos.reshape(-1, 3), def_pos.reshape(-1, 3)]),
+            marker_indices=torch.cat([static_idx, att_idx, def_idx]),
+        )
