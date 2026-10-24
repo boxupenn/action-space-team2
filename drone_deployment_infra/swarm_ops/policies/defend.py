@@ -347,6 +347,59 @@ class UdpAttackers:
         return pos, vel, alive
 
 
+class BusAttackers:
+    """THE ARENA SOURCE (2026-10-24): the organisers fly the attackers with swarm_formation.py under the
+    same umbrella, which publishes "formation/drone<N>" on the shared telemetry bus every tick:
+    {state, p (map frame: x right, y up, z out of tag 10, m; None before the first fix), psi_deg,
+    fix_age, height_cm, rc}. Attackers = `names` (e.g. ["drone4", "drone5"]) or, empty, the first
+    N_ATT "formation/" topics by name. Alive while its topic is younger than STALE_S, has a position,
+    its height reads above LOW_CM and its state is not a landing one; a rammed attacker (on the floor,
+    link lost, or publishing stopped) keeps its last position with alive 0. Velocity is differenced."""
+    STALE_S = 1.0
+    LOW_CM = 30
+    DOWN_STATES = ("LAND", "DONE", "EMERG")
+
+    def __init__(self, bus, names=None):
+        self.bus = bus
+        self.names = list(names or [])[:N_ATT]
+        self.hist = {}                                # name -> deque of (t, p_sim)
+        self.flag = {}
+
+    def pick(self):
+        if len(self.names) < N_ATT:
+            seen = sorted(k.split("/", 1)[1] for k in self.bus.since("formation/"))
+            for n in seen:
+                if n not in self.names and len(self.names) < N_ATT:
+                    self.names.append(n)
+        return self.names
+
+    def state(self, now, defenders_p=None):
+        pos, vel, alive = np.zeros((N_ATT, 3)), np.zeros((N_ATT, 3)), np.zeros(N_ATT)
+        for i, n in enumerate(self.pick()):
+            hit = self.bus.latest(f"formation/{n}")
+            h = self.hist.setdefault(n, deque(maxlen=20))
+            up = False
+            if hit is not None:
+                data, age = hit
+                p = data.get("p")
+                if p is not None and len(p) == 3:
+                    t = time.time() - age                 # the bus ages against the wall clock
+                    if not h or t > h[-1][0]:
+                        h.append((t, tag_to_sim(p)))
+                hc = data.get("height_cm")
+                st = str(data.get("state") or "").upper()
+                up = (age < self.STALE_S and p is not None and (hc is None or hc > self.LOW_CM)
+                      and not any(st.startswith(s) for s in self.DOWN_STATES))
+            self.flag[n] = up
+            if h:
+                pos[i], vel[i] = h[-1][1], velocity(h, now)   # last known even when down
+                alive[i] = 1.0 if up else 0.0
+        return pos, vel, alive
+
+    def status(self):
+        return f"bus attackers {self.names} alive {[self.flag.get(n) for n in self.names]}"
+
+
 def load_tag_map(path=None):
     """config/map.yaml -> {tag id: (R, t)} with X_tag10 = R @ X_tag + t (TagMap.poses convention)."""
     import yaml
@@ -581,7 +634,9 @@ class DefendPolicy(Policy):
             raise ValueError(f"defend: nets take obs dims {dims} for {len(drones)} drones; this runner builds "
                              f"{OBS_WIDTHS} for exactly {N_DEF} drones")
         if self.attackers is None:
-            if self.cfg["attackers"] == "udp":
+            if self.cfg["attackers"] == "bus":
+                self.attackers = BusAttackers(self.bus, self.cfg.get("attacker_names") or None)
+            elif self.cfg["attackers"] == "udp":
                 self.attackers = UdpAttackers(self.cfg["udp_port"])
             elif self.cfg["attackers"] == "telemetry":
                 self.attackers = TelemetryAttackers(self.cfg.get("telemetry_port", 9100),

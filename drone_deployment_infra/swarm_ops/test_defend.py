@@ -272,3 +272,27 @@ def test_policy_shapes_and_closing(policy_dir):
         to_att = att_p[0][:2] - own[:2]
         closing += float(np.dot(act[:2], to_att / np.linalg.norm(to_att))) > 0
     assert closing >= 1, "at least one defender should move toward the attackers"
+
+
+def test_bus_attackers_alive_and_velocity():
+    """BusAttackers: formation/drone<N> topics -> sim positions, differenced velocity, alive flags."""
+    import time
+    from policies.defend import BusAttackers, tag_to_sim
+    from policies.telemetry import TelemetryBus
+    bus = TelemetryBus()
+    att = BusAttackers(bus)
+    now = time.time()
+    bus.publish("formation/drone5", {"state": "APPROACH", "p": [0.0, -0.3, 2.0], "height_cm": 120}, now - 0.2)
+    att.state(now)                                       # the bus keeps only the latest value: history builds per tick
+    bus.publish("formation/drone5", {"state": "APPROACH", "p": [0.0, -0.3, 1.7], "height_cm": 120}, now)
+    bus.publish("formation/drone4", {"state": "CLIMB", "p": None, "height_cm": 40}, now)
+    pos, vel, alive = att.state(now)
+    assert att.names == ["drone5", "drone4"]            # slots fill as attackers appear (drone5 was first), then stay
+    assert alive.tolist() == [1.0, 0.0]                 # drone5 alive; drone4 has no fix yet -> not alive
+    assert np.allclose(pos[0], tag_to_sim([0.0, -0.3, 1.7]))
+    assert vel[0][0] < -0.5                             # moving toward the wall (sim -x) at ~1.5 m/s
+    bus.publish("formation/drone5", {"state": "LANDING", "p": [0.0, -1.3, 1.7], "height_cm": 10}, now + 0.01)
+    pos, vel, alive = att.state(now + 0.01)
+    assert alive[0] == 0.0 and np.allclose(pos[0], tag_to_sim([0.0, -1.3, 1.7]))   # down: last position, alive 0
+    att.STALE_S = -1.0                                  # a stalled publisher never steers: not alive
+    assert att.state(now)[2].tolist() == [0.0, 0.0]
