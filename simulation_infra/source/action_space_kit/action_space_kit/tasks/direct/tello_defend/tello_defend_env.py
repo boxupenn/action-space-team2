@@ -436,6 +436,9 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
                 angle = sample_uniform(-half, half, (num,), self.device)
                 radius = self.cfg.spawn_radius + sample_uniform(-self.cfg.spawn_radius_jitter, self.cfg.spawn_radius_jitter, (num,), self.device)
                 xy = radius.unsqueeze(-1) * torch.stack([torch.cos(angle), torch.sin(angle)], dim=-1)
+            if self.cfg.arena_bounds:
+                b = torch.tensor(self.cfg.arena_bounds[:2], device=self.device)
+                xy = torch.maximum(torch.minimum(xy, b[:, 1]), b[:, 0])
             self._spawn_angle[env_ids, i] = angle
             state[:, :2] = origins[:, :2] + xy
             state[:, 2] = origins[:, 2] + sample_uniform(self.cfg.attacker_spawn_z[0], self.cfg.attacker_spawn_z[1], (num,), self.device)

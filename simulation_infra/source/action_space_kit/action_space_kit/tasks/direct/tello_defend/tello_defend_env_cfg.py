@@ -83,8 +83,14 @@ class TelloDefendEnvCfg(DirectMARLEnvCfg):
     # candidate points each attacker picks from at random (+-spawn_xy_jitter). Empty attacker list = random
     # ring at spawn_radius (the kit default). Fill both from the organisers' arena figure; the defender
     # points are also where the teacher / clone flies back to once the field is cleared.
-    defender_spawn_xy = [[2.0, 0.0], [1.4, 1.4], [1.4, -1.4]]  # ponytail: placeholder, in front of the site at 0 / +-45 deg; fill from the arena figure
+    # From the organisers' map.yaml (2026-10-24): tag-10 wall at z=0, floor 1.25 m below tag 10, right wall at
+    # x~2.8 m, floor tags out to z~5 m, left side mapped only to x~-0.5. Sim frame = (tag z, tag x, up).
+    defender_spawn_xy = [[2.0, 0.2], [1.6, 1.6], [1.6, -0.4]]  # tag frame (x, z): (0.2, 2.0), (1.6, 1.6), (-0.4, 1.6)
     attacker_spawn_xy = []
+    # Room box from map.yaml, sim frame [x out of the wall, y right, z above the floor]: attackers only
+    # spawn inside it and the teacher never commands a velocity through its faces (the runner's fence does
+    # the same on the real drone). [] = no box.
+    arena_bounds = [[0.4, 4.8], [-0.8, 2.6], [0.5, 2.25]]
     spawn_xy_jitter = 0.2  # [m]
     # Seconds between a cleared field and the next wave's first launch (respawn_waves only): the
     # defenders fly home in the gap, so the clone learns the return.
@@ -158,7 +164,7 @@ class TelloDefendEnvCfg(DirectMARLEnvCfg):
     obs_assignment = OBS_ASSIGNMENT
     # Defenders start at index-specific heights (metres above the floor), as they will be placed and
     # launched on the real field; empty list = uniform 1-2 m (the kit's default).
-    defender_spawn_heights = [2.0, 2.2, 2.4]  # above the attackers (1.2-1.8 m) so the ram is a shallow descent; fence 2.2 m above tag 10
+    defender_spawn_heights = [1.9, 2.05, 2.2]  # above the attackers (1.2-1.8 m) so the ram is a shallow descent; Tello tof cap 2.25 m
     """Launch a fresh wave when the field is cleared, instead of ending the episode.
 
     Ending on success truncates the value bootstrap, which makes a short successful

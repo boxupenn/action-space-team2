@@ -187,6 +187,7 @@ def smart2_actions(
     obs_teammates = getattr(raw.cfg, "obs_teammates", True)
     aim_up = getattr(raw.cfg, "teacher_aim_up", aim_up)
     climb_slope = getattr(raw.cfg, "teacher_climb_slope", 0.0)
+    bounds = getattr(raw.cfg, "arena_bounds", [])
     align_dist = getattr(raw.cfg, "teacher_align_dist", 0.0)
     align_tol = getattr(raw.cfg, "teacher_align_tol", 0.05)
     v_max = getattr(raw.cfg.command, "max_lin_speed", v_max)
@@ -289,6 +290,12 @@ def smart2_actions(
             horiz = torch.cat([away[..., :2], torch.zeros(E, D - 1, 1, device=dev)], dim=-1)
             push = mag * (sep_vertical * vert + (1.0 - sep_vertical) * horiz)
             direction = (direction + push.sum(dim=1)).clamp(-1.0, 1.0)
+        if bounds:  # room box (map.yaml): no velocity through a face I am already at / beyond
+            own = o[:, 0:3] + torch.tensor([0.0, 0.0, site_z], device=dev)  # above the floor, site frame
+            lo = torch.tensor([bnd[0] for bnd in bounds], device=dev)
+            hi = torch.tensor([bnd[1] for bnd in bounds], device=dev)
+            direction = torch.where((own <= lo) & (direction < 0.0), torch.zeros_like(direction), direction)
+            direction = torch.where((own >= hi) & (direction > 0.0), torch.zeros_like(direction), direction)
         actions[a] = torch.cat([direction, torch.zeros(E, 1, device=dev)], dim=-1)
     return actions
 

@@ -48,7 +48,7 @@ OBS_DIM_MATES = 23 + 3 * (N_DEF - 1)        # 29 (defend_3v2_ram4_*): + teammate
 OBS_DIM_ACTIVE = 23 + 4 * (N_DEF - 1)       # 31 (defend_3v2_ram5/6_*): + per teammate rel position and active flag
 OBS_DIM = OBS_DIM_ACTIVE + N_ATT + 1        # 34 (defend_3v2_ram8_*): + one-hot of my assigned attacker, goalkeeper flag
 OBS_WIDTHS = (OBS_DIM_LEGACY, OBS_DIM_MATES, OBS_DIM_ACTIVE, OBS_DIM)
-V_MAX = 1.0                                 # m/s at |action| = 1 (sim TelloCommandCfg.max_lin_speed): assignment rule
+V_MAX = 2.0                                 # m/s at |action| = 1 (sim TelloCommandCfg.max_lin_speed, arena nets): assignment rule
 MATE_INACTIVE_S = 6.0                       # teammate with no fix this long (= NO_FIX_LAND_S) counts as inactive
 MATE_LOW_CM, MATE_LOW_S = 30, 1.0           # ... or on the floor: height below this for this long (rammed)
 MATE_STATUS_STALE_S = 3.0                   # ... or its status stream stopped (link lost / powered off)
