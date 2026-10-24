@@ -201,6 +201,12 @@ The first drone in `--run defend:a,b,c` is `defender_0`, the second `defender_1`
    a tag fix from every defender (place them 1-2.5 m in front of the wall, **facing tag 10**).
 
 **Attackers** (`attackers:` in `defend.yaml`)
+- `bus` (**the arena setting, default**): the organisers run our policy under their umbrella next to
+  their `formation` attackers (`python swarm_policies.py --run defend:4,5,6 --run formation:7,9 --fly`);
+  `swarm_formation.py` publishes `formation/drone<N>` (map-frame `p`, `state`, `height_cm`, ...) on the
+  shared telemetry bus every tick (section 5). We take `attacker_names` (e.g. `[drone7, drone9]`) or the
+  first two `formation/` topics that appear; an attacker is alive while its topic is younger than 1 s,
+  has a fix, reads above 30 cm and is not landing; a rammed one keeps its last position with alive 0.
 - `scripted` (default, for testing with no real attackers): each attacker flies straight from
   `start` at `speed` toward the site after `delay`; it is "down" within `capture_radius` of a
   defender or on arrival, and restarts after `respawn_s`.
