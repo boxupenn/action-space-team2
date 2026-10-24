@@ -51,6 +51,7 @@ import yaml
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "core"))
 from paths import CAMERA_DIR, DONGLES_PATH, MAP_PATH, TAGS_PATH, camera_file  # noqa: E402  (config/ lives in core)
+from policies.telemetry import TelemetryClient  # noqa: E402  (umbrella telemetry; local bus when run alone)
 
 # ======================= SETTINGS =======================
 TAG_ID = 10
@@ -400,6 +401,18 @@ def load_tag_files(map_path, tags_path):
     if origin not in poses:
         raise SystemExit(f"origin tag {origin} missing from {map_path}")
     return origin, poses, sizes
+
+
+def publish_telemetry(telem, drones, now):
+    """"formation/drone<N>" for the umbrella's other policies: pose in the map frame
+    (x right, y up, z out of tag 10, m), None until the drone's first tag fix."""
+    for d in drones:
+        e = d.est(now)
+        telem.publish(f"formation/{d.name}", {
+            "state": d.state, "height_cm": d.height_cm(), "rc": list(d.last_rc),
+            "p": None if e is None else [round(float(v), 3) for v in C_FLIP @ e[0]],
+            "psi_deg": None if e is None else round(float(e[1]), 1),
+            "fix_age": None if e is None else round(e[2], 3)}, now)
 
 
 def drone_in_frame(R, t):
@@ -1104,9 +1117,11 @@ def main():
         term_key = start_terminal_keys() if args.headless else None
         if args.headless:
             print(">>> HEADLESS: type  q + Enter = land all,  e + Enter = EMERGENCY,  Ctrl+C = land all")
+        telem = TelemetryClient.from_env()
         while True:
             t_loop = now = time.time()
             active = [d for d in drones if not d.landed and not d.landing]
+            publish_telemetry(telem, active, now)
             if not active:
                 print("No drones left in the formation.")
                 return

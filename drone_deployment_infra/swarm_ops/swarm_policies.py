@@ -19,6 +19,12 @@ Umbrella: give --run once per group, e.g. drones 1,2 spin while 3,4,5 split 3 ft
   python swarm_policies.py --run spin:6,7,9 --run formation:4,5 --fly    # defend + attack
 One --run flies just that policy. A drone may be in only one group.
 
+Telemetry: every policy can publish live data and read what the others publish
+(policies/telemetry.py): self.bus.publish(topic, data) / self.bus.latest(topic). External
+policies (formation) get the same calls over localhost UDP via TelemetryClient.from_env().
+The umbrella itself publishes "status/drone<N>" (height, battery, rc, policy) every tick
+for the drones it flies; formation publishes "formation/drone<N>" (tag-frame pose).
+
 DEFAULT IS DRY-RUN (connect + status only, no takeoff). --fly to fly.
 Safety: all-or-nothing preflight; a failed takeoff, Ctrl+C or the end of --duration lands
 ALL; a drone that loses its status stream or drops below LAND_BATTERY lands on its own.
@@ -38,7 +44,8 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "core"))
 from paths import DONGLES_PATH  # noqa: E402  (config/ lives in core)
-from policies import POLICIES, FormationPolicy, HoverPolicy, SpinPolicy, Umbrella  # noqa: E402
+from policies import (POLICIES, FormationPolicy, HoverPolicy, SpinPolicy, TelemetryBus,  # noqa: E402
+                      TelemetryHub, Umbrella)
 from policies.base import HIGH_CM  # noqa: E402
 from policies.formation import PROMPT as FORMATION_PROMPT  # noqa: E402
 from policies.spin import SPIN_YAW_RC  # noqa: E402
@@ -266,11 +273,11 @@ def load_drones(cfg, nums, fly):
 class External:
     """A policy that flies its drones from its own process (e.g. policies/formation.py)."""
 
-    def __init__(self, policy, nums, fly, config):
+    def __init__(self, policy, nums, fly, config, env=None):
         self.name, self.nums, self.started = policy.name, nums, False
         self.proc = subprocess.Popen(policy.command(nums, fly, config), stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                     start_new_session=True)   # our Ctrl+C reaches it once, via stop()
+                                     start_new_session=True, env=env)   # our Ctrl+C reaches it once, via stop()
         self.prompted = threading.Event()
         self.passed = 0                                    # its drones' preflight PASS lines
         threading.Thread(target=self._relay, daemon=True).start()
@@ -400,7 +407,9 @@ def main():
     umbrella, ext_specs = parse_runs(args.run, args.yaw, args.formation_args, args.height)
     ext_nums = {n for _, nums in ext_specs for n in nums}
     groups = {p: nums for p, nums in umbrella.groups.items() if not getattr(p, "external", False)}
-    policy = Umbrella(groups)
+    bus = TelemetryBus()
+    hub = TelemetryHub(bus)
+    policy = Umbrella(groups, bus)
     drones = load_drones(args.config, set(policy.owner), args.fly)
     policy.setup(drones)
     print("Plan: " + ", ".join([f"{d.name}={policy.describe(d)}" for d in drones]
@@ -409,7 +418,7 @@ def main():
     if args.duration is None and not ext_specs:
         args.duration = 20.0
 
-    externals = [External(p, nums, args.fly, args.config) for p, nums in ext_specs]
+    externals = [External(p, nums, args.fly, args.config, hub.env()) for p, nums in ext_specs]
     res = parallel(drones, preflight)
     failed = [d.name for d in drones if not res.get(d.num)]
     for e in externals:
@@ -473,6 +482,8 @@ def main():
                     d.land_async(f"{policy.describe(d)} done")
                     continue
                 d.rc(*rc)
+                bus.publish(f"status/{d.name}", {"policy": policy.owner[d.num].name, "height_cm": d.height_cm(),
+                                                 "battery": bat, "rc": list(d.last_rc)}, t_loop)
             if t_loop - last_print >= 1.0:
                 last_print = t_loop
                 for d in active:
@@ -496,6 +507,7 @@ def main():
             parallel([d for d in drones if d.airborne and not d.landed], lambda d: d.land())
         for d in drones:
             d.close()
+        hub.close()
         print("Done.", flush=True)
 
 

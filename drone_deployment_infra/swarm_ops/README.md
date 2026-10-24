@@ -139,6 +139,23 @@ umbrella's terminal. Formation drones only avoid each other: keep the other grou
 of the space in front of tag 10. Safety: a drone with no status stream for 3 s or
 battery < 15 % lands on its own; takeoff needs battery >= 40 %.
 
+**Telemetry between policies** (`policies/telemetry.py`). Any policy can publish live data
+and read what the others publish; only the latest value per topic is kept, with its age.
+```python
+self.bus.publish("spin/drone6", {"yaw_rc": 40})        # in step() or anywhere
+hit = self.bus.latest("formation/drone4", max_age=0.5)  # (data, age_s) or None if missing/stale
+self.bus.since("formation/")                            # {topic: (data, age_s)}
+```
+In-process policies get the umbrella's bus as `self.bus`. A policy in its own process uses
+`TelemetryClient.from_env()` (same calls, over localhost UDP to the umbrella; a private bus
+when run alone). Published automatically every tick:
+| Topic | From | Data |
+|---|---|---|
+| `status/drone<N>` | umbrella, its own drones | `policy`, `height_cm`, `battery`, `rc` |
+| `formation/drone<N>` | `swarm_formation.py` | `state`, `p` (m, map frame; `None` = no fix yet), `psi_deg`, `fix_age`, `height_cm`, `rc` |
+
+Steer on telemetry only while it is fresh (`max_age`): a stalled publisher must not steer a drone.
+
 ---
 
 ## 6. Map the tags (`map_tags.py`, no flying)

@@ -2,8 +2,10 @@
 
 A policy gets its drones once (setup) and then, every tick, returns each airborne drone's
 rc command. A drone object offers height_cm(), battery(), num and name (see Drone in
-swarm_policies.py).
+swarm_policies.py). self.bus is the shared telemetry (telemetry.py): publish what other
+policies may use, read what they publish.
 """
+from .telemetry import TelemetryBus
 
 LOW_CM = 91                  # 3 ft
 HIGH_CM = 183                # 6 ft
@@ -27,9 +29,12 @@ def hold_height(d, target_cm):
 class Policy:
     """step(d, t) -> (a, b, c, d) rc for drone d, t = s since its takeoff; None = land it."""
     name = "policy"
+    bus = None                   # set by the umbrella before setup; else a private bus
 
     def setup(self, drones):
         self.drones = list(drones)
+        if self.bus is None:
+            self.bus = TelemetryBus()
 
     def step(self, d, t):
         raise NotImplementedError
