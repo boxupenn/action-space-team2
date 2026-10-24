@@ -1,0 +1,191 @@
+[INFO][AppLauncher]: Using device: cuda:0
+[INFO][AppLauncher]: Loading experience file: /home/linyue/isaac/IsaacLab/apps/isaaclab.python.headless.kit
+Loading user config located at: '/home/linyue/isaac/env_isaaclab/lib/python3.11/site-packages/isaacsim/kit/data/Kit/Isaac-Sim/5.1/user.config.json'
+[Info] [carb] Logging to file: /home/linyue/isaac/env_isaaclab/lib/python3.11/site-packages/isaacsim/kit/logs/Kit/Isaac-Sim/5.1/kit_20261024_001800.log
+2026-10-24T04:18:00Z [43ms] [Warning] [omni.usd_config.extension] Enable omni.materialx.libs extension to use MaterialX
+2026-10-24T04:18:00Z [172ms] [Warning] [omni.platforminfo.plugin] failed to open the default display.  Can't verify X Server version.
+2026-10-24T04:18:00Z [259ms] [Warning] [carb] Acquiring non optional plugin interface which is not listed as dependency: [omni::physx::IPhysxBenchmarks v1.0] (plugin: <default plugin>), by client: omni.physics.physx.plugin. Add it to CARB_PLUGIN_IMPL_DEPS() macro of a client.
+2026-10-24T04:18:00Z [263ms] [Warning] [omni.isaac.dynamic_control] omni.isaac.dynamic_control is deprecated as of Isaac Sim 4.5. No action is needed from end-users.
+2026-10-24T04:18:01Z [1,744ms] [Warning] [gpu.foundation.plugin] Skipping unsupported non-NVIDIA GPU: AMD Ryzen 7 9850X3D 8-Core Processor (RADV RAPHAEL_MENDOCINO)
+2026-10-24T04:18:01Z [1,744ms] [Warning] [gpu.foundation.plugin] Skipping unsupported non-NVIDIA GPU: AMD Ryzen 7 9850X3D 8-Core Processor (RADV RAPHAEL_MENDOCINO)
+
+|---------------------------------------------------------------------------------------------|
+| Driver Version: 580.178.04    | Graphics API: Vulkan
+|=============================================================================================|
+| GPU | Name                             | Active | LDA | GPU Memory | Vendor-ID | LUID       |
+|     |                                  |        |     |            | Device-ID | UUID       |
+|     |                                  |        |     |            | Bus-ID    |            |
+|---------------------------------------------------------------------------------------------|
+| 0   | NVIDIA GeForce RTX 5080          | Yes: 0 |     | 16303   MB | 10de      | 0          |
+|     |                                  |        |     |            | 2c02      | 476d84cd.. |
+|     |                                  |        |     |            | 1         |            |
+|---------------------------------------------------------------------------------------------|
+| 1   | AMD Ryzen 7 9850X3D 8-Core Pro.. |        |     | 10746   MB | 1002      | 0          |
+|     |                                  |        |     |            | 13c0      | 00000000.. |
+|     |                                  |        |     |            | 7a        |            |
+|=============================================================================================|
+| OS: 24.04.5 LTS (Noble Numbat) ubuntu, Version: 24.04.5, Kernel: 7.0.0-38-generic
+| Processor: AMD Ryzen 7 9850X3D 8-Core Processor
+| Cores: 8 | Logical Cores: 16
+|---------------------------------------------------------------------------------------------|
+| Total Memory (MB): 31216 | Free Memory: 25006
+| Total Page/Swap (MB): 8191 | Free Page/Swap: 8191
+|---------------------------------------------------------------------------------------------|
+2026-10-24T04:18:01Z [1,904ms] [Warning] [gpu.foundation.plugin] CPU performance profile is set to powersave. This profile sets the CPU to the lowest frequency reducing performance.
+2026-10-24T04:18:01Z [1,912ms] [Warning] [gpu.foundation.plugin] PCIe link width current (8) and maximum (16) for device 0 don't match.
+2026-10-24T04:18:01Z [1,912ms] [Warning] [gpu.foundation.plugin] IOMMU is enabled.
+2026-10-24T04:18:01Z [1,912ms] [Warning] [gpu.foundation.plugin] Detected IOMMU is enabled. Running CUDA peer-to-peer bandwidth and latency validation.
+Unidirectional P2P=Enabled Bandwidth (P2P Writes) Matrix (GB/s)
+   D\D     0 
+     0 824.10 
+P2P=Enabled Latency (P2P Writes) Matrix (us)
+   GPU     0 
+     0   2.06 
+
+   CPU     0 
+     0   1.69 
+2026-10-24T04:18:01Z [1,933ms] [Warning] [omni.kvdb.plugin] Disabling key-value database because another kit process is locking it
+[INFO]: Parsing configuration from: action_space_kit.tasks.direct.tello_defend.tello_defend_env_cfg:TelloDefendEnvCfg
+[bc] override env.capture_radius = 0.2
+
+[36m======================================================================================[0m
+[36m[1m[INFO][IsaacLab]: Logging to file: /tmp/isaaclab/logs/isaaclab_2026-10-24_00-18-02.log[0m
+[36m======================================================================================[0m
+
+[33m00:18:02 [simulation_context.py] WARNING: The `enable_external_forces_every_iteration` parameter in the PhysxCfg is set to False. If you are experiencing noisy velocities, consider enabling this flag. You may need to slightly increase the number of velocity iterations (setting it to 1 or 2 rather than 0), together with this flag, to improve the accuracy of velocity updates.[0m
+[INFO]: Base environment:
+	Environment device    : cuda:0
+	Environment seed      : 2
+	Physics step-size     : 0.008333333333333333
+	Rendering step-size   : 0.016666666666666666
+	Environment step-size : 0.016666666666666666
+[INFO]: Time taken for scene creation : 1.219801 seconds
+[INFO]: Scene manager:  <class InteractiveScene>
+	Number of environments: 512
+	Environment spacing   : 12.0
+	Source prim name      : /World/envs/env_0
+	Global prim paths     : []
+	Replicate physics     : True
+[INFO]: Starting the simulation. This may take a few seconds. Please wait...
+2026-10-24T04:18:03Z [3,694ms] [Warning] [omni.physx.fabric.plugin] FabricManager::initializePointInstancer mismatched prototypes on point instancer: /Visuals/site.
+[INFO]: Time taken for simulation start : 0.294938 seconds
+[INFO]: Completed setting up the environment...
+[INFO]: Parsing configuration from: /home/linyue/Action_Space/simulation_infra/source/action_space_kit/action_space_kit/tasks/direct/tello_defend/agents/skrl_ippo_cfg.yaml
+[38;20m[skrl:INFO] Environment wrapper: Isaac Lab (multi-agent)[0m
+[33;20m[skrl:WARNING] The 'lambda' field in the configuration is deprecated. Use 'gae_lambda' instead[0m
+[33m00:18:03 [runner.py] WARNING: The 'lambda' field in the configuration is deprecated. Use 'gae_lambda' instead[0m
+[33;20m[skrl:WARNING] The 'clip_predicted_values' field in the configuration is deprecated. Use a 'value_clip' value greater than 0 to clip the predicted values instead[0m
+[33m00:18:03 [runner.py] WARNING: The 'clip_predicted_values' field in the configuration is deprecated. Use a 'value_clip' value greater than 0 to clip the predicted values instead[0m
+[38;20m[skrl:INFO] Seed: 2[0m
+[33m00:18:04 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:18:09 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:18:14 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:18:19 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:18:24 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:18:29 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[bc] collected 384000 samples per agent driven by the teacher
+[bc] round0 defender_0: n=384000 policy mse 0.0500 -> 0.0036 (holdout 0.0084), direction cosine 0.985 (n=38400), value explained var nan, log_std set to -1.0
+[bc] round0 defender_1: n=384000 policy mse 0.0770 -> 0.0140 (holdout 0.0123), direction cosine 0.981 (n=38400), value explained var nan, log_std set to -1.0
+[bc] round0 defender_2: n=384000 policy mse 0.0435 -> 0.0077 (holdout 0.0124), direction cosine 0.990 (n=38400), value explained var nan, log_std set to -1.0
+[33m00:18:42 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:18:47 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:18:52 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:18:57 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:19:02 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:19:07 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:19:12 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[bc] collected 384000 samples per agent driven by the student
+[bc] dagger1 defender_0: n=768000 policy mse 0.0350 -> 0.0062 (holdout 0.0075), direction cosine 0.988 (n=76800), value explained var nan, log_std set to -1.0
+[bc] dagger1 defender_1: n=768000 policy mse 0.0612 -> 0.0135 (holdout 0.0110), direction cosine 0.983 (n=76800), value explained var nan, log_std set to -1.0
+[bc] dagger1 defender_2: n=768000 policy mse 0.0386 -> 0.0093 (holdout 0.0016), direction cosine 0.998 (n=73868), value explained var nan, log_std set to -1.0
+[33m00:19:37 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:19:42 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:19:47 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:19:52 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:19:57 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:20:02 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:20:07 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:20:12 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[bc] collected 384000 samples per agent driven by the student
+[bc] dagger2 defender_0: n=1152000 policy mse 0.0151 -> 0.0041 (holdout 0.0083), direction cosine 0.987 (n=115200), value explained var nan, log_std set to -1.0
+[bc] dagger2 defender_1: n=1152000 policy mse 0.0278 -> 0.0095 (holdout 0.0155), direction cosine 0.975 (n=115073), value explained var nan, log_std set to -1.0
+[bc] dagger2 defender_2: n=1152000 policy mse 0.0161 -> 0.0064 (holdout 0.0039), direction cosine 0.995 (n=84540), value explained var nan, log_std set to -1.0
+[33m00:20:45 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:20:50 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:20:55 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:21:00 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:21:06 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:21:11 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:21:16 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:21:21 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[bc] collected 384000 samples per agent driven by the student
+[bc] dagger3 defender_0: n=1536000 policy mse 0.0095 -> 0.0030 (holdout 0.0080), direction cosine 0.986 (n=153600), value explained var nan, log_std set to -1.0
+[bc] dagger3 defender_1: n=1536000 policy mse 0.0160 -> 0.0068 (holdout 0.0147), direction cosine 0.979 (n=153161), value explained var nan, log_std set to -1.0
+[bc] dagger3 defender_2: n=1536000 policy mse 0.0089 -> 0.0045 (holdout 0.0052), direction cosine 0.992 (n=107677), value explained var nan, log_std set to -1.0
+[33m00:22:06 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:22:11 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:22:16 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:22:21 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:22:26 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:22:31 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:22:36 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:22:41 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[bc] collected 384000 samples per agent driven by the student
+[bc] dagger4 defender_0: n=1920000 policy mse 0.0058 -> 0.0022 (holdout 0.0070), direction cosine 0.988 (n=191995), value explained var nan, log_std set to -1.0
+[bc] dagger4 defender_1: n=1920000 policy mse 0.0101 -> 0.0050 (holdout 0.0117), direction cosine 0.982 (n=191349), value explained var nan, log_std set to -1.0
+[bc] dagger4 defender_2: n=1920000 policy mse 0.0059 -> 0.0032 (holdout 0.0046), direction cosine 0.992 (n=134515), value explained var nan, log_std set to -1.0
+[33m00:23:39 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:23:44 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:23:49 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:23:54 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:23:59 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:24:04 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:24:09 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:24:14 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[bc] collected 384000 samples per agent driven by the student
+[bc] dagger5 defender_0: n=2304000 policy mse 0.0039 -> 0.0017 (holdout 0.0055), direction cosine 0.990 (n=230395), value explained var nan, log_std set to -1.0
+[bc] dagger5 defender_1: n=2304000 policy mse 0.0066 -> 0.0037 (holdout 0.0079), direction cosine 0.988 (n=229719), value explained var nan, log_std set to -1.0
+[bc] dagger5 defender_2: n=2304000 policy mse 0.0041 -> 0.0025 (holdout 0.0032), direction cosine 0.994 (n=151983), value explained var nan, log_std set to -1.0
+[33m00:25:22 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:25:27 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:25:32 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:25:37 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:25:42 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:25:47 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:25:52 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:25:57 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[bc] collected 384000 samples per agent driven by the student
+[bc] dagger6 defender_0: n=2688000 policy mse 0.0028 -> 0.0012 (holdout 0.0040), direction cosine 0.993 (n=268793), value explained var nan, log_std set to -1.0
+[bc] dagger6 defender_1: n=2688000 policy mse 0.0048 -> 0.0030 (holdout 0.0066), direction cosine 0.989 (n=267752), value explained var nan, log_std set to -1.0
+[bc] dagger6 defender_2: n=2688000 policy mse 0.0031 -> 0.0021 (holdout 0.0028), direction cosine 0.994 (n=163882), value explained var nan, log_std set to -1.0
+[33m00:27:17 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:27:22 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:27:27 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:27:32 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:27:37 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:27:42 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:27:47 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:27:52 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[bc] collected 384000 samples per agent driven by the student
+[bc] dagger7 defender_0: n=3072000 policy mse 0.0017 -> 0.0009 (holdout 0.0028), direction cosine 0.995 (n=307133), value explained var nan, log_std set to -1.0
+[bc] dagger7 defender_1: n=3072000 policy mse 0.0036 -> 0.0025 (holdout 0.0049), direction cosine 0.992 (n=305314), value explained var nan, log_std set to -1.0
+[bc] dagger7 defender_2: n=3072000 policy mse 0.0026 -> 0.0018 (holdout 0.0025), direction cosine 0.995 (n=183697), value explained var nan, log_std set to -1.0
+[33m00:29:14 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:29:19 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[bc] collected 384000 samples per agent driven by the student
+[bc] dagger8 defender_0: n=3456000 policy mse 0.0013 -> 0.0007 (holdout 0.0023), direction cosine 0.996 (n=345381), value explained var nan, log_std set to -1.0
+[bc] dagger8 defender_1: n=3456000 policy mse 0.0029 -> 0.0021 (holdout 0.0042), direction cosine 0.994 (n=342618), value explained var nan, log_std set to -1.0
+[bc] dagger8 defender_2: n=3456000 policy mse 0.0021 -> 0.0016 (holdout 0.0027), direction cosine 0.994 (n=207958), value explained var nan, log_std set to -1.0
+[33m00:30:50 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:30:55 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[bc] collected 384000 samples per agent driven by the student
+[bc] dagger9 defender_0: n=3840000 policy mse 0.0009 -> 0.0006 (holdout 0.0017), direction cosine 0.997 (n=383697), value explained var nan, log_std set to -1.0
+[bc] dagger9 defender_1: n=3840000 policy mse 0.0024 -> 0.0018 (holdout 0.0037), direction cosine 0.994 (n=380519), value explained var nan, log_std set to -1.0
+[bc] dagger9 defender_2: n=3840000 policy mse 0.0018 -> 0.0014 (holdout 0.0024), direction cosine 0.994 (n=232165), value explained var nan, log_std set to -1.0
+[33m00:32:35 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[33m00:32:40 [rigid_object.py] WARNING: The function 'set_external_force_and_torque' will be deprecated in a future release. Please use 'permanent_wrench_composer.set_forces_and_torques' instead.[0m
+[bc] collected 384000 samples per agent driven by the student
+[bc] dagger10 defender_0: n=4224000 policy mse 0.0008 -> 0.0005 (holdout 0.0015), direction cosine 0.998 (n=422097), value explained var nan, log_std set to -1.0
+[bc] dagger10 defender_1: n=4224000 policy mse 0.0020 -> 0.0017 (holdout 0.0032), direction cosine 0.994 (n=418919), value explained var nan, log_std set to -1.0
+[bc] dagger10 defender_2: n=4224000 policy mse 0.0017 -> 0.0013 (holdout 0.0021), direction cosine 0.995 (n=270565), value explained var nan, log_std set to -1.0
+[bc] wrote outputs/exports/ram6_s2.pt
