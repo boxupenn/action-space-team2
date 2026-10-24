@@ -1,7 +1,7 @@
 [INFO][AppLauncher]: Using device: cuda:0
-[INFO][AppLauncher]: Loading experience file: /home/linyue/isaac/IsaacLab/apps/isaaclab.python.headless.kit
-Loading user config located at: '/home/linyue/isaac/env_isaaclab/lib/python3.11/site-packages/isaacsim/kit/data/Kit/Isaac-Sim/5.1/user.config.json'
-[Info] [carb] Logging to file: /home/linyue/isaac/env_isaaclab/lib/python3.11/site-packages/isaacsim/kit/logs/Kit/Isaac-Sim/5.1/kit_20261023_215642.log
+[INFO][AppLauncher]: Loading experience file: /home/<user>/isaac/IsaacLab/apps/isaaclab.python.headless.kit
+Loading user config located at: '/home/<user>/isaac/env_isaaclab/lib/python3.11/site-packages/isaacsim/kit/data/Kit/Isaac-Sim/5.1/user.config.json'
+[Info] [carb] Logging to file: /home/<user>/isaac/env_isaaclab/lib/python3.11/site-packages/isaacsim/kit/logs/Kit/Isaac-Sim/5.1/kit_20261023_215642.log
 2026-10-24T01:56:42Z [42ms] [Warning] [omni.usd_config.extension] Enable omni.materialx.libs extension to use MaterialX
 2026-10-24T01:56:42Z [169ms] [Warning] [omni.platforminfo.plugin] failed to open the default display.  Can't verify X Server version.
 2026-10-24T01:56:42Z [252ms] [Warning] [carb] Acquiring non optional plugin interface which is not listed as dependency: [omni::physx::IPhysxBenchmarks v1.0] (plugin: <default plugin>), by client: omni.physics.physx.plugin. Add it to CARB_PLUGIN_IMPL_DEPS() macro of a client.
@@ -69,7 +69,7 @@ P2P=Enabled Latency (P2P Writes) Matrix (us)
 2026-10-24T01:56:45Z [3,627ms] [Warning] [omni.physx.fabric.plugin] FabricManager::initializePointInstancer mismatched prototypes on point instancer: /Visuals/site.
 [INFO]: Time taken for simulation start : 0.276710 seconds
 [INFO]: Completed setting up the environment...
-[INFO]: Parsing configuration from: /home/linyue/Action_Space/simulation_infra/source/action_space_kit/action_space_kit/tasks/direct/tello_defend/agents/skrl_ippo_cfg.yaml
+[INFO]: Parsing configuration from: /home/<user>/Action_Space/simulation_infra/source/action_space_kit/action_space_kit/tasks/direct/tello_defend/agents/skrl_ippo_cfg.yaml
 [38;20m[skrl:INFO] Environment wrapper: Isaac Lab (multi-agent)[0m
 [33;20m[skrl:WARNING] The 'lambda' field in the configuration is deprecated. Use 'gae_lambda' instead[0m
 [33m21:56:45 [runner.py] WARNING: The 'lambda' field in the configuration is deprecated. Use 'gae_lambda' instead[0m
