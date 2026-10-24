@@ -322,3 +322,32 @@ def test_npz_net_matches_torchscript(tmp_path):
     for _ in range(20):
         o = rng.uniform(-3, 3, int(m.mean.numel())).astype(np.float32)
         assert np.allclose(run_net(net, o), run_net(m, o), atol=2e-4)
+
+
+def test_defend_publishes_pose_and_reads_mates_from_bus():
+    """defend/drone<N> carries the formation/ schema; a teammate without an in-process feed is read back from it."""
+    from policies.defend import DefendPolicy, sim_to_tag
+    from policies.telemetry import TelemetryBus
+
+    class D:
+        def __init__(self, num):
+            self.num, self.name, self.fly, self.landed, self.land_thread = num, f"drone{num}", False, False, None
+        def height_cm(self):
+            return 150
+        def status_age(self):
+            return 0.0
+        def on_ground(self):
+            return False
+        def log(self, m):
+            pass
+
+    pol = DefendPolicy.__new__(DefendPolicy)
+    pol.bus, pol.low_since, pol.idx = TelemetryBus(), {}, {4: 0, 5: 1}
+    p_sim = np.array([2.0, 0.2, 0.65])
+    pol.publish_pose(D(4), (p_sim, np.zeros(3), 180.0, 0.05), (1, 2, 3, 4))
+    data, age = pol.bus.latest("defend/drone4")
+    assert data["state"] == "DEFEND" and data["rc"] == [1, 2, 3, 4] and data["height_cm"] == 150
+    assert np.allclose(data["p"], sim_to_tag(p_sim), atol=1e-3) and data["psi_deg"] == 180.0
+    got = pol.mate_from_bus(4, 0.0)
+    assert got is not None and np.allclose(got[0], p_sim, atol=1e-3)
+    assert pol.mate_from_bus(5, 0.0) is None

@@ -727,6 +727,27 @@ class DefendPolicy(Policy):
     def describe(self, d):
         return f"defend{self.idx.get(d.num, '?')}"
 
+    def mate_from_bus(self, n, now, max_age=1.0):
+        """A teammate flown by another process running this policy: its defend/drone<N> topic
+        (same fields as formation/drone<N>) -> (p_sim, v, yaw, age) like a feed, or None."""
+        hit = self.bus.latest(f"defend/drone{n}", max_age=max_age) if self.bus is not None else None
+        if hit is None or hit[0].get("p") is None:
+            return None
+        data, age = hit
+        return tag_to_sim(data["p"]), np.zeros(3), data.get("psi_deg"), age
+
+    def publish_pose(self, d, est, rc):
+        """defend/drone<N> every tick, the formation/drone<N> schema (map frame p, psi_deg, fix_age,
+        height_cm, rc, state) so the organisers' tools and other policies see our defenders too."""
+        if self.bus is None:
+            return
+        state = ("SPENT" if grounded(d, time.time(), self.low_since) else "DEFEND") if est is not None else "NOFIX"
+        self.bus.publish(f"defend/{d.name}", {
+            "state": state, "height_cm": d.height_cm() if hasattr(d, "height_cm") else None, "rc": list(rc),
+            "p": None if est is None else [round(float(v), 3) for v in sim_to_tag(est[0])],
+            "psi_deg": None if est is None or est[2] is None else round(float(est[2]), 1),
+            "fix_age": None if est is None else round(float(est[3]), 3)})
+
     def preflight(self, d):
         """streamon, then wait for video and (flying) a tag fix: the drone must face a mapped tag."""
         feed = self.feeds[d.num]
@@ -757,6 +778,7 @@ class DefendPolicy(Policy):
         if est is None or est[3] > FIX_FRESH_S:
             age = est[3] if est else float("inf")
             self.last_fix_t.setdefault(d.num, now)
+            self.publish_pose(d, est, (0, 0, 0, 0))
             if now - self.last_fix_t[d.num] > NO_FIX_LAND_S:
                 d.log(f"no tag fix for {NO_FIX_LAND_S:.0f} s")
                 return None                      # land it
@@ -776,7 +798,9 @@ class DefendPolicy(Policy):
                 self.ready[d.num] = True
                 d.log(f"at launch height {h:.0f} cm -> policy")
             else:
-                return (0, 0, hold_height(d, heights[i]), face_yaw_rc(own_p, yaw, self.cfg["site"]))
+                rc = (0, 0, hold_height(d, heights[i]), face_yaw_rc(own_p, yaw, self.cfg["site"]))
+                self.publish_pose(d, est, rc)
+                return rc
         if self.cfg["fence_hi"][0] < own_p[0] or own_p[0] < -0.1:
             d.log(f"WARNING: fix behind the wall / past the fence (sim x {own_p[0]:.2f}); map frame mirrored?")
 
@@ -789,7 +813,7 @@ class DefendPolicy(Policy):
         for n, j in sorted(self.idx.items(), key=lambda kv: kv[1]):
             if n == d.num:
                 continue
-            o = self.feeds[n].est(now)
+            o = self.feeds[n].est(now) if n in self.feeds else self.mate_from_bus(n, now)
             if o is not None:
                 self.last_p[n] = o[0]
             dr = self.by_num[n]
@@ -821,6 +845,7 @@ class DefendPolicy(Policy):
         yaw_rc = face_yaw_rc(own_p, yaw, self.cfg["site"])
         rc = (a, b, c, yaw_rc)
         self.last_action[d.num] = (action, rc)
+        self.publish_pose(d, est, rc)
         if hasattr(feed, "apply"):
             feed.apply(action, yaw_rc, now)
         if not fly:
