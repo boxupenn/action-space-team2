@@ -64,6 +64,12 @@ class TelloDefendEnvCfg(DirectMARLEnvCfg):
 
     # - scripted attacker behaviour (curriculum stage 0 = straight dive)
     attacker_speed = [0.4, 0.9]  # [m/s]
+    # Staggered launches: attacker 0 enters at t=0, every further attacker after a delay sampled
+    # uniformly from this range (seconds). A pending attacker is parked at its spawn point, is not
+    # observable (alive flag 0) and cannot be captured or breach -- the arena case where the
+    # organisers launch one attacker first or one crashes early, leaving a single live attacker and
+    # two goalkeepers. [0, 0] = everyone at t=0 (the kit's original behaviour).
+    attacker_launch_delay = [0.0, 3.0]
     attacker_evasion = 0.0  # 0 = straight line, 1 = strong lateral weave
 
     # - reward scales (per defender)
@@ -95,6 +101,7 @@ class TelloDefendEnvCfg(DirectMARLEnvCfg):
     teacher_sep_vertical = 0.8  # share of the repulsion that goes vertical (lower index dives, higher climbs)
     teacher_cruise_bias = 0.0  # [m] altitude offset while cruising; 0.2 tested slightly worse (100% / 0.1%, 0.5% near-misses) -> off
     teacher_standby_up = 1.0  # [m] goalkeeper standby height above the site centre
+    teacher_standby_ring = 0.8  # [m] goalkeeper i holds at azimuth 2*pi*i/D on this ring around the site (two goalkeepers never share a point)
     # smart2 target assignment: "azimuth" = defender i takes the i-th attacker by azimuth around the
     # site (ignores where the defenders are); "time" = every defender computes, from its own
     # observation (own + teammates' positions), the assignment that minimises the summed lead-pursuit

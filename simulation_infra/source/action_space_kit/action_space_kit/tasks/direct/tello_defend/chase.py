@@ -5,6 +5,8 @@ Shared by ``scripts/evaluate.py`` (``--baseline chase``) and ``scripts/bc_warm_s
 (the behaviour-cloning teacher).
 """
 
+import math
+
 import torch
 
 
@@ -151,6 +153,7 @@ def smart2_actions(
     assign_mode = getattr(raw.cfg, "teacher_assign", "azimuth")
     cruise_bias = getattr(raw.cfg, "teacher_cruise_bias", 0.0)
     standby_up = getattr(raw.cfg, "teacher_standby_up", standby_up)
+    standby_ring = getattr(raw.cfg, "teacher_standby_ring", 0.0)
     site_z = raw.cfg.site_height * 0.5  # site centre height above the floor: own height = obs z + site_z
     actions = {}
     for i, a in enumerate(agents):
@@ -203,7 +206,9 @@ def smart2_actions(
         direction = aim / torch.clamp(aim.norm(dim=-1, keepdim=True), min=1e-6)
         direction = direction * alive.any(dim=-1, keepdim=True).float()
         # standby: P-control to the point standby_up above the site (own position relative to the site is obs[0:3])
-        hold = -(o[:, 0:3] - torch.tensor([0.0, 0.0, standby_up], device=dev)) * standby_gain
+        ring_angle = 2.0 * math.pi * i / len(agents)
+        standby_pt = torch.tensor([standby_ring * math.cos(ring_angle), standby_ring * math.sin(ring_angle), standby_up], device=dev)
+        hold = -(o[:, 0:3] - standby_pt) * standby_gain
         hold = hold.clamp(-1.0, 1.0)
         direction = torch.where(standby.unsqueeze(-1), hold, direction)
         direction = torch.where(yield_off.unsqueeze(-1), torch.zeros_like(direction), direction)

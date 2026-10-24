@@ -50,6 +50,10 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
         # attacker bookkeeping
         self._attacker_alive = torch.ones(self.num_envs, self.cfg.num_attackers, device=self.device, dtype=torch.bool)
         self._attacker_speed = torch.zeros(self.num_envs, self.cfg.num_attackers, device=self.device)
+        # staggered launches: pending attackers wait (invisible) at their spawn point until _launch_time
+        self._attacker_pending = torch.zeros(self.num_envs, self.cfg.num_attackers, device=self.device, dtype=torch.bool)
+        self._launch_time = torch.zeros(self.num_envs, self.cfg.num_attackers, device=self.device)
+        self._wave_start = torch.zeros(self.num_envs, device=self.device)  # episode time when the current wave was spawned
         self._breached = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         self._prev_distance = torch.zeros(self.num_envs, self.cfg.num_defenders, device=self.device)
         # defenders that already rammed an attacker this wave (ramming rule, cfg.defender_spent_on_capture)
@@ -236,7 +240,17 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
                 obs[a] = torch.cat([obs[a], onehot, goalkeeper.float().unsqueeze(-1)], dim=-1)
         return obs
 
+    def _launch_pending(self) -> None:
+        """Make pending attackers live once their launch delay has passed."""
+        if not self._attacker_pending.any():
+            return
+        t = (self.episode_length_buf.float() * self.step_dt).unsqueeze(-1) - self._wave_start.unsqueeze(-1)
+        launch = self._attacker_pending & (t >= self._launch_time)
+        self._attacker_alive |= launch
+        self._attacker_pending &= ~launch
+
     def _get_rewards(self) -> dict[str, torch.Tensor]:
+        self._launch_pending()
         attacker_pos, _ = self._attacker_states()
         site = self.scene.env_origins.clone()
         site[:, 2] += self.cfg.site_height * 0.5
@@ -270,7 +284,7 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
         self._breached = inside.any(dim=-1)
 
         # every attacker down this step: the outcome the task actually wants
-        cleared = captured.any(dim=-1) & ~self._attacker_alive.any(dim=-1)
+        cleared = captured.any(dim=-1) & ~(self._attacker_alive | self._attacker_pending).any(dim=-1)
         self._episode_captures += captured.float().sum(dim=-1)
 
         # the attacker each defender's shaping terms refer to: distance and unit direction to it
@@ -348,7 +362,7 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
 
     def _get_dones(self) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         time_out = self.episode_length_buf >= self.max_episode_length - 1
-        all_down = ~self._attacker_alive.any(dim=-1)
+        all_down = ~(self._attacker_alive | self._attacker_pending).any(dim=-1)
         if self.cfg.respawn_waves:
             # a cleared field starts the next wave; only a breach ends the episode
             if all_down.any():
@@ -386,10 +400,17 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
             drone.write_root_pose_to_sim(state[:, :7], env_ids)
             drone.write_root_velocity_to_sim(state[:, 7:], env_ids)
             self._attacker_ctl[i].reset(env_ids)
-        self._attacker_alive[env_ids] = True
         self._attacker_speed[env_ids] = sample_uniform(
             self.cfg.attacker_speed[0], self.cfg.attacker_speed[1], (num, self.cfg.num_attackers), self.device
         )
+        delay = sample_uniform(
+            self.cfg.attacker_launch_delay[0], self.cfg.attacker_launch_delay[1], (num, self.cfg.num_attackers), self.device
+        )
+        delay[:, 0] = 0.0  # the first attacker always enters at once
+        self._launch_time[env_ids] = delay
+        self._attacker_pending[env_ids] = delay > 0.0
+        self._attacker_alive[env_ids] = delay <= 0.0
+        self._wave_start[env_ids] = self.episode_length_buf[env_ids].float() * self.step_dt
         self._prev_distance[env_ids] = self.cfg.spawn_radius
         self._spent[env_ids] = False
 
@@ -435,11 +456,19 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
             drone.write_root_velocity_to_sim(state[:, 7:], env_ids)
             self._attacker_ctl[i].reset(env_ids)
 
-        self._attacker_alive[env_ids] = True
         self._attacker_speed[env_ids] = sample_uniform(
             self.cfg.attacker_speed[0], self.cfg.attacker_speed[1], (num, self.cfg.num_attackers), self.device
         )
+        delay = sample_uniform(
+            self.cfg.attacker_launch_delay[0], self.cfg.attacker_launch_delay[1], (num, self.cfg.num_attackers), self.device
+        )
+        delay[:, 0] = 0.0  # the first attacker always enters at once
+        self._launch_time[env_ids] = delay
+        self._attacker_pending[env_ids] = delay > 0.0
+        self._attacker_alive[env_ids] = delay <= 0.0
+        self._wave_start[env_ids] = self.episode_length_buf[env_ids].float() * self.step_dt
         self._breached[env_ids] = False
+        self._wave_start[env_ids] = 0.0
         self._episode_captures[env_ids] = 0.0
         self._episode_credit[env_ids] = 0.0
         self._episode_min_sep[env_ids] = float("inf")
