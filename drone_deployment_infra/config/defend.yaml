@@ -2,7 +2,7 @@
 # All positions are in the TAG-10 frame of config/map.yaml: x right along the wall (seen facing
 # the tag), y up, z out of the tag face into the room; metres.
 
-policy_dir: ../../simulation_infra/policies/defend_3v2_arena_s2        # relative to this file; override
+policy_dir: ../../simulation_infra/policies/defend_3v2_base_s2        # relative to this file; override
                                       # with swarm_policies.py --defend-dir / defend_offline.py --policy-dir
                                       # defender_0.pt -> first drone of --run defend:a,b,c, etc.
 site_xyz: [0.20, 0.0, 0.86]           # the BASE (user's figure 2026-10-24): a 13 cm box 0.86 m out of the tag-10 wall,

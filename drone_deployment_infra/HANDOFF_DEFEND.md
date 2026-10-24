@@ -12,7 +12,7 @@ localises our own drones from their cameras (any mapped tag of `config/map.yaml`
 | **ADD** | `swarm_ops/policies/defend.py` | the policy (obs builder, nets, bus attacker source, safety) |
 | **ADD** | `config/defend.yaml` | its settings: the base position, fence from your map, launch spots, `attackers: bus` |
 | **REPLACE** | `swarm_ops/policies/__init__.py` | yours + two lines: `from .defend import DefendPolicy` and `"defend": DefendPolicy` in `POLICIES` |
-| **ADD** | `../simulation_infra/policies/defend_3v2_arena_s2/` | `defender_0.pt`, `defender_1.pt`, `defender_2.pt` (TorchScript) and the same nets as `defender_<i>.npz` (numpy, used when `torch` is not installed), `README.md` with the sim numbers |
+| **ADD** | `../simulation_infra/policies/defend_3v2_base_s2/` | `defender_0.pt`, `defender_1.pt`, `defender_2.pt` (TorchScript) and the same nets as `defender_<i>.npz` (numpy, used when `torch` is not installed), `README.md` with the sim numbers |
 | optional | `swarm_ops/policies/base.py`, `policies/umbrella.py`, `swarm_ops/swarm_policies.py` | our copies add a `preflight(d)` hook (waits for a tag fix before FLY) and a `--defend-dir` flag. **Not required**: `defend.py` starts its video streams in `setup()` and works with your unmodified `swarm_policies.py`. |
 | optional | `swarm_ops/test_defend.py`, `swarm_ops/defend_offline.py` | tests (`python -m pytest test_defend.py -q`) and a no-drone kinematic demo |
 

@@ -142,7 +142,7 @@ battery < 15 % lands on its own; takeoff needs battery >= 40 %.
 
 ### 5.1 `defend`: the trained anti-drone policy on real Tellos
 
-`policies/defend.py` flies `simulation_infra/policies/defend_3v2_arena_s2/defender_{0,1,2}.pt` (3 defenders vs
+`policies/defend.py` flies `simulation_infra/policies/defend_3v2_base_s2/defender_{0,1,2}.pt` (3 defenders vs
 2 attackers, 34-dim obs, cloned 2026-10-24 for the arena rules: 15 x 15 x 3 cm hit box, ram from above, both drones
 out after a ram, attackers entering 2-3 m in front of tag 10 at rc <= 35 and holding on the 1.3 m arc; numbers in that
 folder's README). Settings: `../config/defend.yaml`; another version via `--defend-dir`.
