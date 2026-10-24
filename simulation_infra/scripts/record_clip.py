@@ -32,7 +32,9 @@ parser.add_argument("--set", nargs="*", default=[], metavar="FIELD=VALUE",
 parser.add_argument("--eye", type=float, nargs=3, default=(13.0, 13.0, 8.0), help="camera position")
 args, _ = parser.parse_known_args()
 
-import h5py  # noqa: E402, F401  Windows: load h5py's hdf5.dll before Kit's isaacsim.sensors.rtx loads an incompatible one
+if sys.platform == "win32":
+    import h5py  # noqa: E402, F401  Windows: load h5py's hdf5.dll before Kit's isaacsim.sensors.rtx loads an incompatible one
+    # (Linux: importing h5py here drags in the venv numpy before Kit's prebundled one -> 'numpy.dtype size changed')
 from isaaclab.app import AppLauncher  # noqa: E402
 
 # livestream mode is not optional here. In plain headless mode Isaac Lab sets
