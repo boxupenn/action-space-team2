@@ -92,7 +92,7 @@ class TelloDefendEnvCfg(DirectMARLEnvCfg):
     # teacher's go-home rule). takeoff_z 0 = everybody starts airborne at its height (the earlier behaviour).
     takeoff_z = 0.3  # [m]
     attacker_climb_speed = 0.5  # [m/s]
-    attacker_visible_z = 1.0  # [m]
+    attacker_visible_z = 0.5  # [m]  (runner attacker_min_height_cm 50)
     # Launch points relative to the site (metres, site frame): defenders one per index, attackers a list of
     # candidate points each attacker picks from at random (+-spawn_xy_jitter). Empty attacker list = random
     # ring at spawn_radius (the kit default). Fill both from the organisers' arena figure; the defender
@@ -190,7 +190,7 @@ class TelloDefendEnvCfg(DirectMARLEnvCfg):
     obs_assignment = OBS_ASSIGNMENT
     # Defenders start at index-specific heights (metres above the floor), as they will be placed and
     # launched on the real field; empty list = uniform 1-2 m (the kit's default).
-    defender_spawn_heights = [1.9, 2.05, 2.2]  # above the attackers (1.2-1.8 m) so the ram is a shallow descent; Tello tof cap 2.25 m
+    defender_spawn_heights = [1.45, 1.5, 1.55]  # the runner climbs to 1.5 m after take-off (user 2026-10-24); teacher 100% / 0% here vs 99.8% / 0.1% at 1.9-2.2 m
     """Launch a fresh wave when the field is cleared, instead of ending the episode.
 
     Ending on success truncates the value bootstrap, which makes a short successful
