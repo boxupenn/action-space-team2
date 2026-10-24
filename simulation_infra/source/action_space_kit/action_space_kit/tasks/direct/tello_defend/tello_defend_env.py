@@ -395,7 +395,11 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
             state = drone.data.default_root_state[env_ids].clone()
             state[:, 0] = origins[:, 0] + self.cfg.defender_radius * torch.cos(angle)
             state[:, 1] = origins[:, 1] + self.cfg.defender_radius * torch.sin(angle)
-            state[:, 2] = origins[:, 2] + sample_uniform(1.0, 2.0, (num,), self.device)
+            heights = self.cfg.defender_spawn_heights
+            if heights and i < len(heights):
+                state[:, 2] = origins[:, 2] + heights[i] + sample_uniform(-0.1, 0.1, (num,), self.device)
+            else:
+                state[:, 2] = origins[:, 2] + sample_uniform(1.0, 2.0, (num,), self.device)
             state[:, 7:] = 0.0
             drone.write_root_pose_to_sim(state[:, :7], env_ids)
             drone.write_root_velocity_to_sim(state[:, 7:], env_ids)

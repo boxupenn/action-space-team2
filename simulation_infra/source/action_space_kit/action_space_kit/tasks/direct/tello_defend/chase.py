@@ -97,6 +97,10 @@ def smart2_actions(
     rows = torch.arange(E, device=dev)
     sep_radius = getattr(raw.cfg, "teacher_sep_radius", sep_radius)
     sep_gain = getattr(raw.cfg, "teacher_sep_gain", sep_gain)
+    sep_vertical = getattr(raw.cfg, "teacher_sep_vertical", 0.0)
+    cruise_bias = getattr(raw.cfg, "teacher_cruise_bias", 0.0)
+    standby_up = getattr(raw.cfg, "teacher_standby_up", standby_up)
+    site_z = raw.cfg.site_height * 0.5  # site centre height above the floor: own height = obs z + site_z
     actions = {}
     for i, a in enumerate(agents):
         o = obs[a]
@@ -139,6 +143,9 @@ def smart2_actions(
         t = torch.where((disc >= 0) & (t_lead > 0), t_lead, t_pursuit)
         aim = r + v * t.unsqueeze(-1)
         aim[:, 2] += aim_up
+        if cruise_bias and i < 2:  # altitude layering while cruising: defender_0 low, defender_1 high; gone in the last metre
+            fade = ((r.norm(dim=-1) - 1.0) / 1.0).clamp(0.0, 1.0)
+            aim[:, 2] += (cruise_bias if i == 1 else -cruise_bias) * fade
         direction = aim / torch.clamp(aim.norm(dim=-1, keepdim=True), min=1e-6)
         direction = direction * alive.any(dim=-1, keepdim=True).float()
         # standby: P-control to the point standby_up above the site (own position relative to the site is obs[0:3])
@@ -146,9 +153,17 @@ def smart2_actions(
         hold = hold.clamp(-1.0, 1.0)
         direction = torch.where(standby.unsqueeze(-1), hold, direction)
         direction = torch.where(yield_off.unsqueeze(-1), torch.zeros_like(direction), direction)
-        if mates is not None:  # repulsion from close teammates
+        if mates is not None:  # repulsion from close teammates, mostly vertical: cheap to dodge, does not fight the pursuit
             d_m = mates.norm(dim=-1, keepdim=True).clamp(min=1e-3)
-            push = (-mates / d_m) * ((sep_radius - d_m).clamp(min=0.0) * sep_gain) * mates_active.unsqueeze(-1).float()
+            mag = (sep_radius - d_m).clamp(min=0.0) * sep_gain * mates_active.unsqueeze(-1).float()  # (E, D-1, 1)
+            away = -mates / d_m
+            mate_idx = torch.tensor([j for j in range(D) if j != i], device=dev)
+            vsign = torch.where(mate_idx > i, -1.0, 1.0).view(1, D - 1, 1).expand(E, D - 1, 1)  # lower index dives
+            too_low = (o[:, 2] + site_z) < 0.6  # never dive into the floor
+            vsign = torch.where(too_low.view(E, 1, 1), torch.ones_like(vsign), vsign)
+            vert = torch.cat([torch.zeros(E, D - 1, 2, device=dev), vsign], dim=-1)
+            horiz = torch.cat([away[..., :2], torch.zeros(E, D - 1, 1, device=dev)], dim=-1)
+            push = mag * (sep_vertical * vert + (1.0 - sep_vertical) * horiz)
             direction = (direction + push.sum(dim=1)).clamp(-1.0, 1.0)
         actions[a] = torch.cat([direction, torch.zeros(E, 1, device=dev)], dim=-1)
     return actions
