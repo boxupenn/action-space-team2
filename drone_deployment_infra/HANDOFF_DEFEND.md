@@ -137,7 +137,7 @@ With `--fly` each defender prints one line per second (`tee` it to a file for us
 | a defender turns but does not translate | fence or height limit active (see `fence:` / `height_cm`), or sep guard | check the log line's `rc` and the yaml |
 
 Simulation numbers for this version (`simulation_infra/policies/defend_3v2_base_s2/README.md`): over 1000 rounds
-in the figure's arena, both teams taking off from the floor, 15 x 15 x 3 cm hit box: teacher rule 99.8 %
-interception / 0.1 % breach, the cloned network 99.3 % / 1.2 %.
+in the figure's arena, both teams taking off from the floor to 1.5 m, 15 x 15 x 3 cm hit box: teacher rule 100 % / 0 %
+(300 rounds), the cloned network 99.7 % interception / 0.1 % breach (1000 rounds).
 
 Contact: Team 2 (Lucas / xieqiyi@seas.upenn.edu).
