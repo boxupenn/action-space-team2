@@ -36,7 +36,7 @@ from collections import deque
 
 import numpy as np
 
-from .base import Policy, clip
+from .base import Policy, clip, hold_height
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CFG_PATH = os.path.join(HERE, "..", "..", "config", "defend.yaml")
@@ -690,6 +690,7 @@ class DefendPolicy(Policy):
         self.last_p = {}                         # drone num -> last known sim position (teammate block)
         self.yielding = {}                       # drone num -> separation guard active
         self.low_since = {}                      # drone num -> since when its height reads "on the floor"
+        self.ready = {}                          # drone num -> reached its launch height (then the net flies it)
 
     def setup(self, drones):
         super().setup(drones)
@@ -765,11 +766,21 @@ class DefendPolicy(Policy):
             return (0, 0, 0, 0)
         own_p, own_v, yaw, _ = est
         self.last_fix_t[d.num] = now
+        # The umbrella's takeoff leaves the drone at ~1 m; the nets were cloned from the launch heights
+        # (above the attackers, ram from above). Climb there first, camera on the tags, then hand over.
+        heights = self.cfg.get("launch_height_cm") or []
+        i = self.idx[d.num]
+        if fly and not self.ready.get(d.num) and i < len(heights):
+            h = d.height_cm() if hasattr(d, "height_cm") else None
+            if h is not None and abs(h - heights[i]) <= 10:
+                self.ready[d.num] = True
+                d.log(f"at launch height {h:.0f} cm -> policy")
+            else:
+                return (0, 0, hold_height(d, heights[i]), face_yaw_rc(own_p, yaw, self.cfg["site"]))
         if self.cfg["fence_hi"][0] < own_p[0] or own_p[0] < -0.1:
             d.log(f"WARNING: fix behind the wall / past the fence (sim x {own_p[0]:.2f}); map frame mirrored?")
 
         self.last_p[d.num] = own_p
-        i = self.idx[d.num]
         # teammates, ascending defender index: (index, position, active). Position = latest fix, else last
         # known, else far away (clipped to 12 m). Inactive = landed / landing / status stream stopped / on the
         # floor for 1 s / no fix for MATE_INACTIVE_S (it is still in the air until it lands itself):

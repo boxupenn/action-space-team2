@@ -142,25 +142,27 @@ battery < 15 % lands on its own; takeoff needs battery >= 40 %.
 
 ### 5.1 `defend`: the trained anti-drone policy on real Tellos
 
-`policies/defend.py` flies `simulation_infra/policies/defend_3v2_ram9_s2/defender_{0,1,2}.pt`
-(3 defenders vs 2 attackers, 34-dim obs; sim: 100 % interception / 0 % breach with simultaneous and
-with staggered attacker launches; goalkeepers hold a 0.8 m ring around the site). Settings:
-`../config/defend.yaml`; another version via `--defend-dir`.
+`policies/defend.py` flies `simulation_infra/policies/defend_3v2_arena_s2/defender_{0,1,2}.pt` (3 defenders vs
+2 attackers, 34-dim obs, cloned 2026-10-24 for the arena rules: 15 x 15 x 3 cm hit box, ram from above, both drones
+out after a ram, attackers entering 2-3 m in front of tag 10 at rc <= 35 and holding on the 1.3 m arc; numbers in that
+folder's README). Settings: `../config/defend.yaml`; another version via `--defend-dir`.
 
+**Arena run (the organisers' umbrella, our policy on our 3 drones, their attackers on `formation`):**
 ```
-python connect.py 4 5 6
-python swarm_policies.py --run defend:4,5,6                 # dry-run: no takeoff, obs + rc every tick
-python swarm_policies.py --run defend:4,5,6 --fly --duration 40
-python swarm_policies.py --run defend:4,5,6 --defend-dir ../../simulation_infra/policies/defend_3v2_smart2_dagger4   # another version
-python defend_offline.py --seconds 14                        # no drones at all: kinematic demo (a defender
-                                                             # that rams is "spent" and drops out, as in the sim)
-python defend_offline.py --seconds 14 --stagger 3            # arena case: the 2nd attacker launches 3 s late
-python -m pytest test_defend.py -q                           # frame / rc / obs / policy checks
+python connect.py 4 5 6 7 9
+python swarm_policies.py --run defend:4,5,6 --run formation:7,9                       # dry-run first: fixes + rc every tick, nothing flies
+python swarm_policies.py --run defend:4,5,6 --run formation:7,9 --fly --duration 60
+python -m pytest test_defend.py -q                                                    # 23 checks: frames / rc / obs / assignment / bus / nets
 ```
-The first drone in `--run defend:a,b,c` is `defender_0`, the second `defender_1`, the third
-`defender_2` (the goalkeeper on the attacker nearest the site). Needs `torch` in the venv
-(the Isaac venv has it: `source ~/isaac/activate.sh`) and the localizer package:
-`pip install -e ../cal_and_map` (plus `pyyaml`, `av`, `pupil-apriltags`).
+Launch spots (tag frame x right, z out of the wall; altitude above the floor): `defender_0` (0.2, 2.0) at 1.9 m,
+`defender_1` (1.6, 1.6) at 2.05 m, `defender_2` (-0.4, 1.6) at 2.2 m, all **facing tag 10**; the policy flies back
+there when the field is cleared and `defender_2` (goalkeeper) waits there. Take off is the umbrella's (`takeoff` ->
+~1 m); the policy climbs to its height by itself (the nets command world-frame velocities; 1.0 = full stick).
+Needs on the laptop: `torch` for the `.pt` files **or nothing extra** (each `defender_i.npz` is the same net in numpy,
+used when torch is missing), the localizer package `pip install -e ../cal_and_map` (the one `map_tags.py`/`05_map.py`
+use), `av`, `pyyaml`, `pupil-apriltags`, and `config/camera/tello_<n>.yaml` for our drone numbers (falls back to
+`camera/default.yaml`). Works with the stock `swarm_policies.py`: video + `streamon` start in `setup()`; our copy of
+`swarm_policies.py` only adds a `preflight` hook that waits for a tag fix and the `--defend-dir` flag.
 
 **How it works, per drone and tick (13.5 Hz)**
 1. **Where am I**: the drone's own video (`streamon`, UDP 11111 bound to its adapter) ->

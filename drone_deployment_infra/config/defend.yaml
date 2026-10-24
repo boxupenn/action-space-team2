@@ -14,6 +14,8 @@ fence:                                # tag-frame box the defenders may not leav
   y: [-1.0, 1.0]                      # y is up: floor 1.25 m below tag 10; 1.0 above = 2.25 m altitude
   z: [0.4, 4.8]                       # floor tags reach z~5.2
 height_cm: [50, 225]                  # tof range: no more down below / up above these
+launch_height_cm: [190, 205, 220]     # after the umbrella's takeoff each defender climbs here (camera on the tags) before
+                                      # the net takes over: the sim launch heights, above the 1.2-1.7 m attackers
 # Launch spots (tag frame x, z; altitude): defender_0 (0.2, 2.0) 1.9 m, defender_1 (1.6, 1.6) 2.05 m,
 # defender_2 (-0.4, 1.6) 2.2 m -- the sim's defender_spawn_xy / heights; the policy flies back there when the
 # field is cleared and the goalkeeper waits there. Attackers start 2-3 m in front of tag 10 at 1.2-1.7 m.
