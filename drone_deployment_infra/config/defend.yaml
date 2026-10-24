@@ -5,20 +5,21 @@
 policy_dir: ../../simulation_infra/policies/defend_3v2_arena_s2        # relative to this file; override
                                       # with swarm_policies.py --defend-dir / defend_offline.py --policy-dir
                                       # defender_0.pt -> first drone of --run defend:a,b,c, etc.
-site_xyz: [0.0, 0.0, 0.0]             # the protected point = tag 10 itself (sim: site centre 1.25 m up at the wall;
-                                      # the attackers' 1.3 m arc is the breach line)
+site_xyz: [0.20, 0.0, 0.86]           # the BASE (user's figure 2026-10-24): a 13 cm box 0.86 m out of the tag-10 wall,
+                                      # 0.94 m from the left long wall (tag x = -0.74 + 0.94); sim site centre is 1.25 m up.
+                                      # An attacker past the base line 1.30 m from the wall (towards it) wins.
 speed_cap: 1.0                        # fraction of full rc on a/b/c: the arena nets were cloned with 1.0 = full stick
                                       # (~2 m/s, sim max_lin_speed 2.0); lowering it changes the geometry (re-clone)
 fence:                                # tag-frame box the defenders may not leave (rc outward = 0)
-  x: [-0.8, 2.6]                      # map.yaml 2026-10-24: right wall at x~2.8 (tag 8), left mapped to -0.5
+  x: [-0.64, 2.66]                    # 3.5 m wall: tag x -0.74 (left long wall) .. 2.76 (right long wall, tag 8)
   y: [-1.0, 1.0]                      # y is up: floor 1.25 m below tag 10; 1.0 above = 2.25 m altitude
-  z: [0.4, 4.8]                       # floor tags reach z~5.2
+  z: [0.3, 6.3]                       # the room is 6.6 m deep
 height_cm: [50, 225]                  # tof range: no more down below / up above these
 launch_height_cm: [190, 205, 220]     # after the umbrella's takeoff each defender climbs here (camera on the tags) before
                                       # the net takes over: the sim launch heights, above the 1.2-1.7 m attackers
-# Launch spots (tag frame x, z; altitude): defender_0 (0.2, 2.0) 1.9 m, defender_1 (1.6, 1.6) 2.05 m,
-# defender_2 (-0.4, 1.6) 2.2 m -- the sim's defender_spawn_xy / heights; the policy flies back there when the
-# field is cleared and the goalkeeper waits there. Attackers start 2-3 m in front of tag 10 at 1.2-1.7 m.
+# Launch spots = the three crosses of the arena figure (tag frame x, z; altitude): defender_0 (1.0, 1.37) 1.9 m,
+# defender_1 (1.52, 0.50) 2.05 m, defender_2 (0.33, 0.99) 2.2 m, next to the base (goalkeeper when idle). The sim's
+# defender_spawn_xy / heights. Attackers take off at the far end of the room (4.4-6.3 m from the wall).
 alert_radius: 2.2                     # goalkeeper dispatch (sim teacher_alert_radius): attacker nearer the site than this ...
 cover_m: 1.2                          # ... and no active teammate within this of it (sim teacher_cover_m); arena nets need both
 alert_force: 1.7                      # ... or, inside this of the site, regardless of cover (sim teacher_alert_force)

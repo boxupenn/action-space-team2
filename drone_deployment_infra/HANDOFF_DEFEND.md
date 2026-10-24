@@ -10,7 +10,7 @@ localises our own drones from their cameras (any mapped tag of `config/map.yaml`
 | Action | Path | What |
 |---|---|---|
 | **ADD** | `swarm_ops/policies/defend.py` | the policy (obs builder, nets, bus attacker source, safety) |
-| **ADD** | `config/defend.yaml` | its settings: site = tag 10, fence from your map, launch spots, `attackers: bus` |
+| **ADD** | `config/defend.yaml` | its settings: the base position, fence from your map, launch spots, `attackers: bus` |
 | **REPLACE** | `swarm_ops/policies/__init__.py` | yours + two lines: `from .defend import DefendPolicy` and `"defend": DefendPolicy` in `POLICIES` |
 | **ADD** | `../simulation_infra/policies/defend_3v2_arena_s2/` | `defender_0.pt`, `defender_1.pt`, `defender_2.pt` (TorchScript) and the same nets as `defender_<i>.npz` (numpy, used when `torch` is not installed), `README.md` with the sim numbers |
 | optional | `swarm_ops/policies/base.py`, `policies/umbrella.py`, `swarm_ops/swarm_policies.py` | our copies add a `preflight(d)` hook (waits for a tag fix before FLY) and a `--defend-dir` flag. **Not required**: `defend.py` starts its video streams in `setup()` and works with your unmodified `swarm_policies.py`. |
@@ -52,7 +52,7 @@ python swarm_policies.py --run defend:4,5,6 --run formation:7,9 --fly --duration
 
 3 defenders vs 2 attackers. Each defender rams the attacker it is assigned to (assignment computed
 on every drone from the same numbers, no communication); the third waits at its launch spot and is
-dispatched when an attacker gets within 2.2 m of tag 10 with nobody about to ram it. A defender
+dispatched when an attacker gets within 3 m of the base with nobody about to ram it. A defender
 that rammed is out; attackers that stopped publishing / landed count as down. Defenders keep 0.6 m
 from each other (the higher-index one holds), stay inside the fence box of `defend.yaml` and
 between 50 and 225 cm height. Full description: `swarm_ops/README.md`, section 5.1.

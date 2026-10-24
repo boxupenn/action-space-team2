@@ -58,10 +58,16 @@ class TelloDefendEnvCfg(DirectMARLEnvCfg):
     # - scenario geometry
     num_defenders = NUM_DEFENDERS
     num_attackers = NUM_ATTACKERS
-    site_radius = 1.3  # [m] protected perimeter: the organisers' attackers hold on a 1.3 m arc in front of tag 10 (swarm_formation.py)
+    site_radius = 1.3  # [m] protected perimeter (cylinder rule; unused while breach_x > 0, still drawn as the site square)
+    # ARENA (user's figure 2026-10-24): room 6.6 x 3.5 m, tag-10 wall = the short wall; the BASE is a 13 cm box
+    # 0.86 m out of that wall and 0.94 m from the long wall on the viewer's left (tag x = -0.74 + 0.94). An
+    # attacker that crosses the line 1.05 m from the tag-10 wall (towards it) wins: breach = attacker sim x < breach_x.
+    # Sim frame = (tag z out of the wall, tag x right, up); site_xy is the base relative to the env origin.
+    site_xy = [0.86, 0.20]  # [m]
+    breach_x = 1.30  # [m] the base line, 1.3 m from the tag-10 wall (user 2026-10-24); 0 = the cylinder rule (site_radius) instead
     site_height = 2.5  # [m] height of the protected cylinder
-    spawn_radius = 4.0  # [m] where attackers take off: the far side of the room (user 2026-10-24: 3-5 m from the tag-10 wall, not 2-3 m)
-    spawn_radius_jitter = 0.8  # [m]  (3.2-4.8 m; the room box ends at x 4.8)
+    spawn_radius = 4.7  # [m] from the base: attackers take off in the far (left) half of the 6.6 m room, 4.6-6.3 m from the wall
+    spawn_radius_jitter = 0.9  # [m]
     attacker_spawn_sector_deg = 60.0  # attackers enter within +-this azimuth of +x (the room side of the tag wall); 180 = full ring
     attacker_spawn_z = [1.2, 1.8]  # [m] above the floor (formation flies at ~1.2-1.7 m)
     defender_radius = 2.5  # [m] where defenders start, around the site
@@ -93,12 +99,14 @@ class TelloDefendEnvCfg(DirectMARLEnvCfg):
     # points are also where the teacher / clone flies back to once the field is cleared.
     # From the organisers' map.yaml (2026-10-24): tag-10 wall at z=0, floor 1.25 m below tag 10, right wall at
     # x~2.8 m, floor tags out to z~5 m, left side mapped only to x~-0.5. Sim frame = (tag z, tag x, up).
-    defender_spawn_xy = [[2.0, 0.2], [1.6, 1.6], [1.6, -0.4]]  # tag frame (x, z): (0.2, 2.0), (1.6, 1.6), (-0.4, 1.6)
+    # Launch spots = the three crosses of the figure (tag frame x, z): 1.37 m out / mid-room, 0.99 m out next to the
+    # base, 0.50 m out behind the line. defender_2 (goalkeeper role when idle) is the one by the base.
+    defender_spawn_xy = [[1.37, 1.0], [0.50, 1.52], [0.99, 0.33]]
     attacker_spawn_xy = []
     # Room box from map.yaml, sim frame [x out of the wall, y right, z above the floor]: attackers only
     # spawn inside it and the teacher never commands a velocity through its faces (the runner's fence does
     # the same on the real drone). [] = no box.
-    arena_bounds = [[0.4, 4.8], [-0.8, 2.6], [0.5, 2.25]]
+    arena_bounds = [[0.3, 6.3], [-0.64, 2.66], [0.5, 2.25]]  # 6.6 x 3.5 m room; tag x -0.74 (left wall) .. 2.76 (right wall, tag 8)
     spawn_xy_jitter = 0.2  # [m]
     # Seconds between a cleared field and the next wave's first launch (respawn_waves only): the
     # defenders fly home in the gap, so the clone learns the return.
@@ -152,12 +160,12 @@ class TelloDefendEnvCfg(DirectMARLEnvCfg):
     # rank i when the whole wave is visible or when it holds no target; the target is then kept until that
     # attacker is down (a teammate's ram does not re-shuffle a pursuit in progress); unassigned = goalkeeper.
     # Goalkeepers engage once a live attacker is within teacher_alert_radius of the site.
-    teacher_alert_radius = 2.2  # [m]  goalkeepers engage inside this (spawn 2.5, arc 1.3)
+    teacher_alert_radius = 2.2  # [m]  goalkeepers engage inside this of the base (figure arena, 300 ep: 99.8% / 0.3%, 1.3% near-misses; 3.0 m: 100% / 0% but 4.3%)
     # ... AND only while no active teammate is within teacher_cover_m of that attacker (someone is about to
     # ram it): otherwise two defenders crowd one attacker, repel each other and both miss the 3 cm box.
     # The dispatch is part of the assignment feature (chase.assignment_from_obs). None = old rule.
-    teacher_cover_m = 1.2  # [m]  (0.8 and 1.2 both 99.7% / 0.7%; 1.2 had 0 near-misses)
-    teacher_alert_force = 1.7  # [m] inside this the goalkeeper goes regardless of cover (the arc is at 1.3 m); 0 = off
+    teacher_cover_m = 1.2  # [m]
+    teacher_alert_force = 1.7  # [m] inside this the goalkeeper goes regardless of cover (the base line is 1.3 m out); 0 = off
     teacher_aim_up = 0.02  # [m] aim offset above the attacker: inside the 3 cm box, but from above (props vs frame)
     # Ram from above (2026-10-24, 15x15x3 cm box): while below the lead-pursuit aim point the defender climbs
     # at least teacher_climb_slope x horizontal distance (1 = 45 deg), so it gets above early and the
@@ -165,6 +173,10 @@ class TelloDefendEnvCfg(DirectMARLEnvCfg):
     # (Tried and rejected: a vertical P-loop lags a descending attacker, 72-83%; an aim point that slides
     # down over the last 2 m lags the 0.25 s response, 39-50%. The last metre must be a straight line.)
     teacher_climb_slope = 0.0
+    # Terminal slow-down: within teacher_terminal_dist of the aim point the stick is scaled to
+    # teacher_terminal_speed (full speed passes straight through the 3 cm box; the attackers are slow). 0 = off.
+    teacher_terminal_dist = 0.0  # [m]  (0.5 x inside 1 m: 99.7% / 0.7% and 5.7% near-misses -> off)
+    teacher_terminal_speed = 0.5
     # Optional creep (20% speed) within teacher_align_dist while still > teacher_align_tol below the
     # attacker; 0 = off (a 0.9 m/s attacker flies past a creeping defender).
     teacher_align_dist = 0.0  # [m]

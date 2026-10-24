@@ -121,7 +121,7 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
         light_cfg.func("/World/Light", light_cfg)
 
         marker_cfg = CUBOID_MARKER_CFG.copy()
-        marker_cfg.markers["cuboid"].size = (self.cfg.site_radius, self.cfg.site_radius, 0.05)
+        marker_cfg.markers["cuboid"].size = (0.26, 0.26, 0.13) if self.cfg.breach_x > 0.0 else (self.cfg.site_radius, self.cfg.site_radius, 0.05)
         marker_cfg.prim_path = "/Visuals/site"
         self._site_markers = VisualizationMarkers(marker_cfg)
         self._team_markers = None  # built on the first debug-vis callback (video clips): teams, arc, launch spots, room
@@ -145,13 +145,22 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
         self._team_markers = VisualizationMarkers(cfg)
         names = list(cfg.markers)
         pts, idx = [], []  # static markers in the env-local frame
-        for k in range(48):  # the breach cylinder: a ring on the floor, one at its top, posts between them
-            a = 2.0 * math.pi * k / 48
-            for z in (0.01, self.cfg.site_height):
-                pts.append([self.cfg.site_radius * math.cos(a), self.cfg.site_radius * math.sin(a), z]); idx.append(names.index("arc"))
-        for k in range(8):
-            a = 2.0 * math.pi * k / 8
-            pts.append([self.cfg.site_radius * math.cos(a), self.cfg.site_radius * math.sin(a), self.cfg.site_height / 2]); idx.append(names.index("post"))
+        if self.cfg.breach_x > 0.0:  # the arena line across the room: dots on the floor and at the top, posts between
+            n_dots = 40
+            for k in range(n_dots + 1):
+                y = b[1][0] + ly * k / n_dots
+                for z in (0.01, self.cfg.site_height):
+                    pts.append([self.cfg.breach_x, y, z]); idx.append(names.index("arc"))
+            for k in range(8):
+                pts.append([self.cfg.breach_x, b[1][0] + ly * k / 7, self.cfg.site_height / 2]); idx.append(names.index("post"))
+        else:  # the cylinder rule: a ring on the floor, one at its top, posts between them
+            for k in range(48):
+                a = 2.0 * math.pi * k / 48
+                for z in (0.01, self.cfg.site_height):
+                    pts.append([self.cfg.site_radius * math.cos(a), self.cfg.site_radius * math.sin(a), z]); idx.append(names.index("arc"))
+            for k in range(8):
+                a = 2.0 * math.pi * k / 8
+                pts.append([self.cfg.site_radius * math.cos(a), self.cfg.site_radius * math.sin(a), self.cfg.site_height / 2]); idx.append(names.index("post"))
         for xy in self.cfg.defender_spawn_xy:
             pts.append([xy[0], xy[1], 0.01]); idx.append(names.index("launch"))
         cx, cy = (b[0][0] + b[0][1]) / 2, (b[1][0] + b[1][1]) / 2
@@ -207,8 +216,7 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
         """Fly each attacker at the protected site, with optional lateral weaving."""
         actions = []
         for i, drone in enumerate(self._attackers):
-            to_site = self.scene.env_origins - drone.data.root_pos_w
-            to_site[:, 2] += self.cfg.site_height * 0.5
+            to_site = self._site_w() - drone.data.root_pos_w
             direction = to_site / torch.clamp(torch.linalg.norm(to_site, dim=-1, keepdim=True), min=1e-6)
             if self.cfg.attacker_evasion > 0.0:
                 phase = self.episode_length_buf.float() * self.step_dt * 2.0 + i
@@ -231,6 +239,14 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
 
     # -- MDP --------------------------------------------------------------------
 
+    def _site_w(self) -> torch.Tensor:
+        """The protected point (the base) in world coordinates, (E, 3): env origin + cfg.site_xy, site_height/2 up."""
+        site = self.scene.env_origins.clone()
+        site[:, 0] += self.cfg.site_xy[0]
+        site[:, 1] += self.cfg.site_xy[1]
+        site[:, 2] += self.cfg.site_height * 0.5
+        return site
+
     def _downed(self, i: int) -> torch.Tensor:
         """Attacker i was captured (not alive and not waiting to launch)."""
         return ~self._attacker_alive[:, i] & ~self._attacker_pending[:, i]
@@ -243,8 +259,7 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
 
     def _get_observations(self) -> dict[str, torch.Tensor]:
         attacker_pos, attacker_vel = self._attacker_states()
-        site = self.scene.env_origins.clone()
-        site[:, 2] += self.cfg.site_height * 0.5
+        site = self._site_w()
 
         obs = {}
         defender_pos = torch.stack([d.data.root_pos_w for d in self._defenders], dim=1)  # (envs, D, 3)
@@ -314,8 +329,7 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
     def _get_rewards(self) -> dict[str, torch.Tensor]:
         self._launch_pending()
         attacker_pos, _ = self._attacker_states()
-        site = self.scene.env_origins.clone()
-        site[:, 2] += self.cfg.site_height * 0.5
+        site = self._site_w()
 
         # interceptions: any live attacker within capture radius of any defender
         captured = torch.zeros_like(self._attacker_alive)
@@ -346,7 +360,10 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
 
         # breach: a live attacker inside the protected cylinder
         radial = torch.linalg.norm(attacker_pos[:, :, :2] - site[:, :2].unsqueeze(1), dim=-1)
-        inside = (radial < self.cfg.site_radius) & self._attacker_alive
+        if self.cfg.breach_x > 0.0:  # the arena line: past it towards the tag-10 wall = lost
+            inside = (attacker_pos[:, :, 0] - self.scene.env_origins[:, 0:1] < self.cfg.breach_x) & self._attacker_alive
+        else:
+            inside = (radial < self.cfg.site_radius) & self._attacker_alive
         self._breached = inside.any(dim=-1)
 
         # every attacker down this step: the outcome the task actually wants
@@ -490,13 +507,15 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
                 angle = sample_uniform(-half, half, (num,), self.device)
                 radius = self.cfg.spawn_radius + sample_uniform(-self.cfg.spawn_radius_jitter, self.cfg.spawn_radius_jitter, (num,), self.device)
                 xy = radius.unsqueeze(-1) * torch.stack([torch.cos(angle), torch.sin(angle)], dim=-1)
+                xy = xy + torch.tensor(self.cfg.site_xy, device=self.device)
             if self.cfg.arena_bounds:
                 b = torch.tensor(self.cfg.arena_bounds[:2], device=self.device)
                 xy = torch.maximum(torch.minimum(xy, b[:, 1]), b[:, 0])
                 # clamping must not move a launch point inside the perimeter: keep y, push x out to the ring
                 r_min = self.cfg.spawn_radius - self.cfg.spawn_radius_jitter
-                short = xy.norm(dim=-1) < r_min
-                x_out = torch.sqrt((r_min**2 - xy[:, 1] ** 2).clamp(min=0.0)).clamp(min=b[0, 0], max=b[0, 1])
+                base = torch.tensor(self.cfg.site_xy, device=self.device)
+                short = (xy - base).norm(dim=-1) < r_min
+                x_out = (base[0] + torch.sqrt((r_min**2 - (xy[:, 1] - base[1]) ** 2).clamp(min=0.0))).clamp(min=b[0, 0], max=b[0, 1])
                 xy = torch.where(short.unsqueeze(-1), torch.stack([x_out, xy[:, 1]], dim=-1), xy)
             self._spawn_angle[env_ids, i] = angle
             state[:, :2] = origins[:, :2] + xy
@@ -580,7 +599,8 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
     def draw_markers(self):
         """Site, teams (attackers red, defenders blue, down grey), arc, launch spots and room; called per
         captured frame by scripts/record_clip.py (the env has no _set_debug_vis_impl, so no Kit callback)."""
-        site = self.scene.env_origins.clone()
+        site = self._site_w()
+        site[:, 2] = self.scene.env_origins[:, 2]  # the base box sits on the floor
         self._site_markers.visualize(site)
         if self._team_markers is None:
             self._build_team_markers()

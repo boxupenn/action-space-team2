@@ -205,6 +205,8 @@ def smart2_actions(
     obs_teammates = getattr(raw.cfg, "obs_teammates", True)
     aim_up = getattr(raw.cfg, "teacher_aim_up", aim_up)
     climb_slope = getattr(raw.cfg, "teacher_climb_slope", 0.0)
+    term_dist = getattr(raw.cfg, "teacher_terminal_dist", 0.0)
+    term_speed = getattr(raw.cfg, "teacher_terminal_speed", 1.0)
     bounds = getattr(raw.cfg, "arena_bounds", [])
     align_dist = getattr(raw.cfg, "teacher_align_dist", 0.0)
     align_tol = getattr(raw.cfg, "teacher_align_tol", 0.05)
@@ -277,6 +279,11 @@ def smart2_actions(
             z = torch.where(aim[:, 2] > 0.0, torch.maximum(aim[:, 2], climb_slope * hd), aim[:, 2])
             aim = torch.cat([aim[:, :2], z.unsqueeze(-1)], dim=-1)
         direction = aim / torch.clamp(aim.norm(dim=-1, keepdim=True), min=1e-6)
+        if term_dist > 0.0:
+            # terminal slow-down: inside term_dist of the aim point fly at term_speed x full stick, so the 0.25 s
+            # response has time to settle the height into the 3 cm box (full speed passes straight through)
+            near = (aim.norm(dim=-1) < term_dist).unsqueeze(-1)
+            direction = torch.where(near, direction * term_speed, direction)
         if align_dist > 0.0:
             # optional: creep (20%) while still more than align_tol below the attacker inside align_dist
             below = (aim[:, 2] - aim_up) > align_tol
