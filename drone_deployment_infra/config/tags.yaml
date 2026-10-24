@@ -16,6 +16,7 @@ sizes_mm:
   8: 132.08
   9: 132.08
   10: 571.5
+  11: 132.08       # same print as 1-9
 
 detector:               # pupil-apriltags options
   quad_decimate: 2.0    # 2 = faster on 960x720; edges are refined back to full resolution
