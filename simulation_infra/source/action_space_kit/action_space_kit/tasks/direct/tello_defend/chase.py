@@ -74,7 +74,8 @@ def smart_actions(raw, obs: dict[str, torch.Tensor], v_max: float = 1.0) -> dict
 
 def smart2_actions(
     raw, obs: dict[str, torch.Tensor], v_max: float = 1.0, alert_frac: float = 0.6, aim_up: float = 0.15,
-    standby_up: float = 0.5, standby_gain: float = 1.5,
+    standby_up: float = 0.5, standby_gain: float = 1.5, sep_radius: float = 0.8, sep_gain: float = 1.5,
+    yield_margin: float = 0.3,
 ) -> dict[str, torch.Tensor]:
     """Like ``smart_actions`` but the assignment uses only what ONE defender observes, so a
     per-agent policy can clone it: attackers are ranked by their azimuth around the protected
@@ -85,7 +86,11 @@ def smart2_actions(
     ``standby_up`` above the site and only engage (the attacker nearest the site) once some live
     attacker is within ``alert_frac`` x spawn_radius of the site -- the "send another drone when an
     interception fails" rule. Lead pursuit as in ``smart_actions``, aiming ``aim_up`` metres above
-    the attacker: a ram from above hits the props and stays out of its downwash."""
+    the attacker: a ram from above hits the props and stays out of its downwash.
+    De-confliction (teammate positions are the last 3*(D-1) obs entries): a repulsion of
+    ``sep_gain`` x (sep_radius - d) away from any teammate closer than ``sep_radius``; and when a
+    single attacker is left, only the defender nearest to it (by ``yield_margin``) goes in, the
+    others hold off so two drones never converge on the same target."""
     n, E, dev = raw.cfg.num_attackers, raw.num_envs, raw.device
     agents = raw.cfg.possible_agents
     rows = torch.arange(E, device=dev)
@@ -109,6 +114,14 @@ def smart2_actions(
         target = torch.where(goalkeeper, site_dist.argmin(dim=-1), target)
         alert = site_dist.min(dim=-1).values < alert_frac * raw.cfg.spawn_radius
         standby = goalkeeper & ~alert
+        D = len(agents)
+        mates = o[:, 9 + 7 * n : 9 + 7 * n + 3 * (D - 1)].reshape(E, D - 1, 3) if D > 1 else None
+        # one attacker left: only the closest defender rams it, the rest hold off
+        yield_off = torch.zeros(E, dtype=torch.bool, device=dev)
+        if mates is not None:
+            r_t = rel[rows, target]  # (E, 3) target relative to me
+            mate_to_target = (r_t.unsqueeze(1) - mates).norm(dim=-1)  # (E, D-1)
+            yield_off = (n_alive <= 1) & ((mate_to_target.min(dim=-1).values + yield_margin) < r_t.norm(dim=-1))
         r = rel[rows, target]
         v = va[rows, target]
         qa = (v * v).sum(-1) - v_max**2
@@ -126,6 +139,11 @@ def smart2_actions(
         hold = -(o[:, 0:3] - torch.tensor([0.0, 0.0, standby_up], device=dev)) * standby_gain
         hold = hold.clamp(-1.0, 1.0)
         direction = torch.where(standby.unsqueeze(-1), hold, direction)
+        direction = torch.where(yield_off.unsqueeze(-1), torch.zeros_like(direction), direction)
+        if mates is not None:  # repulsion from close teammates
+            d_m = mates.norm(dim=-1, keepdim=True).clamp(min=1e-3)
+            push = (-mates / d_m) * ((sep_radius - d_m).clamp(min=0.0) * sep_gain)
+            direction = (direction + push.sum(dim=1)).clamp(-1.0, 1.0)
         actions[a] = torch.cat([direction, torch.zeros(E, 1, device=dev)], dim=-1)
     return actions
 

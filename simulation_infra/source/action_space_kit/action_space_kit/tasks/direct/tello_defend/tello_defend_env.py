@@ -54,6 +54,7 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
         # defenders that already rammed an attacker this wave (ramming rule, cfg.defender_spent_on_capture)
         self._spent = torch.zeros(self.num_envs, self.cfg.num_defenders, device=self.device, dtype=torch.bool)
         self._episode_credit = torch.zeros(self.num_envs, self.cfg.num_defenders, device=self.device)
+        self._episode_min_sep = torch.full((self.num_envs,), float("inf"), device=self.device)
         if self.cfg.closing_mode not in ("distance", "own_motion"):
             raise ValueError(f"closing_mode must be 'distance' or 'own_motion', got {self.cfg.closing_mode!r}")
         if self.cfg.target_mode not in ("nearest", "assigned"):
@@ -71,6 +72,7 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
         self.outcome_breached = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         self.outcome_captures = torch.zeros(self.num_envs, device=self.device)
         self.outcome_credit = torch.zeros(self.num_envs, self.cfg.num_defenders, device=self.device)  # captures per defender
+        self.outcome_min_sep = torch.full((self.num_envs,), float("inf"), device=self.device)  # min defender-defender distance
         self.outcome_valid = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
 
     # -- scene ------------------------------------------------------------------
@@ -180,8 +182,11 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
         site[:, 2] += self.cfg.site_height * 0.5
 
         obs = {}
+        defender_pos = torch.stack([d.data.root_pos_w for d in self._defenders], dim=1)  # (envs, D, 3)
         for i, drone in enumerate(self._defenders):
             own_rel_site = drone.data.root_pos_w - site
+            mates = torch.cat([defender_pos[:, j] - drone.data.root_pos_w for j in range(self.cfg.num_defenders) if j != i], dim=-1)
+            mates = mates.clamp(-self.cfg.obs_clip_pos, self.cfg.obs_clip_pos)
             rel_pos = attacker_pos - drone.data.root_pos_w.unsqueeze(1)
             rel_vel = attacker_vel - drone.data.root_lin_vel_w.unsqueeze(1)
             # A downed attacker is zeroed out and flagged, not pushed to a huge sentinel
@@ -198,6 +203,7 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
                     rel_pos.reshape(self.num_envs, -1),
                     rel_vel.reshape(self.num_envs, -1),
                     alive.squeeze(-1),
+                    mates,  # teammates' positions relative to me, so the policy can keep clear of them
                 ],
                 dim=-1,
             )
@@ -222,6 +228,11 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
         if self.cfg.defender_spent_on_capture:
             self._spent |= defender_credit > 0
         self._episode_credit += defender_credit
+        if self.cfg.num_defenders > 1:
+            dpos = torch.stack([d.data.root_pos_w for d in self._defenders], dim=1)
+            pair = torch.cdist(dpos, dpos)  # (envs, D, D)
+            pair = pair + torch.eye(self.cfg.num_defenders, device=self.device) * 1.0e3
+            self._episode_min_sep = torch.minimum(self._episode_min_sep, pair.flatten(1).min(dim=-1).values)
 
         # breach: a live attacker inside the protected cylinder
         radial = torch.linalg.norm(attacker_pos[:, :, :2] - site[:, :2].unsqueeze(1), dim=-1)
@@ -320,6 +331,7 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
         self.outcome_breached = torch.where(finished, self._breached, self.outcome_breached)
         self.outcome_captures = torch.where(finished, self._episode_captures, self.outcome_captures)
         self.outcome_credit = torch.where(finished.unsqueeze(-1), self._episode_credit, self.outcome_credit)
+        self.outcome_min_sep = torch.where(finished, self._episode_min_sep, self.outcome_min_sep)
         terminated = {agent: done for agent in self.cfg.possible_agents}
         time_outs = {agent: time_out for agent in self.cfg.possible_agents}
         return terminated, time_outs
@@ -385,6 +397,7 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
         self._breached[env_ids] = False
         self._episode_captures[env_ids] = 0.0
         self._episode_credit[env_ids] = 0.0
+        self._episode_min_sep[env_ids] = float("inf")
         self._spent[env_ids] = False
         for agent in self.cfg.possible_agents:
             self._actions[agent][env_ids] = 0.0

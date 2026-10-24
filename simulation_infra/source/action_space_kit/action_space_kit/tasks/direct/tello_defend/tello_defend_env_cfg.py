@@ -16,7 +16,7 @@ NUM_ATTACKERS = 2
 
 # obs per defender: own pos rel. site (3) + own vel (3) + gravity (3)
 #                 + per attacker (rel pos 3, rel vel 3, visible flag 1)
-_OBS_DIM = 9 + 7 * NUM_ATTACKERS
+_OBS_DIM = 9 + 7 * NUM_ATTACKERS + 3 * (NUM_DEFENDERS - 1)  # + teammates' relative positions (2026-10-23)
 
 
 @configclass
@@ -78,6 +78,9 @@ class TelloDefendEnvCfg(DirectMARLEnvCfg):
     # defender that makes it is out too. True: that defender's commands are zeroed for the rest
     # of the wave and it cannot capture again (reset on a new wave / episode).
     defender_spent_on_capture = True
+    # Defender-defender separation: the per-episode minimum pairwise distance is latched in
+    # outcome_min_sep; a minimum below this counts as a defender collision in evaluate.py.
+    defender_collision_radius = 0.3
     """Launch a fresh wave when the field is cleared, instead of ending the episode.
 
     Ending on success truncates the value bootstrap, which makes a short successful

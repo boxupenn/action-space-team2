@@ -138,6 +138,7 @@ def main():
     episode_intercept_times: list[list[float]] = [[] for _ in range(raw.num_envs)]
     ep_return = {a: torch.zeros(raw.num_envs, device=raw.device) for a in raw.cfg.possible_agents}
     credit = torch.zeros(raw.cfg.num_defenders, device=raw.device)
+    min_seps: list[float] = []
     returns: dict[str, list[float]] = {a: [] for a in raw.cfg.possible_agents}
     episode_lengths: list[float] = []
     action_norm_sum, action_steps = 0.0, 0
@@ -178,6 +179,7 @@ def main():
             breaches += int(raw.outcome_breached[finished].sum().item())
             intercepted += int(raw.outcome_captures[finished].sum().item())
             credit += raw.outcome_credit[finished].sum(dim=0)
+            min_seps += raw.outcome_min_sep[finished].tolist()
             attacker_slots += len(finished) * raw.cfg.num_attackers
             for row in finished.tolist():
                 intercept_times += episode_intercept_times[row]
@@ -196,6 +198,12 @@ def main():
     for a in raw.cfg.possible_agents:
         print("return %-11s %.1f (mean of %d episodes)" % (a + ":", sum(returns[a]) / max(len(returns[a]), 1), len(returns[a])), flush=True)
     print("captures/episode:    " + "  ".join("%s %.2f" % (a, credit[i].item() / max(episodes, 1)) for i, a in enumerate(raw.cfg.possible_agents)), flush=True)
+    if min_seps:
+        finite = [m for m in min_seps if m < 1.0e3]
+        coll = sum(m < raw.cfg.defender_collision_radius for m in finite)
+        srt = sorted(finite)
+        print("defender separation: min %.2f m, p5 %.2f m, median %.2f m; collisions (<%.2f m) %.1f%% of episodes" % (
+            srt[0], srt[len(srt) // 20], srt[len(srt) // 2], raw.cfg.defender_collision_radius, 100.0 * coll / max(len(finite), 1)), flush=True)
     print("episode length:      %.1f s" % (sum(episode_lengths) / max(len(episode_lengths), 1)), flush=True)
     print("mean |v cmd|:        %.2f" % (action_norm_sum / max(action_steps, 1)), flush=True)
     if intercept_times:
