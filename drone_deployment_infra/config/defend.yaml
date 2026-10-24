@@ -31,7 +31,7 @@ attackers: bus                        # bus | scripted | telemetry | udp
                                       # umbrella publish formation/drone<N> on the shared telemetry bus (swarm_ops README 5)
 telemetry_port: 9100                  # `telemetry`: drone_gui's fleet feed (drone_telemetry/README.md, UDP JSON
                                       # v1; add this laptop's LAN address:9100 to its destinations)
-attacker_min_height_cm: 100            # `bus`: an attacker still taking off (below this) is not a target yet (sim attacker_visible_z)
+attacker_min_height_cm: 50             # `bus`: an attacker still taking off (below this) is not a target yet (sim trains from 1.0 m; 50 cm per the user, 2026-10-24)
 attacker_names: []                    # `bus`: e.g. [drone4, drone5] (empty = first two formation/ topics); `telemetry`: e.g. [TELLO-2, TELLO-3]
 scripted:                             # each flies straight at site_xyz from `start` at `speed`
   - start: [2.0, 0.3, 4.5]            # m, tag frame
