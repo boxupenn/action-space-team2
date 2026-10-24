@@ -16,7 +16,9 @@ NUM_ATTACKERS = 2
 
 # obs per defender: own pos rel. site (3) + own vel (3) + gravity (3)
 #                 + per attacker (rel pos 3, rel vel 3, visible flag 1)
-_OBS_DIM = 9 + 7 * NUM_ATTACKERS + 4 * (NUM_DEFENDERS - 1)  # + per teammate: relative position (3) and active flag (1)
+OBS_ASSIGNMENT = True  # append the decentralised target assignment to the observation (see chase.assignment_from_obs)
+_OBS_DIM = 9 + 7 * NUM_ATTACKERS + 4 * (NUM_DEFENDERS - 1) + (NUM_ATTACKERS + 1 if OBS_ASSIGNMENT else 0)
+# 9 own + per attacker 7 + per teammate [rel xyz, active] + [one-hot assigned attacker, goalkeeper flag]
 
 
 @configclass
@@ -99,6 +101,12 @@ class TelloDefendEnvCfg(DirectMARLEnvCfg):
     # intercept time over the live attackers; the leftover defender is the goalkeeper. Same inputs ->
     # same answer on every drone, no communication.
     teacher_assign = "time"
+    # Append [one-hot of my assigned attacker (n), goalkeeper flag (1)] to the observation, computed
+    # per defender from its own observation by chase.assignment_from_obs. The discrete allocation is
+    # then an input, and the cloned network only has to learn the continuous pursuit (2026-10-24: the
+    # clone of the time-assignment teacher without this reached cosine 0.95 / 98.2%; the rule itself
+    # is 100% / 0%). The real runner computes the same feature from the same numbers.
+    obs_assignment = OBS_ASSIGNMENT
     # Defenders start at index-specific heights (metres above the floor), as they will be placed and
     # launched on the real field; empty list = uniform 1-2 m (the kit's default).
     defender_spawn_heights = [1.0, 1.5, 2.0]

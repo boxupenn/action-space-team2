@@ -84,6 +84,44 @@ def _intercept_time(r: torch.Tensor, v: torch.Tensor, v_max: float) -> torch.Ten
     return torch.where((disc >= 0) & (t_lead > 0), t_lead, t_pursuit)
 
 
+def assignment_from_obs(
+    o: torch.Tensor, i: int, num_attackers: int, num_defenders: int, v_max: float = 1.0
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Decentralised target assignment from ONE defender's observation (the 31-dim layout: own 9,
+    attackers 7n, teammates 4(D-1)). Rebuilds the (defenders x attackers) lead-pursuit intercept-time
+    table -- own position is the origin, teammates' relative positions come from the observation --
+    and picks the ordered assignment with the smallest total time (inactive defenders / dead
+    attackers cost 1e3). Returns (target index (E,), goalkeeper flag (E,)) for defender ``i``.
+    Deterministic and identical on every drone, so no communication is needed. The real runner
+    computes exactly this from the same numbers."""
+    import itertools
+
+    n, D, E, dev = num_attackers, num_defenders, o.shape[0], o.device
+    alive = o[:, 9 + 6 * n : 9 + 7 * n] > 0.5
+    rel = o[:, 9 : 9 + 3 * n].reshape(E, n, 3)
+    va = o[:, 9 + 3 * n : 9 + 6 * n].reshape(E, n, 3) + o[:, 3:6].unsqueeze(1)
+    mate_block = o[:, 9 + 7 * n : 9 + 7 * n + 4 * (D - 1)].reshape(E, D - 1, 4)
+    def_pos = torch.zeros(E, D, 3, device=dev)
+    def_active = torch.ones(E, D, dtype=torch.bool, device=dev)
+    for k, j in enumerate(j for j in range(D) if j != i):
+        def_pos[:, j] = mate_block[:, k, :3]
+        def_active[:, j] = mate_block[:, k, 3] > 0.5
+    cost = torch.full((E, D, n), 1.0e3, device=dev)
+    for j in range(D):
+        for m in range(n):
+            t_jm = _intercept_time(rel[:, m] - def_pos[:, j], va[:, m], v_max)
+            cost[:, j, m] = torch.where(alive[:, m] & def_active[:, j], t_jm, torch.full_like(t_jm, 1.0e3))
+    perms = list(itertools.permutations(range(D), min(D, n)))
+    totals = torch.stack([sum(cost[:, p[m], m] for m in range(len(p))) for p in perms], dim=-1)
+    chosen = torch.tensor(perms, device=dev)[totals.argmin(dim=-1)]  # (E, n): defender assigned to attacker m
+    mine = chosen == i
+    assigned = mine.any(dim=-1)
+    # a defender whose attacker is dead (cost 1e3) is not really assigned
+    my_target = mine.float().argmax(dim=-1)
+    assigned = assigned & alive[torch.arange(E, device=dev), my_target]
+    return my_target, ~assigned
+
+
 def smart2_actions(
     raw, obs: dict[str, torch.Tensor], v_max: float = 1.0, alert_frac: float = 0.6, aim_up: float = 0.15,
     standby_up: float = 0.5, standby_gain: float = 1.5, sep_radius: float = 0.8, sep_gain: float = 1.5,
@@ -131,31 +169,14 @@ def smart2_actions(
         D = len(agents)
         mate_block = o[:, 9 + 7 * n : 9 + 7 * n + 4 * (D - 1)].reshape(E, D - 1, 4) if D > 1 else None
         if assign_mode == "time" and mate_block is not None:
-            # Every defender rebuilds the same (defenders x attackers) intercept-time table from its own
-            # observation and picks the assignment with the smallest total time; inactive defenders and
-            # dead attackers cost 1e3. Deterministic -> identical on every drone.
-            mate_idx = [j for j in range(D) if j != i]
-            def_pos = torch.zeros(E, D, 3, device=dev)  # relative to me
-            def_active = torch.ones(E, D, dtype=torch.bool, device=dev)
-            for k, j in enumerate(mate_idx):
-                def_pos[:, j] = mate_block[:, k, :3]
-                def_active[:, j] = mate_block[:, k, 3] > 0.5
-            cost = torch.full((E, D, n), 1.0e3, device=dev)
-            for j in range(D):
-                for m in range(n):
-                    t_jm = _intercept_time(rel[:, m] - def_pos[:, j], va[:, m], v_max)
-                    cost[:, j, m] = torch.where(alive[:, m] & def_active[:, j], t_jm, torch.full_like(t_jm, 1.0e3))
-            import itertools
-            perms = list(itertools.permutations(range(D), min(D, n)))  # ordered choice of defenders for attackers 0..n-1
-            totals = torch.stack([sum(cost[:, p[m], m] for m in range(len(p))) for p in perms], dim=-1)  # (E, P)
-            best = totals.argmin(dim=-1)
-            perm_t = torch.tensor(perms, device=dev)  # (P, n)
-            chosen = perm_t[best]  # (E, n): defender index assigned to attacker m
-            mine = chosen == i  # (E, n)
-            assigned = mine.any(dim=-1)
-            my_target = mine.float().argmax(dim=-1)
-            target = torch.where(assigned, my_target, target)
-            goalkeeper = ~assigned
+            base = 9 + 7 * n + 4 * (D - 1)
+            if getattr(raw.cfg, "obs_assignment", False) and o.shape[1] >= base + n + 1:
+                # the env already appended [one-hot target (n), goalkeeper (1)] computed by assignment_from_obs
+                my_target = o[:, base : base + n].argmax(dim=-1)
+                goalkeeper = o[:, base + n] > 0.5
+            else:
+                my_target, goalkeeper = assignment_from_obs(o, i, n, D, v_max)
+            target = torch.where(goalkeeper, target, my_target)
         # defenders without an assignment are goalkeepers: go for the attacker nearest the site,
         # i.e. the one whose interception is failing ("send another drone")
         site_dist = torch.where(alive, site_rel[..., :2].norm(dim=-1), torch.full_like(az, 1.0e3))

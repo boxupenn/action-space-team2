@@ -21,6 +21,7 @@ from isaaclab.utils.math import sample_uniform
 
 from action_space_kit.assets import TELLO_CFG, TELLO_MASS
 from action_space_kit.control import TelloVelocityController
+from action_space_kit.tasks.direct.tello_defend.chase import assignment_from_obs
 from action_space_kit.rl.terminal_observation import TerminalObservationMixin
 
 from .tello_defend_env_cfg import TelloDefendEnvCfg
@@ -226,6 +227,13 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
                 ],
                 dim=-1,
             )
+        if self.cfg.obs_assignment:
+            n, D = self.cfg.num_attackers, self.cfg.num_defenders
+            for i in range(D):
+                a = f"defender_{i}"
+                target, goalkeeper = assignment_from_obs(obs[a], i, n, D, self.cfg.command.max_lin_speed)
+                onehot = torch.nn.functional.one_hot(target, n).float() * (~goalkeeper).float().unsqueeze(-1)
+                obs[a] = torch.cat([obs[a], onehot, goalkeeper.float().unsqueeze(-1)], dim=-1)
         return obs
 
     def _get_rewards(self) -> dict[str, torch.Tensor]:
