@@ -33,6 +33,7 @@ parser.add_argument(
 )
 parser.add_argument("--algorithm", type=str, default="IPPO", choices=["IPPO", "MAPPO"], help="Algorithm of the checkpoint.")
 parser.add_argument("--stochastic", action="store_true", default=False, help="Sample actions like training does instead of using the mean.")
+parser.add_argument("--diag", type=int, default=0, help="Print up to N breached episodes: attacker azimuth gap, speeds, captures, time.")
 parser.add_argument("--video", action="store_true", default=False, help="Record a video of the run.")
 parser.add_argument("--video_length", type=int, default=400, help="Video length in steps.")
 parser.add_argument("--video_dir", type=str, default="videos/evaluate", help="Where to write the video.")
@@ -139,6 +140,7 @@ def main():
     ep_return = {a: torch.zeros(raw.num_envs, device=raw.device) for a in raw.cfg.possible_agents}
     credit = torch.zeros(raw.cfg.num_defenders, device=raw.device)
     min_seps: list[float] = []
+    diag_printed = 0
     returns: dict[str, list[float]] = {a: [] for a in raw.cfg.possible_agents}
     episode_lengths: list[float] = []
     action_norm_sum, action_steps = 0.0, 0
@@ -180,6 +182,15 @@ def main():
             intercepted += int(raw.outcome_captures[finished].sum().item())
             credit += raw.outcome_credit[finished].sum(dim=0)
             min_seps += raw.outcome_min_sep[finished].tolist()
+            if args_cli.diag:
+                for row in finished.tolist():
+                    if raw.outcome_breached[row] and diag_printed < args_cli.diag:
+                        ang = raw.outcome_spawn_angle[row]
+                        gap = torch.remainder(ang[0] - ang[1] + 3.14159, 6.28318) - 3.14159
+                        print("[diag] breach: az gap %5.0f deg, speeds %s m/s, captures %d, t=%.1f s, min sep %.2f" % (
+                            abs(gap.item()) * 57.3, [round(x, 2) for x in raw.outcome_attacker_speed[row].tolist()],
+                            int(raw.outcome_captures[row].item()), raw.outcome_time[row].item(), raw.outcome_min_sep[row].item()), flush=True)
+                        diag_printed += 1
             attacker_slots += len(finished) * raw.cfg.num_attackers
             for row in finished.tolist():
                 intercept_times += episode_intercept_times[row]

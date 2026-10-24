@@ -72,6 +72,18 @@ def smart_actions(raw, obs: dict[str, torch.Tensor], v_max: float = 1.0) -> dict
     return actions
 
 
+def _intercept_time(r: torch.Tensor, v: torch.Tensor, v_max: float) -> torch.Tensor:
+    """Time to meet a target at relative position r moving at v when flying straight at v_max
+    (lead pursuit): smallest positive root of |r + v t| = v_max t; pure-pursuit fallback |r| / v_max."""
+    qa = (v * v).sum(-1) - v_max**2
+    qb = 2.0 * (r * v).sum(-1)
+    qc = (r * r).sum(-1)
+    disc = qb * qb - 4.0 * qa * qc
+    t_pursuit = r.norm(dim=-1) / v_max
+    t_lead = (-qb - torch.sqrt(disc.clamp(min=0.0))) / (2.0 * qa.clamp(max=-1e-6))
+    return torch.where((disc >= 0) & (t_lead > 0), t_lead, t_pursuit)
+
+
 def smart2_actions(
     raw, obs: dict[str, torch.Tensor], v_max: float = 1.0, alert_frac: float = 0.6, aim_up: float = 0.15,
     standby_up: float = 0.5, standby_gain: float = 1.5, sep_radius: float = 0.8, sep_gain: float = 1.5,
@@ -98,6 +110,7 @@ def smart2_actions(
     sep_radius = getattr(raw.cfg, "teacher_sep_radius", sep_radius)
     sep_gain = getattr(raw.cfg, "teacher_sep_gain", sep_gain)
     sep_vertical = getattr(raw.cfg, "teacher_sep_vertical", 0.0)
+    assign_mode = getattr(raw.cfg, "teacher_assign", "azimuth")
     cruise_bias = getattr(raw.cfg, "teacher_cruise_bias", 0.0)
     standby_up = getattr(raw.cfg, "teacher_standby_up", standby_up)
     site_z = raw.cfg.site_height * 0.5  # site centre height above the floor: own height = obs z + site_z
@@ -114,15 +127,41 @@ def smart2_actions(
         n_alive = alive.sum(dim=-1)
         rank = torch.clamp(torch.full((E,), i, device=dev, dtype=torch.long), max=(n_alive - 1).clamp(min=0))
         target = order[rows, rank]
-        # defenders beyond the live attacker count are goalkeepers: go for the attacker nearest
-        # the site, i.e. the one whose interception is failing ("send another drone")
-        site_dist = torch.where(alive, site_rel[..., :2].norm(dim=-1), torch.full_like(az, 1.0e3))
         goalkeeper = i >= n_alive
+        D = len(agents)
+        mate_block = o[:, 9 + 7 * n : 9 + 7 * n + 4 * (D - 1)].reshape(E, D - 1, 4) if D > 1 else None
+        if assign_mode == "time" and mate_block is not None:
+            # Every defender rebuilds the same (defenders x attackers) intercept-time table from its own
+            # observation and picks the assignment with the smallest total time; inactive defenders and
+            # dead attackers cost 1e3. Deterministic -> identical on every drone.
+            mate_idx = [j for j in range(D) if j != i]
+            def_pos = torch.zeros(E, D, 3, device=dev)  # relative to me
+            def_active = torch.ones(E, D, dtype=torch.bool, device=dev)
+            for k, j in enumerate(mate_idx):
+                def_pos[:, j] = mate_block[:, k, :3]
+                def_active[:, j] = mate_block[:, k, 3] > 0.5
+            cost = torch.full((E, D, n), 1.0e3, device=dev)
+            for j in range(D):
+                for m in range(n):
+                    t_jm = _intercept_time(rel[:, m] - def_pos[:, j], va[:, m], v_max)
+                    cost[:, j, m] = torch.where(alive[:, m] & def_active[:, j], t_jm, torch.full_like(t_jm, 1.0e3))
+            import itertools
+            perms = list(itertools.permutations(range(D), min(D, n)))  # ordered choice of defenders for attackers 0..n-1
+            totals = torch.stack([sum(cost[:, p[m], m] for m in range(len(p))) for p in perms], dim=-1)  # (E, P)
+            best = totals.argmin(dim=-1)
+            perm_t = torch.tensor(perms, device=dev)  # (P, n)
+            chosen = perm_t[best]  # (E, n): defender index assigned to attacker m
+            mine = chosen == i  # (E, n)
+            assigned = mine.any(dim=-1)
+            my_target = mine.float().argmax(dim=-1)
+            target = torch.where(assigned, my_target, target)
+            goalkeeper = ~assigned
+        # defenders without an assignment are goalkeepers: go for the attacker nearest the site,
+        # i.e. the one whose interception is failing ("send another drone")
+        site_dist = torch.where(alive, site_rel[..., :2].norm(dim=-1), torch.full_like(az, 1.0e3))
         target = torch.where(goalkeeper, site_dist.argmin(dim=-1), target)
         alert = site_dist.min(dim=-1).values < alert_frac * raw.cfg.spawn_radius
         standby = goalkeeper & ~alert
-        D = len(agents)
-        mate_block = o[:, 9 + 7 * n : 9 + 7 * n + 4 * (D - 1)].reshape(E, D - 1, 4) if D > 1 else None
         mates = mate_block[..., :3] if mate_block is not None else None
         mates_active = mate_block[..., 3] > 0.5 if mate_block is not None else None  # inactive (rammed) teammates are ignored
         # one attacker left: only the closest defender rams it, the rest hold off
@@ -134,13 +173,7 @@ def smart2_actions(
             yield_off = (n_alive <= 1) & ((mate_to_target.min(dim=-1).values + yield_margin) < r_t.norm(dim=-1))
         r = rel[rows, target]
         v = va[rows, target]
-        qa = (v * v).sum(-1) - v_max**2
-        qb = 2.0 * (r * v).sum(-1)
-        qc = (r * r).sum(-1)
-        disc = qb * qb - 4.0 * qa * qc
-        t_pursuit = r.norm(dim=-1) / v_max
-        t_lead = (-qb - torch.sqrt(disc.clamp(min=0.0))) / (2.0 * qa.clamp(max=-1e-6))
-        t = torch.where((disc >= 0) & (t_lead > 0), t_lead, t_pursuit)
+        t = _intercept_time(r, v, v_max)
         aim = r + v * t.unsqueeze(-1)
         aim[:, 2] += aim_up
         if cruise_bias and i < 2:  # altitude layering while cruising: defender_0 low, defender_1 high; gone in the last metre

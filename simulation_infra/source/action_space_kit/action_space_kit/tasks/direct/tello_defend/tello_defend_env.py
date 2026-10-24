@@ -55,6 +55,7 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
         self._spent = torch.zeros(self.num_envs, self.cfg.num_defenders, device=self.device, dtype=torch.bool)
         self._episode_credit = torch.zeros(self.num_envs, self.cfg.num_defenders, device=self.device)
         self._episode_min_sep = torch.full((self.num_envs,), float("inf"), device=self.device)
+        self._spawn_angle = torch.zeros(self.num_envs, self.cfg.num_attackers, device=self.device)  # diagnostics
         if self.cfg.closing_mode not in ("distance", "own_motion"):
             raise ValueError(f"closing_mode must be 'distance' or 'own_motion', got {self.cfg.closing_mode!r}")
         if self.cfg.target_mode not in ("nearest", "assigned"):
@@ -73,6 +74,10 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
         self.outcome_captures = torch.zeros(self.num_envs, device=self.device)
         self.outcome_credit = torch.zeros(self.num_envs, self.cfg.num_defenders, device=self.device)  # captures per defender
         self.outcome_min_sep = torch.full((self.num_envs,), float("inf"), device=self.device)  # min defender-defender distance
+        # diagnostics latched with the outcome: attacker spawn azimuths, speeds, episode time
+        self.outcome_spawn_angle = torch.zeros(self.num_envs, self.cfg.num_attackers, device=self.device)
+        self.outcome_attacker_speed = torch.zeros(self.num_envs, self.cfg.num_attackers, device=self.device)
+        self.outcome_time = torch.zeros(self.num_envs, device=self.device)
         self.outcome_valid = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
 
     # -- scene ------------------------------------------------------------------
@@ -349,6 +354,9 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
         self.outcome_captures = torch.where(finished, self._episode_captures, self.outcome_captures)
         self.outcome_credit = torch.where(finished.unsqueeze(-1), self._episode_credit, self.outcome_credit)
         self.outcome_min_sep = torch.where(finished, self._episode_min_sep, self.outcome_min_sep)
+        self.outcome_spawn_angle = torch.where(finished.unsqueeze(-1), self._spawn_angle, self.outcome_spawn_angle)
+        self.outcome_attacker_speed = torch.where(finished.unsqueeze(-1), self._attacker_speed, self.outcome_attacker_speed)
+        self.outcome_time = torch.where(finished, self.episode_length_buf.float() * self.step_dt, self.outcome_time)
         terminated = {agent: done for agent in self.cfg.possible_agents}
         time_outs = {agent: time_out for agent in self.cfg.possible_agents}
         return terminated, time_outs
@@ -361,6 +369,7 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
         origins = self.scene.env_origins[env_ids]
         for i, drone in enumerate(self._attackers):
             angle = sample_uniform(0.0, 6.2832, (num,), self.device)
+            self._spawn_angle[env_ids, i] = angle
             state = drone.data.default_root_state[env_ids].clone()
             state[:, 0] = origins[:, 0] + self.cfg.spawn_radius * torch.cos(angle)
             state[:, 1] = origins[:, 1] + self.cfg.spawn_radius * torch.sin(angle)
@@ -408,6 +417,7 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
         # attackers enter from a wider ring
         for i, drone in enumerate(self._attackers):
             angle = sample_uniform(0.0, 6.2832, (num,), self.device)
+            self._spawn_angle[env_ids, i] = angle
             state = drone.data.default_root_state[env_ids].clone()
             state[:, 0] = origins[:, 0] + self.cfg.spawn_radius * torch.cos(angle)
             state[:, 1] = origins[:, 1] + self.cfg.spawn_radius * torch.sin(angle)

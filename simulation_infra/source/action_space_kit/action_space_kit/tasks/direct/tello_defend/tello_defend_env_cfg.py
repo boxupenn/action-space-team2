@@ -93,6 +93,12 @@ class TelloDefendEnvCfg(DirectMARLEnvCfg):
     teacher_sep_vertical = 0.8  # share of the repulsion that goes vertical (lower index dives, higher climbs)
     teacher_cruise_bias = 0.0  # [m] altitude offset while cruising; 0.2 tested slightly worse (100% / 0.1%, 0.5% near-misses) -> off
     teacher_standby_up = 1.0  # [m] goalkeeper standby height above the site centre
+    # smart2 target assignment: "azimuth" = defender i takes the i-th attacker by azimuth around the
+    # site (ignores where the defenders are); "time" = every defender computes, from its own
+    # observation (own + teammates' positions), the assignment that minimises the summed lead-pursuit
+    # intercept time over the live attackers; the leftover defender is the goalkeeper. Same inputs ->
+    # same answer on every drone, no communication.
+    teacher_assign = "time"
     # Defenders start at index-specific heights (metres above the floor), as they will be placed and
     # launched on the real field; empty list = uniform 1-2 m (the kit's default).
     defender_spawn_heights = [1.0, 1.5, 2.0]
