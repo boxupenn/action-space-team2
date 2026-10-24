@@ -94,6 +94,8 @@ def smart2_actions(
     n, E, dev = raw.cfg.num_attackers, raw.num_envs, raw.device
     agents = raw.cfg.possible_agents
     rows = torch.arange(E, device=dev)
+    sep_radius = getattr(raw.cfg, "teacher_sep_radius", sep_radius)
+    sep_gain = getattr(raw.cfg, "teacher_sep_gain", sep_gain)
     actions = {}
     for i, a in enumerate(agents):
         o = obs[a]

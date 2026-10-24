@@ -86,6 +86,9 @@ class TelloDefendEnvCfg(DirectMARLEnvCfg):
     # default), which puts two of three within 0.3 m in ~6% of episodes.
     defender_spawn_even = True
     defender_spawn_jitter = 0.3  # [rad]
+    # smart2 teacher knobs (chase.py reads them when present): teammate repulsion radius / gain
+    teacher_sep_radius = 0.8  # [m]
+    teacher_sep_gain = 1.5
     """Launch a fresh wave when the field is cleared, instead of ending the episode.
 
     Ending on success truncates the value bootstrap, which makes a short successful
