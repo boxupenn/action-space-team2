@@ -54,6 +54,7 @@ MATE_LOW_CM, MATE_LOW_S = 30, 1.0           # ... or on the floor: height below 
 MATE_STATUS_STALE_S = 3.0                   # ... or its status stream stopped (link lost / powered off)
 OBS_CLIP_POS, OBS_CLIP_VEL = 12.0, 3.0      # as the sim env clips before normalisation
 FIX_FRESH_S = 0.5                           # fix older than this: hover
+CLIMB_MAX_S = 6.0                           # climb phase gives up after this (no / wrong height reading) and the net flies
 NO_FIX_LAND_S = 6.0                         # no fix this long while airborne: land
 PREFLIGHT_FIX_S = 8.0                       # preflight waits this long for video + a first fix
 VEL_WINDOW_S = 0.4                          # ponytail: velocity = finite difference over this window;
@@ -692,6 +693,8 @@ class DefendPolicy(Policy):
         self.yielding = {}                       # drone num -> separation guard active
         self.low_since = {}                      # drone num -> since when its height reads "on the floor"
         self.ready = {}                          # drone num -> reached its launch height (then the net flies it)
+        self.climb_t0 = {}                       # drone num -> when its climb started
+        self.last_status = {}                    # drone num -> last status line time
 
     def setup(self, drones):
         super().setup(drones)
@@ -727,6 +730,20 @@ class DefendPolicy(Policy):
 
     def describe(self, d):
         return f"defend{self.idx.get(d.num, '?')}"
+
+    def status_line(self, d, est, att, rc, what, every=1.0):
+        """One line per second per drone while flying (dry-run prints everything anyway): where it is, what it
+        sees, what it sends -- the first thing to read when a drone does not move."""
+        if not getattr(d, "fly", False):
+            return
+        now = time.time()
+        if now - self.last_status.get(d.num, 0.0) < every:
+            return
+        self.last_status[d.num] = now
+        p = "-" if est is None else np.round(est[0], 2).tolist()
+        a = "-" if att is None else [np.round(q, 2).tolist() if al else None for q, al in zip(att[0], att[1])]
+        d.log(f"defend{self.idx.get(d.num, '?')} {what} p={p} att={a} h={d.height_cm() if hasattr(d, 'height_cm') else '-'} "
+              f"rc {rc[0]:+d} {rc[1]:+d} {rc[2]:+d} {rc[3]:+d}")
 
     def mate_from_bus(self, n, now, max_age=1.0):
         """A teammate flown by another process running this policy: its defend/drone<N> topic
@@ -780,6 +797,7 @@ class DefendPolicy(Policy):
             age = est[3] if est else float("inf")
             self.last_fix_t.setdefault(d.num, now)
             self.publish_pose(d, est, (0, 0, 0, 0))
+            self.status_line(d, est, None, (0, 0, 0, 0), f"NO FIX (age {age:.1f}s, frames {getattr(feed, 'frames', '-')})")
             if now - self.last_fix_t[d.num] > NO_FIX_LAND_S:
                 d.log(f"no tag fix for {NO_FIX_LAND_S:.0f} s")
                 return None                      # land it
@@ -795,12 +813,14 @@ class DefendPolicy(Policy):
         i = self.idx[d.num]
         if fly and not self.ready.get(d.num) and i < len(heights):
             h = d.height_cm() if hasattr(d, "height_cm") else None
-            if h is not None and abs(h - heights[i]) <= 10:
-                self.ready[d.num] = True
-                d.log(f"at launch height {h:.0f} cm -> policy")
+            self.climb_t0.setdefault(d.num, now)
+            if (h is not None and abs(h - heights[i]) <= 10) or now - self.climb_t0[d.num] > CLIMB_MAX_S:
+                self.ready[d.num] = True   # at height, or no usable height / too slow: the net climbs by itself
+                d.log(f"launch height {heights[i]} cm: reads {h} cm after {now - self.climb_t0[d.num]:.1f} s -> policy")
             else:
                 rc = (0, 0, hold_height(d, heights[i]), face_yaw_rc(own_p, yaw, self.cfg["site"]))
                 self.publish_pose(d, est, rc)
+                self.status_line(d, est, None, rc, "CLIMB")
                 return rc
         if self.cfg["fence_hi"][0] < own_p[0] or own_p[0] < -0.1:
             d.log(f"WARNING: fix behind the wall / past the fence (sim x {own_p[0]:.2f}); map frame mirrored?")
@@ -827,6 +847,7 @@ class DefendPolicy(Policy):
             # reset both teams between rounds; the nets never saw an empty field.
             rc = (0, 0, 0, face_yaw_rc(own_p, yaw, self.cfg["site"]))
             self.publish_pose(d, est, rc)
+            self.status_line(d, est, (att_p, alive), rc, "NO ATTACKER ON THE BUS -> hold")
             return rc
         obs = build_obs(own_p, own_v, att_p, att_v, alive, self.cfg["site"], [m[1] for m in mates],
                         [m[2] for m in mates], i, self.cfg.get("alert_radius"), self.cfg.get("cover_m"), self.cfg.get("alert_force", 0.0))
@@ -853,6 +874,7 @@ class DefendPolicy(Policy):
         rc = (a, b, c, yaw_rc)
         self.last_action[d.num] = (action, rc)
         self.publish_pose(d, est, rc)
+        self.status_line(d, est, (att_p, alive), rc, "guard" if self.yielding.get(d.num) else "policy")
         if hasattr(feed, "apply"):
             feed.apply(action, yaw_rc, now)
         if not fly:
