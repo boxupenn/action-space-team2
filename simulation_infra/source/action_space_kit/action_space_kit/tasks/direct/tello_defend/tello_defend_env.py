@@ -232,6 +232,9 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
             dpos = torch.stack([d.data.root_pos_w for d in self._defenders], dim=1)
             pair = torch.cdist(dpos, dpos)  # (envs, D, D)
             pair = pair + torch.eye(self.cfg.num_defenders, device=self.device) * 1.0e3
+            if self.cfg.defender_spent_on_capture and not self.cfg.collision_count_spent:
+                spent_pair = self._spent.unsqueeze(1) | self._spent.unsqueeze(2)
+                pair = torch.where(spent_pair, torch.full_like(pair, 1.0e3), pair)
             self._episode_min_sep = torch.minimum(self._episode_min_sep, pair.flatten(1).min(dim=-1).values)
 
         # breach: a live attacker inside the protected cylinder

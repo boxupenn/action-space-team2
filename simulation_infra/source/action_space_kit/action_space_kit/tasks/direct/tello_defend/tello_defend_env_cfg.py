@@ -81,6 +81,7 @@ class TelloDefendEnvCfg(DirectMARLEnvCfg):
     # Defender-defender separation: the per-episode minimum pairwise distance is latched in
     # outcome_min_sep; a minimum below this counts as a defender collision in evaluate.py.
     defender_collision_radius = 0.3
+    collision_count_spent = False  # a rammed defender is on the floor in reality: pairs with it do not count
     # Defenders start evenly spaced around the site (2*pi/num_defenders apart, +-defender_spawn_jitter
     # rad), as they will be placed on the real field. False: independent random angles (the kit's
     # default), which puts two of three within 0.3 m in ~6% of episodes.
