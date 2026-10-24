@@ -7,9 +7,11 @@ from .formation import FormationPolicy
 from .hover import HoverPolicy
 from .levels import LevelsPolicy
 from .spin import SpinPolicy
+from .telemetry import TelemetryBus, TelemetryClient, TelemetryHub
 from .umbrella import Umbrella
 
 POLICIES = {"spin": SpinPolicy, "levels": LevelsPolicy, "hover": HoverPolicy,
             "formation": FormationPolicy, "defend": DefendPolicy}
 
-__all__ = ["POLICIES", "Policy", "DefendPolicy", "FormationPolicy", "HoverPolicy", "LevelsPolicy", "SpinPolicy", "Umbrella"]
+__all__ = ["POLICIES", "Policy", "DefendPolicy", "FormationPolicy", "HoverPolicy", "LevelsPolicy", "SpinPolicy", "Umbrella",
+           "TelemetryBus", "TelemetryClient", "TelemetryHub"]

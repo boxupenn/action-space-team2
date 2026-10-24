@@ -60,25 +60,42 @@ $PY scripts/04_tag_check.py --drone tello_3            # per-tag distance, angle
 ## 3. Choose which tags to map
 
 Every tag you want in the map must have its black-square size in `config/tags.yaml`
-`sizes_mm` (already set: 1-9 = 132.08 mm, 10 = 571.5 mm). Tag 10 is the origin — it must
+`sizes_mm` (1-9 and 11 = 132.08 mm, 10 = 571.5 mm). Tag 10 is the origin — it must
 be seen together with the others so they link into one frame.
 
 ## 4. Build the map (tag-10 frame)
 
 ```bash
-$PY scripts/05_map.py --drone tello_3                  # writes config/map.yaml
+cd drone_deployment_infra/cal_and_map
+PYTHONPATH=. python3 scripts/05_map.py --drone tello_4      # writes ../config/map.yaml
 ```
 
-Point the drone so the camera sees **tag 10 together with other tags** (two tags in one
-frame links them; a chain 10↔6↔5 works too). The window shows `mapped N: [...]`; green =
-placed in the map, yellow = seen but not yet linked to the origin. Press `q` to finish —
-it prints each tag's x/y/z in the tag-10 frame and saves `config/map.yaml`.
+Hold the drone (it never flies) so the camera sees **tag 10 together with other tags**;
+chains work too (10↔6↔5). Every frame's tag corners go into one bundle adjustment: all
+camera and tag poses solved together, so a small tag's flip-ambiguous single-frame pose
+is never averaged into the map. Each tag is checked, and turns **green** only when all pass:
 
-Save to a specific file:
+| Check | Default | Fix when it fails |
+|---|---|---|
+| views | ≥ 30 frames | keep it in view longer, with another tag |
+| 1-sigma position | ≤ 0.5 cm | more views, closer |
+| redundancy: two halves of the session solved alone agree | ≤ 1.5 cm | cover it again later in the session |
+| view spread (range of viewing angles) | ≥ 15° | move sideways: 30-50° off-axis views help most |
+
+Yellow tags show what they still need. Press `q` (or Ctrl+C): a final solve on every
+frame prints the table and writes the map **only if every tag passes** (`--force` writes
+anyway); the old map is backed up. The session video is saved to
+`cal_and_map/data/map_<drone>_<time>.avi`. Rebuild from it, or from any flight
+recording, without the drone:
 
 ```bash
-$PY scripts/05_map.py --drone tello_3 --out config/map_room.yaml
+PYTHONPATH=. python3 scripts/07_map_from_video.py --video data/map_tello_4_<time>.avi --drone tello_4
+PYTHONPATH=. python3 scripts/07_map_from_video.py --video a.avi b.avi --drone tello_4 --out /tmp/test_map.yaml
 ```
+
+Each tag in `map.yaml` carries its checks (`ok`, `views`, `sigma_cm`, `split_cm`,
+`spread_deg`, `links`, `issues`); readers use only `R` and `t`.
+Self-check (no drone): `PYTHONPATH=. python3 -m tello_calibration.tags.bundle`.
 
 ## 5. Localize the drone against the map
 
