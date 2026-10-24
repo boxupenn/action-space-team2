@@ -75,7 +75,7 @@ def smart_actions(raw, obs: dict[str, torch.Tensor], v_max: float = 1.0) -> dict
 def smart2_actions(
     raw, obs: dict[str, torch.Tensor], v_max: float = 1.0, alert_frac: float = 0.6, aim_up: float = 0.15,
     standby_up: float = 0.5, standby_gain: float = 1.5, sep_radius: float = 0.8, sep_gain: float = 1.5,
-    yield_margin: float = 0.3,
+    yield_margin: float | None = None,
 ) -> dict[str, torch.Tensor]:
     """Like ``smart_actions`` but the assignment uses only what ONE defender observes, so a
     per-agent policy can clone it: attackers are ranked by their azimuth around the protected
@@ -89,8 +89,8 @@ def smart2_actions(
     the attacker: a ram from above hits the props and stays out of its downwash.
     De-confliction (teammate positions are the last 3*(D-1) obs entries): a repulsion of
     ``sep_gain`` x (sep_radius - d) away from any teammate closer than ``sep_radius``; and when a
-    single attacker is left, only the defender nearest to it (by ``yield_margin``) goes in, the
-    others hold off so two drones never converge on the same target."""
+    single attacker is left and ``yield_margin`` is set, only the defender nearest to it goes in
+    (off by default: the switch is discontinuous and the clone learned it badly, 2026-10-23)."""
     n, E, dev = raw.cfg.num_attackers, raw.num_envs, raw.device
     agents = raw.cfg.possible_agents
     rows = torch.arange(E, device=dev)
@@ -118,7 +118,7 @@ def smart2_actions(
         mates = o[:, 9 + 7 * n : 9 + 7 * n + 3 * (D - 1)].reshape(E, D - 1, 3) if D > 1 else None
         # one attacker left: only the closest defender rams it, the rest hold off
         yield_off = torch.zeros(E, dtype=torch.bool, device=dev)
-        if mates is not None:
+        if mates is not None and yield_margin is not None:  # off by default: a hard switch clones badly
             r_t = rel[rows, target]  # (E, 3) target relative to me
             mate_to_target = (r_t.unsqueeze(1) - mates).norm(dim=-1)  # (E, D-1)
             yield_off = (n_alive <= 1) & ((mate_to_target.min(dim=-1).values + yield_margin) < r_t.norm(dim=-1))

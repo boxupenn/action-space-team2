@@ -367,8 +367,14 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
         origins = self.scene.env_origins[env_ids]
 
         # defenders start on a ring around the site
+        base_angle = sample_uniform(0.0, 6.2832, (num,), self.device)
         for i, drone in enumerate(self._defenders):
-            angle = sample_uniform(0.0, 6.2832, (num,), self.device)
+            if self.cfg.defender_spawn_even:
+                angle = base_angle + i * 6.2832 / self.cfg.num_defenders + sample_uniform(
+                    -self.cfg.defender_spawn_jitter, self.cfg.defender_spawn_jitter, (num,), self.device
+                )
+            else:
+                angle = sample_uniform(0.0, 6.2832, (num,), self.device)
             state = drone.data.default_root_state[env_ids].clone()
             state[:, 0] = origins[:, 0] + self.cfg.defender_radius * torch.cos(angle)
             state[:, 1] = origins[:, 1] + self.cfg.defender_radius * torch.sin(angle)
