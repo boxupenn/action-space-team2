@@ -102,9 +102,16 @@ obs, _ = env.reset()
 viewport = get_active_viewport()
 print(f"[clip] viewport: {viewport}", flush=True)
 
+
+def tick(n: int) -> None:
+    """Tick the app n times for rendering/capture flushing WITHOUT advancing physics (see sim.render())."""
+    env.sim.set_setting("/app/player/playSimulations", False)
+    for _ in range(n):
+        simulation_app.update()
+    env.sim.set_setting("/app/player/playSimulations", True)
+
 # let the renderer settle before the first capture
-for _ in range(30):
-    simulation_app.update()
+tick(30)
 
 
 def capture(index: int) -> str:
@@ -112,8 +119,7 @@ def capture(index: int) -> str:
     # wait_for_result is a coroutine, so there is nothing useful to call synchronously;
     # ticking the app is what actually flushes the capture to disk
     capture_viewport_to_file(viewport, path)
-    for _ in range(args.ticks_per_capture):
-        simulation_app.update()
+    tick(args.ticks_per_capture)
     return path
 
 
@@ -133,17 +139,29 @@ while captured < args.frames:
     else:
         actions = TEACHERS[args.pilot](env, obs)
 
+    prev_credit = env._episode_credit[0].clone()
     obs, _, _, _, _ = env.step(actions)
     env.sim.render()
     step += 1
+    # ponytail: event log so the clip can be narrated -- sim time t, video time v (frames / fps).
+    # credit (captures per defender) survives wave respawns and is latched into outcome_credit at episode end.
+    t, v = step * env.step_dt, captured / args.fps
+    ended = bool(env.outcome_valid[0])
+    credit = env.outcome_credit[0] if ended else env._episode_credit[0]
+    who = (credit - prev_credit > 0).nonzero().flatten().tolist()
+    if who:
+        print(f"[clip] t={t:6.2f}s v={v:5.1f}s CAPTURE by defender {who}", flush=True)
+    if ended:
+        kind = "BREACH" if env.outcome_breached[0] else ("CLEARED" if env.outcome_captures[0] >= num_attackers else "TIMEOUT")
+        print(f"[clip] t={t:6.2f}s v={v:5.1f}s EPISODE END {kind} captures={int(env.outcome_captures[0])} "
+              f"time={env.outcome_time[0]:.1f}s min_sep={env.outcome_min_sep[0]:.2f}m", flush=True)
 
     if step % args.capture_every == 0:
         path = capture(captured)
         captured += 1
         if captured == 1:
             # fail fast rather than simulating for minutes and writing nothing
-            for _ in range(60):
-                simulation_app.update()
+            tick(60)
             if not os.path.exists(path):
                 print("[clip] first capture produced no file -- aborting", flush=True)
                 env.close()
@@ -152,8 +170,7 @@ while captured < args.frames:
             print(f"[clip] first frame OK ({os.path.getsize(path)} bytes)", flush=True)
 
 # let the trailing captures flush
-for _ in range(120):
-    simulation_app.update()
+tick(120)
 
 frames = sorted(f for f in os.listdir(args.frame_dir) if f.endswith(".png"))
 print(f"[clip] wrote {len(frames)} frames", flush=True)

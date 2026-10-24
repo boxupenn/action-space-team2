@@ -1,0 +1,33 @@
+# defend policy (swarm_ops/policies/defend.py): the sim-trained 3-defender policy on real Tellos.
+# All positions are in the TAG-10 frame of config/map.yaml: x right along the wall (seen facing
+# the tag), y up, z out of the tag face into the room; metres.
+
+policy_dir: ../../simulation_infra/policies/defend_3v2_ram9_s2          # relative to this file; override
+                                      # with swarm_policies.py --defend-dir / defend_offline.py --policy-dir
+                                      # defender_0.pt -> first drone of --run defend:a,b,c, etc.
+site_xyz: [0.0, -0.3, 0.6]            # the protected point (sim: site centre, 1.25 m up): a bit
+                                      # below tag 10 and 0.6 m out of the wall
+speed_cap: 0.5                        # fraction of full rc on a/b/c (0.5 = rc +-50 ~ 0.5 m/s)
+fence:                                # tag-frame box the defenders may not leave (rc outward = 0)
+  x: [-3.0, 3.0]
+  y: [-1.5, 1.2]                      # y is up: floor ~ -1.5 m below tag 10, ceiling 1.2 m above
+  z: [0.4, 5.0]
+height_cm: [50, 220]                  # tof range: no more down below / up above these
+sep_guard_m: 0.6                      # defenders closer than this: the higher-index one holds horizontally
+sep_release_m: 0.8                    # ... until they are this far apart again
+
+attackers: scripted                   # scripted | telemetry | udp
+telemetry_port: 9100                  # `telemetry`: drone_gui's fleet feed (drone_telemetry/README.md, UDP JSON
+                                      # v1; add this laptop's LAN address:9100 to its destinations)
+attacker_names: []                    # `telemetry`: e.g. [TELLO-2, TELLO-3]; empty = the team=="attack" entries by slot
+scripted:                             # each flies straight at site_xyz from `start` at `speed`
+  - start: [2.0, 0.3, 4.5]            # m, tag frame
+    speed: 0.6                        # m/s
+    delay: 0.0                        # s after the run starts
+  - start: [-2.5, 0.6, 4.0]
+    speed: 0.5
+    delay: 0.0                        # the sim spawns both at once; with one attacker alive two defenders
+                                      # are goalkeepers and crowd the site (try 3.0 to see it)
+capture_radius: 0.5                   # m: a scripted attacker this close to a defender is "down"
+respawn_s: 0.0                        # a down / arrived attacker restarts after this; 0 = never (sim eval: no waves)
+udp_port: 5005                        # `udp` (our own test feed): JSON {"attackers": [[x,y,z], [x,y,z] | null]} tag-10 frame

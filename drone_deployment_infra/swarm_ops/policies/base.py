@@ -31,6 +31,10 @@ class Policy:
     def setup(self, drones):
         self.drones = list(drones)
 
+    def preflight(self, d):
+        """Extra per-drone check after the umbrella's own (link, battery, status); False = nobody flies."""
+        return True
+
     def step(self, d, t):
         raise NotImplementedError
 

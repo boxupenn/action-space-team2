@@ -26,6 +26,9 @@ class Umbrella(Policy):
         for p, nums in self.groups.items():
             p.setup([by_num[n] for n in nums])
 
+    def preflight(self, d):
+        return self.owner[d.num].preflight(d)
+
     def step(self, d, t):
         return self.owner[d.num].step(d, t)
 
