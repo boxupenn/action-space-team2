@@ -34,7 +34,7 @@ If you write your own task, keep that action space and your policy stays flyable
 |---|---|---|
 | `AS-Tello-Hover-v0` | single-agent | Hold a sampled position. Start here; trains in minutes. |
 | `AS-Tello-Waypoint-v0` | single-agent | Chase a moving goal -- the basis of pursuit. |
-| `AS-Defend-v0` | multi-agent | The hackathon scenario: defenders intercept attackers before they reach the protected site. |
+| `AS-Defend-v0` | multi-agent | The hackathon scenario: defenders intercept attackers before they reach the protected site. Since 2026-10-23: 3 defenders vs 2 attackers, ramming rule (a defender that intercepts is out), teammates + a decentralised target assignment in the observation (34-dim); scripted teachers `smart`/`smart2` and DAgger cloning in `scripts/bc_warm_start.py`; shipped policy `policies/defend_3v2_ram8_s2/`. |
 | `AS-Tello-Approach-v0` | multi-agent, SB3 | Four Tellos enter a base's airspace, each through its own gate on a keep-out sphere. Randomized Tello firmware model. See below. |
 
 List them yourself with `python scripts/list_envs.py`.
