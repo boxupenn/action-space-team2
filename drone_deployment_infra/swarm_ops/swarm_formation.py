@@ -100,6 +100,14 @@ D_STOP_M = 0.4
 K_REP = 60.0
 LOST_DRIFT_MPS = 0.15
 MIN_TAG_DIST_M = 0.8
+KEEPOUT_M = 0.0              # --keepout: stay this far (horizontal) from every mapped tag
+KEEPOUT_PTS = []             # mapped tag positions (filled at startup)
+K_KEEPOUT = 40.0             # rc per m of intrusion (safety net)
+PLAN_RES_M = 0.10            # path-planning grid cell
+PLAN_MARGIN_M = 0.10         # plan this much outside the keepout circles
+PLAN_EVERY_S = 1.0
+LOOKAHEAD_M = 0.4
+DIRECT_ZONE_M = 0.5          # this close to the slot: aim straight at it
 DRONE_RADIUS_M = 0.12        # for view-cone checks
 K_CONE = 50.0                # push out of another drone's view cone (rc per m)
 
@@ -233,6 +241,14 @@ def control(p, psi, target, others, cap=None, integ=None):
             rep += K_REP * (ds - dist) * u
             scale = min(scale, max(0.0, (dist - dstop) / (ds - dstop)))
     v = v * scale + rep
+    for q in KEEPOUT_PTS:                        # boundary tags: never closer than KEEPOUT_M
+        dq = math.hypot(p[0] - q[0], p[2] - q[2])
+        if 1e-6 < dq < KEEPOUT_M:
+            u = np.array([p[0] - q[0], 0.0, p[2] - q[2]]) / dq
+            inward = -float(v @ u)
+            if inward > 0:
+                v = v + inward * u
+            v = v + K_KEEPOUT * (KEEPOUT_M - dq) * u
     dh = math.hypot(p[0], p[2])
     if 1e-6 < dh < MIN_TAG_DIST_M:
         u = np.array([p[0], 0.0, p[2]]) / dh
@@ -1000,8 +1016,98 @@ def start_terminal_keys():
     return get
 
 
+def plan_path(start, goal):
+    """A* on a floor-plan grid around the keepout circles. start/goal: internal-frame points.
+    Returns waypoints [(x, z), ...] ending at goal (or None if no route)."""
+    import heapq
+    r = KEEPOUT_M + PLAN_MARGIN_M
+    pts = [(q[0], q[2]) for q in KEEPOUT_PTS]
+    xs = [start[0], goal[0]] + [q[0] for q in pts]
+    zs = [start[2], goal[2]] + [q[1] for q in pts]
+    x0, z0 = min(xs) - r - 1.0, min(zs) - r - 1.0
+    nx = int((max(xs) + r + 1.0 - x0) / PLAN_RES_M) + 1
+    nz = int((max(zs) + r + 1.0 - z0) / PLAN_RES_M) + 1
+
+    def cell(x, z):
+        return (min(nx - 1, max(0, int(round((x - x0) / PLAN_RES_M)))),
+                min(nz - 1, max(0, int(round((z - z0) / PLAN_RES_M)))))
+
+    def xz(c):
+        return (x0 + c[0] * PLAN_RES_M, z0 + c[1] * PLAN_RES_M)
+
+    def blocked(c, rr=r):
+        x, z = xz(c)
+        return any(math.hypot(x - a, z - b) < rr for a, b in pts)
+
+    def nearest_free(c):
+        if not blocked(c):
+            return c
+        seen, q = {c}, [c]
+        while q:
+            cur = q.pop(0)
+            for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nb = (cur[0] + dx, cur[1] + dz)
+                if 0 <= nb[0] < nx and 0 <= nb[1] < nz and nb not in seen:
+                    if not blocked(nb):
+                        return nb
+                    seen.add(nb)
+                    q.append(nb)
+        return None
+    s0, g0 = nearest_free(cell(start[0], start[2])), nearest_free(cell(goal[0], goal[2]))
+    if s0 is None or g0 is None:
+        return None
+    steps = [(1, 0, 1), (-1, 0, 1), (0, 1, 1), (0, -1, 1),
+             (1, 1, 1.414), (1, -1, 1.414), (-1, 1, 1.414), (-1, -1, 1.414)]
+    openq, came, cost = [(0.0, s0)], {s0: None}, {s0: 0.0}
+    while openq:
+        _, cur = heapq.heappop(openq)
+        if cur == g0:
+            break
+        for dx, dz, w in steps:
+            nb = (cur[0] + dx, cur[1] + dz)
+            if not (0 <= nb[0] < nx and 0 <= nb[1] < nz) or blocked(nb):
+                continue
+            c2 = cost[cur] + w
+            if c2 < cost.get(nb, 1e18):
+                cost[nb], came[nb] = c2, cur
+                heapq.heappush(openq, (c2 + math.hypot(nb[0] - g0[0], nb[1] - g0[1]), nb))
+    if g0 not in came:
+        return None
+    cells, c = [], g0
+    while c is not None:
+        cells.append(c)
+        c = came[c]
+    cells.reverse()
+
+    def clear(a, b):                              # straight segment stays outside circles?
+        n = max(2, int(math.hypot(b[0] - a[0], b[1] - a[1]) / (PLAN_RES_M / 2)))
+        return all(not any(math.hypot(a[0] + (b[0] - a[0]) * i / n - qa,
+                                      a[1] + (b[1] - a[1]) * i / n - qb) < r - 1e-6 for qa, qb in pts)
+                   for i in range(n + 1))
+    raw = [(start[0], start[2])] + [xz(c) for c in cells[1:]] + [(goal[0], goal[2])]
+    out, i = [raw[0]], 0                          # line-of-sight smoothing
+    while i < len(raw) - 1:
+        j = len(raw) - 1
+        while j > i + 1 and not clear(raw[i], raw[j]):
+            j -= 1
+        out.append(raw[j])
+        i = j
+    return out
+
+
+def path_carrot(p, path, goal):
+    """Point ~LOOKAHEAD_M ahead along the path (internal frame, goal height)."""
+    if not path:
+        return goal
+    best_i = min(range(len(path)), key=lambda i: math.hypot(path[i][0] - p[0], path[i][1] - p[2]))
+    for k in range(best_i, len(path)):
+        if math.hypot(path[k][0] - p[0], path[k][1] - p[2]) >= LOOKAHEAD_M:
+            return np.array([path[k][0], goal[1], path[k][1]])
+    return goal
+
+
 def main():
-    global HEIGHT_OFFSET_M, ARC_RADIUS_M
+    global HEIGHT_OFFSET_M, ARC_RADIUS_M, TAG_ID
     g = globals()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=str(DONGLES_PATH))
@@ -1009,6 +1115,10 @@ def main():
     ap.add_argument("--map", default=str(MAP_PATH))
     ap.add_argument("--tags", default=str(TAGS_PATH))
     ap.add_argument("--no-map", action="store_true", help="use tag 10 only")
+    ap.add_argument("--keepout", type=float, default=0.0,
+                    help="stay at least this many m (horizontal) from every mapped tag")
+    ap.add_argument("--target", type=int, default=10,
+                    help="form in front of this mapped tag (default 10)")
     ap.add_argument("--ignore-tags", default="", help="mapped tags to ignore, e.g. 6,7")
     ap.add_argument("--only", default="", help="e.g. 3 or 1,3,5")
     ap.add_argument("--start-height", type=int, default=None,
@@ -1048,17 +1158,37 @@ def main():
         origin, tag_map, sizes = load_tag_files(args.map, args.tags)
         if origin != TAG_ID:
             sys.exit(f"map origin is tag {origin}, this script expects tag {TAG_ID}")
+        if args.target != origin:                     # re-express the map around the target
+            if args.target not in tag_map:
+                sys.exit(f"--target {args.target}: tag not in the map {sorted(tag_map)}")
+            Rt, tt = tag_map[args.target]
+            tag_map = {k: (Rt.T @ R, Rt.T @ (t - tt)) for k, (R, t) in tag_map.items()}
+            TAG_ID = args.target
+            print(f">>> TARGET: formation in front of tag {TAG_ID} "
+                  f"({sizes[TAG_ID] * 1000:.0f} mm); map re-expressed around it")
         for k in {int(x) for x in args.ignore_tags.split(",") if x.strip()}:
             if k != TAG_ID:
                 tag_map.pop(k, None)
         print(f"Map: tags {sorted(tag_map)}")
+        if args.keepout > 0:
+            globals()["KEEPOUT_M"] = args.keepout
+            globals()["KEEPOUT_PTS"] = [np.array(t, float) for _, (_, t) in tag_map.items()]
+            print(f">>> KEEPOUT: staying {args.keepout:.2f} m from tags {sorted(tag_map)} (path planning on)")
     else:
+        if args.target != TAG_ID:
+            sys.exit("--target needs the map (don't combine with --no-map)")
         tag_map, sizes = {TAG_ID: (np.eye(3), np.zeros(3))}, {TAG_ID: TAG_SIZE_M}
         print("No map: tag 10 only")
     mapcheck = MapCheck(tag_map)
 
     drones = load_drones(args.config, only, args.camera_dir, fly, tag_map, sizes, mapcheck)
     slots, radius = make_slots(len(drones))
+    for i, sp in enumerate(slots):
+        for q in KEEPOUT_PTS:
+            dq = math.hypot(sp[0] - q[0], sp[2] - q[2])
+            if dq < KEEPOUT_M - 0.05:
+                print(f"WARNING: slot s{i} is {dq:.2f} m from a mapped tag (< keepout {KEEPOUT_M:.2f} m): "
+                      f"it can't be reached. Use a bigger --radius or smaller --keepout.")
     print(f"Drones {[d.name for d in drones]} -> slots {radius:.2f} m from tag 10 at "
           f"{[round(math.degrees(math.atan2(s[0], -s[2]))) for s in slots]} deg")
     if not all(parallel(drones, lambda d: preflight(d, fly)).values()):
@@ -1306,7 +1436,12 @@ def main():
                     if n_i > lim:
                         d.integ *= lim / n_i
                 d.integ_t = now
-                rc, _, _ = control(p, psi, target, others, cap, d.integ)
+                aim = target
+                if KEEPOUT_PTS and dist_h > DIRECT_ZONE_M:
+                    if getattr(d, "plan_t", 0) + PLAN_EVERY_S < now or getattr(d, "plan_goal", None) != assign[d.num]:
+                        d.plan, d.plan_t, d.plan_goal = plan_path(p, target), now, assign[d.num]
+                    aim = path_carrot(p, d.plan, target)
+                rc, _, _ = control(p, psi, aim, others, cap, d.integ)
                 pe = float(math.hypot(target[0] - p[0], target[2] - p[2]))   # horizontal only
                 push = cone_push(p, cones)                         # stay out of others' view
                 if np.linalg.norm(push) > 0:
