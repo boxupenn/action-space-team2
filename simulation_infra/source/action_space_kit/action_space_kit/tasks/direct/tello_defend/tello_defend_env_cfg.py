@@ -88,10 +88,10 @@ class TelloDefendEnvCfg(DirectMARLEnvCfg):
     defender_spawn_even = True
     defender_spawn_jitter = 0.3  # [rad]
     # smart2 teacher knobs (chase.py reads them when present): teammate repulsion radius / gain
-    teacher_sep_radius = 0.9  # [m]  (sweep 2026-10-23: 100% / 0.1%, 0.4% near-misses)
-    teacher_sep_gain = 2.0
+    teacher_sep_radius = 1.0  # [m]  (sweep 2026-10-24 with index spawn heights: 100% / 0.1%, 0.1% near-misses, p5 sep 0.52 m)
+    teacher_sep_gain = 2.5
     teacher_sep_vertical = 0.8  # share of the repulsion that goes vertical (lower index dives, higher climbs)
-    teacher_cruise_bias = 0.2  # [m] altitude offset while cruising (defender_0 below, defender_1 above the aim), fades in the last metre
+    teacher_cruise_bias = 0.0  # [m] altitude offset while cruising; 0.2 tested slightly worse (100% / 0.1%, 0.5% near-misses) -> off
     teacher_standby_up = 1.0  # [m] goalkeeper standby height above the site centre
     # Defenders start at index-specific heights (metres above the floor), as they will be placed and
     # launched on the real field; empty list = uniform 1-2 m (the kit's default).
