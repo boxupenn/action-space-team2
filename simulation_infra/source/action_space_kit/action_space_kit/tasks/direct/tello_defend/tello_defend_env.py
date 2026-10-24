@@ -185,8 +185,22 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
         defender_pos = torch.stack([d.data.root_pos_w for d in self._defenders], dim=1)  # (envs, D, 3)
         for i, drone in enumerate(self._defenders):
             own_rel_site = drone.data.root_pos_w - site
-            mates = torch.cat([defender_pos[:, j] - drone.data.root_pos_w for j in range(self.cfg.num_defenders) if j != i], dim=-1)
-            mates = mates.clamp(-self.cfg.obs_clip_pos, self.cfg.obs_clip_pos)
+            # per teammate: position relative to me (clipped) and an active flag (0 once it has rammed
+            # and is out -- on the floor in reality -- so policies and the teacher stop avoiding it)
+            mates = torch.cat(
+                [
+                    torch.cat(
+                        [
+                            (defender_pos[:, j] - drone.data.root_pos_w).clamp(-self.cfg.obs_clip_pos, self.cfg.obs_clip_pos),
+                            (~self._spent[:, j]).float().unsqueeze(-1),
+                        ],
+                        dim=-1,
+                    )
+                    for j in range(self.cfg.num_defenders)
+                    if j != i
+                ],
+                dim=-1,
+            )
             rel_pos = attacker_pos - drone.data.root_pos_w.unsqueeze(1)
             rel_vel = attacker_vel - drone.data.root_lin_vel_w.unsqueeze(1)
             # A downed attacker is zeroed out and flagged, not pushed to a huge sentinel

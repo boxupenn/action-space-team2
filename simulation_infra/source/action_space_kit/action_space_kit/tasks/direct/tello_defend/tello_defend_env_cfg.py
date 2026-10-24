@@ -16,7 +16,7 @@ NUM_ATTACKERS = 2
 
 # obs per defender: own pos rel. site (3) + own vel (3) + gravity (3)
 #                 + per attacker (rel pos 3, rel vel 3, visible flag 1)
-_OBS_DIM = 9 + 7 * NUM_ATTACKERS + 3 * (NUM_DEFENDERS - 1)  # + teammates' relative positions (2026-10-23)
+_OBS_DIM = 9 + 7 * NUM_ATTACKERS + 4 * (NUM_DEFENDERS - 1)  # + per teammate: relative position (3) and active flag (1)
 
 
 @configclass
@@ -88,8 +88,8 @@ class TelloDefendEnvCfg(DirectMARLEnvCfg):
     defender_spawn_even = True
     defender_spawn_jitter = 0.3  # [rad]
     # smart2 teacher knobs (chase.py reads them when present): teammate repulsion radius / gain
-    teacher_sep_radius = 0.8  # [m]
-    teacher_sep_gain = 1.5
+    teacher_sep_radius = 0.9  # [m]  (sweep 2026-10-23: 100% / 0.1%, 0.4% near-misses)
+    teacher_sep_gain = 2.0
     """Launch a fresh wave when the field is cleared, instead of ending the episode.
 
     Ending on success truncates the value bootstrap, which makes a short successful

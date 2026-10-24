@@ -87,7 +87,8 @@ def smart2_actions(
     attacker is within ``alert_frac`` x spawn_radius of the site -- the "send another drone when an
     interception fails" rule. Lead pursuit as in ``smart_actions``, aiming ``aim_up`` metres above
     the attacker: a ram from above hits the props and stays out of its downwash.
-    De-confliction (teammate positions are the last 3*(D-1) obs entries): a repulsion of
+    De-confliction (the last 4*(D-1) obs entries are per teammate [rel x, y, z, active]; an
+    inactive = rammed teammate is ignored everywhere): a repulsion of
     ``sep_gain`` x (sep_radius - d) away from any teammate closer than ``sep_radius``; and when a
     single attacker is left and ``yield_margin`` is set, only the defender nearest to it goes in
     (off by default: the switch is discontinuous and the clone learned it badly, 2026-10-23)."""
@@ -117,12 +118,15 @@ def smart2_actions(
         alert = site_dist.min(dim=-1).values < alert_frac * raw.cfg.spawn_radius
         standby = goalkeeper & ~alert
         D = len(agents)
-        mates = o[:, 9 + 7 * n : 9 + 7 * n + 3 * (D - 1)].reshape(E, D - 1, 3) if D > 1 else None
+        mate_block = o[:, 9 + 7 * n : 9 + 7 * n + 4 * (D - 1)].reshape(E, D - 1, 4) if D > 1 else None
+        mates = mate_block[..., :3] if mate_block is not None else None
+        mates_active = mate_block[..., 3] > 0.5 if mate_block is not None else None  # inactive (rammed) teammates are ignored
         # one attacker left: only the closest defender rams it, the rest hold off
         yield_off = torch.zeros(E, dtype=torch.bool, device=dev)
         if mates is not None and yield_margin is not None:  # off by default: a hard switch clones badly
             r_t = rel[rows, target]  # (E, 3) target relative to me
             mate_to_target = (r_t.unsqueeze(1) - mates).norm(dim=-1)  # (E, D-1)
+            mate_to_target = torch.where(mates_active, mate_to_target, torch.full_like(mate_to_target, 1.0e3))
             yield_off = (n_alive <= 1) & ((mate_to_target.min(dim=-1).values + yield_margin) < r_t.norm(dim=-1))
         r = rel[rows, target]
         v = va[rows, target]
@@ -144,7 +148,7 @@ def smart2_actions(
         direction = torch.where(yield_off.unsqueeze(-1), torch.zeros_like(direction), direction)
         if mates is not None:  # repulsion from close teammates
             d_m = mates.norm(dim=-1, keepdim=True).clamp(min=1e-3)
-            push = (-mates / d_m) * ((sep_radius - d_m).clamp(min=0.0) * sep_gain)
+            push = (-mates / d_m) * ((sep_radius - d_m).clamp(min=0.0) * sep_gain) * mates_active.unsqueeze(-1).float()
             direction = (direction + push.sum(dim=1)).clamp(-1.0, 1.0)
         actions[a] = torch.cat([direction, torch.zeros(E, 1, device=dev)], dim=-1)
     return actions
