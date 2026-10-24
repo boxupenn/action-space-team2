@@ -116,7 +116,7 @@ def intercept_time(r, v, v_max=V_MAX):
     return t_lead if disc >= 0 and t_lead > 0 else t_pursuit
 
 
-def assignment_feature(obs31, i, v_max=V_MAX):
+def assignment_feature(obs31, i, v_max=V_MAX, alert_radius=None, cover_m=None, alert_force=0.0):
     """[one-hot of the attacker assigned to defender i (N_ATT), goalkeeper flag] from the 31-dim obs
     alone: rebuild the (defenders x attackers) intercept-time table (own position = origin, teammates
     from their block), pick the ordered assignment with the smallest total (dead attacker / inactive
@@ -144,12 +144,24 @@ def assignment_feature(obs31, i, v_max=V_MAX):
     feat = np.zeros(n + 1)
     if i in chosen and alive[chosen.index(i)]:
         feat[chosen.index(i)] = 1.0
+    elif alert_radius is not None and cover_m is not None:
+        # goalkeeper dispatch (chase.py cover rule): the live attacker nearest the site, once inside
+        # alert_radius of it and no active teammate within cover_m of it; else stand by
+        site_rel = rel + o[0:3]
+        site_d = np.where(alive, np.linalg.norm(site_rel[:, :2], axis=-1), 1.0e3)
+        c = int(np.argmin(site_d))
+        mate_d = [np.linalg.norm(rel[c] - def_pos[j]) for j in range(D) if j != i and def_active[j]]
+        if site_d[c] < alert_radius and (not mate_d or min(mate_d) > cover_m or site_d[c] < alert_force):
+            feat[c] = 1.0
+        else:
+            feat[n] = 1.0
     else:
         feat[n] = 1.0                           # goalkeeper
     return feat
 
 
-def build_obs(own_p, own_v, att_p, att_v, alive, site, mates_p=(), mates_active=None, defender_index=None):
+def build_obs(own_p, own_v, att_p, att_v, alive, site, mates_p=(), mates_active=None, defender_index=None,
+              alert_radius=None, cover_m=None, alert_force=0.0):
     """The sim observation (tello_defend_env.py::_get_observations), all in the sim frame: own pos - site
     (3), own vel (3), gravity_b (3), per attacker rel pos (3) and rel vel (3), alive (2), then per
     teammate (ascending defender index, self excluded) its position relative to me (3), clipped +-12 m,
@@ -169,7 +181,7 @@ def build_obs(own_p, own_v, att_p, att_v, alive, site, mates_p=(), mates_active=
                          + mates).astype(np.float32)
     assert obs.shape == (OBS_DIM_LEGACY + (4 if mates_active is not None else 3) * len(mates_p),)
     if defender_index is not None and mates_active is not None:
-        obs = np.concatenate([obs, assignment_feature(obs, defender_index)]).astype(np.float32)
+        obs = np.concatenate([obs, assignment_feature(obs, defender_index, V_MAX, alert_radius, cover_m, alert_force)]).astype(np.float32)
     return obs
 
 
@@ -245,29 +257,66 @@ def load_cfg(path=CFG_PATH):
     return cfg
 
 
+class NpzNet:
+    """defender_i.npz (export_skrl_policy.py --npz): the same MLP in numpy, for a laptop without torch.
+    Keys: mean, std, W0, b0, ... (hidden layers), Wh, bh (head), act (elu|relu|tanh), squash (tanh or empty)."""
+
+    def __init__(self, path):
+        z = np.load(path)
+        self.mean, self.std = z["mean"].astype(np.float32), z["std"].astype(np.float32)
+        self.layers = [(z[f"W{k}"], z[f"b{k}"]) for k in range(int(z["n_hidden"]))]
+        self.head = (z["Wh"], z["bh"])
+        self.act, self.squash = str(z["act"]), str(z["squash"])
+
+    def __call__(self, obs):
+        x = np.clip((np.asarray(obs, np.float32) - self.mean) / self.std, -5.0, 5.0)
+        for W, b in self.layers:
+            x = W @ x + b
+            if self.act == "elu":
+                x = np.where(x > 0, x, np.expm1(x))
+            elif self.act == "relu":
+                x = np.maximum(x, 0.0)
+            else:
+                x = np.tanh(x)
+        y = self.head[0] @ x + self.head[1]
+        if self.squash == "tanh":
+            y = np.tanh(y)
+        return np.clip(y, -1.0, 1.0)
+
+
 def load_nets(policy_dir, n):
-    import torch
+    try:
+        import torch
+    except ImportError:
+        torch = None
     nets = []
     for i in range(n):
-        m = torch.jit.load(os.path.join(policy_dir, f"defender_{i}.pt"), map_location="cpu").eval()
-        nets.append(m)
+        pt, npz = (os.path.join(policy_dir, f"defender_{i}.{ext}") for ext in ("pt", "npz"))
+        if torch is not None and os.path.isfile(pt):
+            nets.append(torch.jit.load(pt, map_location="cpu").eval())
+        elif os.path.isfile(npz):
+            nets.append(NpzNet(npz))              # ponytail: numpy twin of the TorchScript, no torch needed
+        else:
+            raise FileNotFoundError(f"{pt} (needs torch) or {npz}")
     return nets
 
 
 def net_obs_dim(net):
     """Input width of an exported net (its normalisation buffer `mean`); OBS_DIM if it has none."""
     try:
-        return int(net.mean.numel())
+        return int(np.asarray(net.mean).size)
     except AttributeError:
         return OBS_DIM
 
 
 def run_net(net, obs):
-    """obs: the full 31-dim observation (or already the net's width)."""
-    import torch
+    """obs: the full observation (or already the net's width)."""
     obs = np.asarray(obs, np.float32)
     if obs.size != net_obs_dim(net):
         obs = fit_obs(obs, net_obs_dim(net))
+    if isinstance(net, NpzNet):
+        return net(obs)
+    import torch
     with torch.no_grad():
         return net(torch.as_tensor(obs, dtype=torch.float32).reshape(1, -1))[0].numpy()
 
@@ -530,14 +579,34 @@ class TagFeed:
         self.lock = threading.Lock()
         self.frame, self.frame_id, self.frames, self.fixes = None, 0, 0, 0
         self.stop = threading.Event()
+        self.started = False
 
     def start(self):
+        if self.started:
+            return True
+        self.started = True
         threading.Thread(target=self._video, daemon=True).start()
         threading.Thread(target=self._perceive, daemon=True).start()
         for _ in range(3):
-            if self.d.send("streamon", 5) == "ok":
+            if self._streamon() == "ok":
                 return True
         return False
+
+    def _streamon(self):
+        try:
+            return self.d.send("streamon", 5)
+        except PermissionError:
+            # the organisers' unmodified swarm_policies.py blocks every command but rc/takeoff/land:
+            # streamon moves nothing, send it on the drone's own socket (same lock, same adapter)
+            with self.d.lock:
+                self.d.sock.settimeout(5)
+                self.d.sock.sendto(b"streamon", ("192.168.10.1", 8889))
+                try:
+                    r = self.d.sock.recv(1024).decode(errors="ignore").strip().lower()
+                except (socket.timeout, OSError):
+                    r = "timeout"
+            self.d.log(f"streamon (raw) -> {r}")
+            return r
 
     def _video(self):
         import av
@@ -646,7 +715,10 @@ class DefendPolicy(Policy):
                                                    self.cfg.get("capture_radius", 0.5), self.cfg.get("respawn_s", 0.0))
         for d in drones:
             if d.num not in self.feeds:
-                self.feeds[d.num] = TagFeed(d)       # map + camera calib must exist; video starts in preflight
+                self.feeds[d.num] = TagFeed(d)       # map + camera calib must exist
+            feed = self.feeds[d.num]
+            if hasattr(feed, "start") and not feed.start():   # video + streamon now: the organisers' umbrella
+                d.log("WARNING: streamon not confirmed")       # may never call our preflight() hook
         print(f"[defend] site(sim)={np.round(self.cfg['site'], 2).tolist()} attackers={self.cfg['attackers']} "
               f"nets={self.cfg['policy_dir']} (obs {dims}) sep guard {self.cfg.get('sep_guard_m', 0.6)}/"
               f"{self.cfg.get('sep_release_m', 0.8)} m", flush=True)
@@ -659,7 +731,7 @@ class DefendPolicy(Policy):
         feed = self.feeds[d.num]
         if not hasattr(feed, "start"):
             return True
-        if not feed.start():
+        if not feed.start() and not feed.frames:
             d.log("FAIL: streamon refused")
             return False
         t0 = time.time()
@@ -715,7 +787,7 @@ class DefendPolicy(Policy):
             mates.append((j, self.last_p.get(n, own_p + np.array([OBS_CLIP_POS, 0.0, 0.0])), active))
         att_p, att_v, alive = self.attackers.state(now, [own_p] + [m[1] for m in mates if m[2]])
         obs = build_obs(own_p, own_v, att_p, att_v, alive, self.cfg["site"], [m[1] for m in mates],
-                        [m[2] for m in mates], i)
+                        [m[2] for m in mates], i, self.cfg.get("alert_radius"), self.cfg.get("cover_m"), self.cfg.get("alert_force", 0.0))
         action = run_net(self.nets[i], obs)
         action = fence_action(action, own_p, self.cfg["fence_lo"], self.cfg["fence_hi"])
         a, b, c, _ = world_to_rc(action, yaw, self.cfg["speed_cap"])

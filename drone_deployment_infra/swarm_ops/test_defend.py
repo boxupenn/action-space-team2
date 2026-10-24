@@ -95,11 +95,12 @@ def test_obs_layout_29_and_31():
 
 
 def test_intercept_time():
-    assert abs(intercept_time([3.0, 0.0, 0.0], [0.0, 0.0, 0.0]) - 3.0) < 1e-9          # still target: |r| / v_max
-    assert abs(intercept_time([3.0, 0.0, 0.0], [-0.5, 0.0, 0.0]) - 2.0) < 1e-9         # closing head-on: 3 / 1.5
-    assert abs(intercept_time([3.0, 0.0, 0.0], [0.5, 0.0, 0.0]) - 6.0) < 1e-9          # fleeing: 3 / 0.5
-    assert intercept_time([3.0, 0.0, 0.0], [2.0, 0.0, 0.0]) > 1e5                      # fleeing faster than me: unreachable (as the sim: qa clamped to -1e-6)
-    assert abs(intercept_time([3.0, 0.0, 0.0], [-2.0, 0.0, 0.0]) - 3.0) < 1e-9         # coming at me faster than me: no lead root (qa > 0) -> pursuit |r| / v_max, as the sim
+    # v_max 1.0 here; the arena nets' V_MAX is 2.0 (sim max_lin_speed)
+    assert abs(intercept_time([3.0, 0.0, 0.0], [0.0, 0.0, 0.0], 1.0) - 3.0) < 1e-9          # still target: |r| / v_max
+    assert abs(intercept_time([3.0, 0.0, 0.0], [-0.5, 0.0, 0.0], 1.0) - 2.0) < 1e-9         # closing head-on: 3 / 1.5
+    assert abs(intercept_time([3.0, 0.0, 0.0], [0.5, 0.0, 0.0], 1.0) - 6.0) < 1e-9          # fleeing: 3 / 0.5
+    assert intercept_time([3.0, 0.0, 0.0], [2.0, 0.0, 0.0], 1.0) > 1e5                      # fleeing faster than me: unreachable (as the sim: qa clamped to -1e-6)
+    assert abs(intercept_time([3.0, 0.0, 0.0], [-2.0, 0.0, 0.0], 1.0) - 3.0) < 1e-9         # coming at me faster than me: no lead root (qa > 0) -> pursuit |r| / v_max, as the sim
 
 
 def _obs31(own_v, rel, va, alive, mates, active):
@@ -142,20 +143,22 @@ def test_assignment_matches_torch_reference():
     rng = np.random.default_rng(0)
     E = 400
     o = np.zeros((E, 31))
+    o[:, 0:3] = rng.uniform(-3, 3, (E, 3))
     o[:, 3:6] = rng.uniform(-1, 1, (E, 3))
     o[:, 9:15] = rng.uniform(-6, 6, (E, 6))
     o[:, 15:21] = rng.uniform(-1.5, 1.5, (E, 6))
     o[:, 21:23] = (rng.uniform(0, 1, (E, 2)) > 0.2).astype(float)
     o[:, 23:31] = rng.uniform(-5, 5, (E, 8))
     o[:, [26, 30]] = (rng.uniform(0, 1, (E, 2)) > 0.2).astype(float)
-    for i in range(3):
-        tgt, gk = ns["assignment_from_obs"](torch.as_tensor(o, dtype=torch.float64), i, 2, 3, 1.0)
-        for e in range(E):
-            feat = assignment_feature(o[e], i)
-            if bool(gk[e]):
-                assert feat.tolist() == [0.0, 0.0, 1.0], (i, e)
-            else:
-                assert feat[int(tgt[e])] == 1.0 and feat[2] == 0.0, (i, e)
+    for alert, cover, force in ((None, None, 0.0), (2.2, 1.2, 1.7)):   # plain, and the goalkeeper cover rule (arena nets)
+        for i in range(3):
+            tgt, gk = ns["assignment_from_obs"](torch.as_tensor(o, dtype=torch.float64), i, 2, 3, 1.0, alert, cover, force)
+            for e in range(E):
+                feat = assignment_feature(o[e], i, 1.0, alert, cover, force)
+                if bool(gk[e]):
+                    assert feat.tolist() == [0.0, 0.0, 1.0], (alert, i, e)
+                else:
+                    assert feat[int(tgt[e])] == 1.0 and feat[2] == 0.0, (alert, i, e)
 
 
 def test_sep_guard_higher_index_yields_with_hysteresis():
@@ -296,3 +299,26 @@ def test_bus_attackers_alive_and_velocity():
     assert alive[0] == 0.0 and np.allclose(pos[0], tag_to_sim([0.0, -1.3, 1.7]))   # down: last position, alive 0
     att.STALE_S = -1.0                                  # a stalled publisher never steers: not alive
     assert att.state(now)[2].tolist() == [0.0, 0.0]
+
+
+def test_npz_net_matches_torchscript(tmp_path):
+    """The numpy twin (export --npz) gives the same actions as the TorchScript file."""
+    torch = pytest.importorskip("torch")
+    from policies.defend import NpzNet, run_net
+    pt = os.path.join(os.path.dirname(__file__), "..", "..", "simulation_infra", "policies", "defend_3v2_ram9_s2", "defender_0.pt")
+    if not os.path.isfile(pt):
+        pytest.skip("no shipped policy")
+    m = torch.jit.load(pt, map_location="cpu").eval()
+    Ws = [p.detach().numpy() for n, p in m.named_parameters() if n.startswith("net.") and n.endswith("weight")]
+    bs = [p.detach().numpy() for n, p in m.named_parameters() if n.startswith("net.") and n.endswith("bias")]
+    arrays = {"mean": m.mean.numpy(), "std": m.std.numpy(), "n_hidden": np.array(len(Ws)),
+              "Wh": m.head.weight.detach().numpy(), "bh": m.head.bias.detach().numpy(),
+              "act": np.array("elu"), "squash": np.array("")}
+    for k in range(len(Ws)):
+        arrays[f"W{k}"], arrays[f"b{k}"] = Ws[k], bs[k]
+    np.savez(tmp_path / "d0.npz", **arrays)
+    net = NpzNet(tmp_path / "d0.npz")
+    rng = np.random.default_rng(1)
+    for _ in range(20):
+        o = rng.uniform(-3, 3, int(m.mean.numel())).astype(np.float32)
+        assert np.allclose(run_net(net, o), run_net(m, o), atol=2e-4)

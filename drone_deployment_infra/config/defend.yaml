@@ -2,7 +2,7 @@
 # All positions are in the TAG-10 frame of config/map.yaml: x right along the wall (seen facing
 # the tag), y up, z out of the tag face into the room; metres.
 
-policy_dir: ../../simulation_infra/policies/defend_3v2_arena1_s2        # relative to this file; override
+policy_dir: ../../simulation_infra/policies/defend_3v2_arena_s2        # relative to this file; override
                                       # with swarm_policies.py --defend-dir / defend_offline.py --policy-dir
                                       # defender_0.pt -> first drone of --run defend:a,b,c, etc.
 site_xyz: [0.0, 0.0, 0.0]             # the protected point = tag 10 itself (sim: site centre 1.25 m up at the wall;
@@ -17,6 +17,9 @@ height_cm: [50, 225]                  # tof range: no more down below / up above
 # Launch spots (tag frame x, z; altitude): defender_0 (0.2, 2.0) 1.9 m, defender_1 (1.6, 1.6) 2.05 m,
 # defender_2 (-0.4, 1.6) 2.2 m -- the sim's defender_spawn_xy / heights; the policy flies back there when the
 # field is cleared and the goalkeeper waits there. Attackers start 2-3 m in front of tag 10 at 1.2-1.7 m.
+alert_radius: 2.2                     # goalkeeper dispatch (sim teacher_alert_radius): attacker nearer the site than this ...
+cover_m: 1.2                          # ... and no active teammate within this of it (sim teacher_cover_m); arena nets need both
+alert_force: 1.7                      # ... or, inside this of the site, regardless of cover (sim teacher_alert_force)
 sep_guard_m: 0.6                      # defenders closer than this: the higher-index one holds horizontally
 sep_release_m: 0.8                    # ... until they are this far apart again
 

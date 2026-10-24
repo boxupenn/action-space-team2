@@ -144,6 +144,11 @@ class TelloDefendEnvCfg(DirectMARLEnvCfg):
     # attacker is down (a teammate's ram does not re-shuffle a pursuit in progress); unassigned = goalkeeper.
     # Goalkeepers engage once a live attacker is within teacher_alert_radius of the site.
     teacher_alert_radius = 2.2  # [m]  goalkeepers engage inside this (spawn 2.5, arc 1.3)
+    # ... AND only while no active teammate is within teacher_cover_m of that attacker (someone is about to
+    # ram it): otherwise two defenders crowd one attacker, repel each other and both miss the 3 cm box.
+    # The dispatch is part of the assignment feature (chase.assignment_from_obs). None = old rule.
+    teacher_cover_m = 1.2  # [m]  (0.8 and 1.2 both 99.7% / 0.7%; 1.2 had 0 near-misses)
+    teacher_alert_force = 1.7  # [m] inside this the goalkeeper goes regardless of cover (the arc is at 1.3 m); 0 = off
     teacher_aim_up = 0.02  # [m] aim offset above the attacker: inside the 3 cm box, but from above (props vs frame)
     # Ram from above (2026-10-24, 15x15x3 cm box): while below the lead-pursuit aim point the defender climbs
     # at least teacher_climb_slope x horizontal distance (1 = 45 deg), so it gets above early and the

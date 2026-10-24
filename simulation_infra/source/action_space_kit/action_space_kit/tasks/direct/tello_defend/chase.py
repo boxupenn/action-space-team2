@@ -88,7 +88,8 @@ def _intercept_time(r: torch.Tensor, v: torch.Tensor, v_max: float) -> torch.Ten
 
 
 def assignment_from_obs(
-    o: torch.Tensor, i: int, num_attackers: int, num_defenders: int, v_max: float = 1.0
+    o: torch.Tensor, i: int, num_attackers: int, num_defenders: int, v_max: float = 1.0,
+    alert_radius: float | None = None, cover_m: float | None = None, alert_force: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Decentralised target assignment from ONE defender's observation (the 31-dim layout: own 9,
     attackers 7n, teammates 4(D-1)). Rebuilds the (defenders x attackers) lead-pursuit intercept-time
@@ -122,6 +123,23 @@ def assignment_from_obs(
     # a defender whose attacker is dead (cost 1e3) is not really assigned
     my_target = mine.float().argmax(dim=-1)
     assigned = assigned & alive[torch.arange(E, device=dev), my_target]
+    if alert_radius is not None and cover_m is not None:
+        # Goalkeeper dispatch as part of the feature (2026-10-24, 100/0 rule): an unassigned defender goes
+        # for the live attacker nearest the site once it is within alert_radius of the site AND no active
+        # teammate is within cover_m of it (nobody is about to ram it: the interception failed or nobody
+        # was sent). Until then it stands by. Returned as: target = that attacker, goalkeeper flag = False.
+        rows = torch.arange(E, device=dev)
+        site_rel = rel + o[:, 0:3].unsqueeze(1)
+        site_dist = torch.where(alive, site_rel[..., :2].norm(dim=-1), torch.full_like(rel[..., 0], 1.0e3))
+        cand = site_dist.argmin(dim=-1)
+        alert = site_dist[rows, cand] < alert_radius
+        mate_d = (rel[rows, cand].unsqueeze(1) - def_pos).norm(dim=-1)  # (E, D) distance of every defender to it
+        mate_d = torch.where(def_active, mate_d, torch.full_like(mate_d, 1.0e3))
+        mate_d[:, i] = 1.0e3
+        uncovered = (mate_d.min(dim=-1).values > cover_m) | (site_dist[rows, cand] < alert_force)  # last chance: go anyway
+        engage = ~assigned & alert & uncovered
+        my_target = torch.where(engage, cand, my_target)
+        assigned = assigned | engage
     return my_target, ~assigned
 
 
@@ -211,20 +229,26 @@ def smart2_actions(
         D = len(agents)
         mate_block = o[:, 9 + 7 * n : 9 + 7 * n + 4 * (D - 1)].reshape(E, D - 1, 4) if (D > 1 and obs_teammates) else None
         base = 9 + 7 * n + (4 * (D - 1) if obs_teammates else 0)
-        if getattr(raw.cfg, "obs_assignment", False) and o.shape[1] >= base + n + 1:
+        alert_radius = getattr(raw.cfg, "teacher_alert_radius", alert_frac * raw.cfg.spawn_radius)
+        cover_m = getattr(raw.cfg, "teacher_cover_m", None)
+        feature = getattr(raw.cfg, "obs_assignment", False) and o.shape[1] >= base + n + 1
+        if feature:
             # the env already appended [one-hot target (n), goalkeeper (1)] (assignment_from_obs or assign_latched)
             my_target = o[:, base : base + n].argmax(dim=-1)
             goalkeeper = o[:, base + n] > 0.5
             target = torch.where(goalkeeper, target, my_target)
         elif assign_mode == "time" and mate_block is not None:
-            my_target, goalkeeper = assignment_from_obs(o, i, n, D, v_max)
+            my_target, goalkeeper = assignment_from_obs(o, i, n, D, v_max, alert_radius, cover_m, getattr(raw.cfg, "teacher_alert_force", 0.0))
             target = torch.where(goalkeeper, target, my_target)
         # defenders without an assignment are goalkeepers: go for the attacker nearest the site,
         # i.e. the one whose interception is failing ("send another drone")
         site_dist = torch.where(alive, site_rel[..., :2].norm(dim=-1), torch.full_like(az, 1.0e3))
         target = torch.where(goalkeeper, site_dist.argmin(dim=-1), target)
-        alert = site_dist.min(dim=-1).values < getattr(raw.cfg, "teacher_alert_radius", alert_frac * raw.cfg.spawn_radius)
-        standby = goalkeeper & ~alert
+        alert = site_dist.min(dim=-1).values < alert_radius
+        if cover_m is not None and (feature or assign_mode == "time"):
+            standby = goalkeeper  # the dispatch decision is inside the flag (assignment_from_obs cover rule)
+        else:
+            standby = goalkeeper & ~alert
         mates = mate_block[..., :3] if mate_block is not None else None
         mates_active = mate_block[..., 3] > 0.5 if mate_block is not None else None  # inactive (rammed) teammates are ignored
         # one attacker left: only the closest defender rams it, the rest hold off

@@ -148,6 +148,8 @@ def main() -> None:
     parser.add_argument("--checkpoint", required=True, help="skrl agent_*.pt / best_agent.pt, or an experiment dir name under logs/skrl.")
     parser.add_argument("--agent", type=str, default=None, help="Multi-agent checkpoints: which agent's policy to export (default: first).")
     parser.add_argument("--out", type=str, default=None, help="Output .pt (default: outputs/exports/<experiment>_<run>[_<agent>].pt).")
+    parser.add_argument("--npz", action="store_true", default=False,
+                        help="Also write <out>.npz: the same MLP as numpy arrays (deployment without torch, policies/defend.py NpzNet).")
     parser.add_argument("--obs23", action="store_true", default=False,
                         help="Defend: wrap a 26-dim (23 + latched assignment) policy so the file takes the kit's 23 numbers (needs --agent defender_i).")
     args = parser.parse_args()
@@ -194,6 +196,16 @@ def main() -> None:
         else:
             scripted = torch.jit.trace(model, torch.zeros(2, obs_dim))
     scripted.save(str(out))
+    if args.npz:
+        import numpy as np
+        hidden = [m for m in model.net if isinstance(m, torch.nn.Linear)]
+        arrays = {"mean": model.mean.numpy(), "std": model.std.numpy(), "n_hidden": np.array(len(hidden)),
+                  "Wh": model.head.weight.detach().numpy(), "bh": model.head.bias.detach().numpy(),
+                  "act": np.array(activation.lower()), "squash": np.array(squash or "")}
+        for k, lin in enumerate(hidden):
+            arrays[f"W{k}"], arrays[f"b{k}"] = lin.weight.detach().numpy(), lin.bias.detach().numpy()
+        np.savez(out.with_suffix(".npz"), **arrays)
+        print(f"[export] wrote {out.with_suffix('.npz')}", flush=True)
     check = torch.jit.load(str(out))(torch.zeros(1, obs_dim))
     print(f"[export] checkpoint: {ckpt}\n[export] activation: {activation}, output squash: {squash or 'none'}, preprocessor: {'yes' if pre_sd is not None else 'none'}", flush=True)
     print(f"[export] wrote {out} ({out.stat().st_size} bytes): obs {obs_dim} -> action {tuple(check.shape)} (clamped to [-1, 1])", flush=True)

@@ -243,7 +243,8 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
                 if self.cfg.teacher_assign == "time":
                     if not self.cfg.obs_teammates:
                         raise ValueError("teacher_assign='time' needs obs_teammates=True; use 'latched' for the 23-dim layout")
-                    target, goalkeeper = assignment_from_obs(obs[a], i, n, D, self.cfg.command.max_lin_speed)
+                    target, goalkeeper = assignment_from_obs(obs[a], i, n, D, self.cfg.command.max_lin_speed,
+                                                            self.cfg.teacher_alert_radius, self.cfg.teacher_cover_m, self.cfg.teacher_alert_force)
                 else:
                     target, goalkeeper, self._assign_prev[:, i] = assign_latched(obs[a], i, n, self._assign_prev[:, i])
                 onehot = torch.nn.functional.one_hot(target, n).float() * (~goalkeeper).float().unsqueeze(-1)
@@ -439,6 +440,11 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
             if self.cfg.arena_bounds:
                 b = torch.tensor(self.cfg.arena_bounds[:2], device=self.device)
                 xy = torch.maximum(torch.minimum(xy, b[:, 1]), b[:, 0])
+                # clamping must not move a launch point inside the perimeter: keep y, push x out to the ring
+                r_min = self.cfg.spawn_radius - self.cfg.spawn_radius_jitter
+                short = xy.norm(dim=-1) < r_min
+                x_out = torch.sqrt((r_min**2 - xy[:, 1] ** 2).clamp(min=0.0)).clamp(min=b[0, 0], max=b[0, 1])
+                xy = torch.where(short.unsqueeze(-1), torch.stack([x_out, xy[:, 1]], dim=-1), xy)
             self._spawn_angle[env_ids, i] = angle
             state[:, :2] = origins[:, :2] + xy
             state[:, 2] = origins[:, 2] + sample_uniform(self.cfg.attacker_spawn_z[0], self.cfg.attacker_spawn_z[1], (num,), self.device)
